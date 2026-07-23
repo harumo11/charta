@@ -1,0 +1,39 @@
+[project]
+name = "charta"
+version = "0.1.0"
+description = "単ページ・ベクター作図ツール（研究図向けローカル PowerPoint）"
+requires-python = ">=3.12"
+dependencies = [
+    "pyside6>=6.7",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "pillow>=10.0",
+]
+
+[dependency-groups]
+# ローカルの CI 相当チェック（§13）
+dev = [
+    "ruff>=0.6",
+    "black>=24.0",
+    "pytest>=8.0",
+]
+
+# パッケージ配布はしない（§1: dev 実行のみ）。プロジェクト自身はビルド/インストールせず、
+# 依存だけを管理する仮想プロジェクトとして扱う。
+[tool.uv]
+package = false
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# venv / uv
+.venv/
+venv/
+.python-version
+
+# Testing / linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# charta プロジェクトファイル関連
+.autosave
+*.autosave
+exports/
+
+# AI モデルキャッシュ（rembg 等）
+.u2net/

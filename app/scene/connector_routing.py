@@ -1,0 +1,204 @@
+"""コネクタのアンカー計算・経路生成（アンカー再設計契約 §1、CLAUDE.md §9.3）。
+
+Qt 非依存の純 Python 関数群。表示（`connector_item.py`）と SVG エクスポート
+（`export/svg_exporter.py`）の双方から共有される「唯一の真実源」となる。
+
+アンカーは接続先オブジェクトの**種類別集合**として表現する:
+- 箱型(rect/ellipse/image/text/math/freehand): 9点
+  (`tl`/`top`/`tr`/`left`/`center`/`right`/`bl`/`bottom`/`br`)。
+- 直線/矢印(line/arrow): 3点 (`start`=p1 / `center`=中点 / `end`=p2)。
+"""
+
+from __future__ import annotations
+
+import math
+
+Box = tuple[float, float, float, float]  # (x, y, w, h) 軸並行bbox
+Point = tuple[float, float]
+
+_LINE_LIKE_TYPES = {"line", "arrow"}
+
+
+def _box_center(box: Box) -> Point:
+    x, y, w, h = box
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def _rotate_point(point: Point, center: Point, rotation: float) -> Point:
+    """`point` を `center` まわりに `rotation` 度回転した点を返す（Qt規約: 正=時計回り、y下向き）。
+
+    `rotation == 0.0` は浮動小数誤差回避のため無回転（`point` をそのまま）で返す。
+    """
+    if rotation == 0.0:
+        return point
+    theta = math.radians(rotation)
+    cx, cy = center
+    px, py = point
+    dx = px - cx
+    dy = py - cy
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    rx = cx + dx * cos_t - dy * sin_t
+    ry = cy + dx * sin_t + dy * cos_t
+    return (rx, ry)
+
+
+def anchors_for(
+    obj_type: str,
+    box: Box | None,
+    p1: Point | None,
+    p2: Point | None,
+    rotation: float = 0.0,
+) -> dict[str, Point]:
+    """`obj_type` に応じた種類別アンカー集合を返す。
+
+    - 直線/矢印(`obj_type` が "line"/"arrow" かつ `p1`/`p2` が両方 not None):
+      `{"start": p1, "center": 中点, "end": p2}` の3点。`rotation` は無関係
+      （p1/p2 は絶対座標で回転を既に反映済みのため）。
+    - それ以外で `box` が not None: 箱型の9点
+      (`tl`/`top`/`tr`/`left`/`center`/`right`/`bl`/`bottom`/`br`)。
+      `rotation` が非0の場合、各点を box 中心まわりに `rotation` 度回転する
+      （Qt の回転規約に一致: 正=時計回り、y下向き）。
+    - どちらの条件も満たさない場合は空 dict。
+    """
+    if obj_type in _LINE_LIKE_TYPES and p1 is not None and p2 is not None:
+        mid: Point = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+        return {"start": p1, "center": mid, "end": p2}
+    if box is not None and obj_type not in _LINE_LIKE_TYPES:
+        x, y, w, h = box
+        cx, cy = _box_center(box)
+        points: dict[str, Point] = {
+            "tl": (x, y),
+            "top": (cx, y),
+            "tr": (x + w, y),
+            "left": (x, cy),
+            "center": (cx, cy),
+            "right": (x + w, cy),
+            "bl": (x, y + h),
+            "bottom": (cx, y + h),
+            "br": (x + w, y + h),
+        }
+        if rotation != 0.0:
+            center: Point = (cx, cy)
+            points = {name: _rotate_point(pt, center, rotation) for name, pt in points.items()}
+        return points
+    return {}
+
+
+def nearest_anchor_name(anchor_set: dict[str, Point], toward: Point) -> str | None:
+    """`anchor_set` のうち `toward` に最も近いアンカー名を返す。空なら `None`。"""
+    if not anchor_set:
+        return None
+    px, py = toward
+    best_name: str | None = None
+    best_dist_sq = math.inf
+    for name, (ax, ay) in anchor_set.items():
+        dist_sq = (ax - px) ** 2 + (ay - py) ** 2
+        if dist_sq < best_dist_sq:
+            best_dist_sq = dist_sq
+            best_name = name
+    return best_name
+
+
+def set_reference(anchor_set: dict[str, Point] | None, fixed_point: Point) -> Point:
+    """相手端点の参照点。
+
+    `anchor_set` があれば `center`（無ければ集合内の任意代表点）を返し、
+    無ければ `fixed_point` を返す。
+    """
+    if anchor_set:
+        if "center" in anchor_set:
+            return anchor_set["center"]
+        return next(iter(anchor_set.values()))
+    return fixed_point
+
+
+def resolve_anchor(
+    anchor_set: dict[str, Point] | None,
+    fixed_point: Point,
+    anchor: str,
+    toward: Point,
+) -> Point:
+    """`anchor_set` と `anchor` 名から実座標を解決する。
+
+    - `anchor_set` が `None`（未接続）: `fixed_point`。
+    - `anchor` == "nearest": `toward` に最も近いアンカー点（集合が空なら `fixed_point`）。
+    - それ以外: `anchor_set[anchor]`。無ければ `center`、無ければ最寄り、
+      それも無ければ `fixed_point` へフォールバック。
+    """
+    if anchor_set is None:
+        return fixed_point
+    if anchor == "nearest":
+        name = nearest_anchor_name(anchor_set, toward)
+        if name is None:
+            return fixed_point
+        return anchor_set[name]
+    if anchor in anchor_set:
+        return anchor_set[anchor]
+    if "center" in anchor_set:
+        return anchor_set["center"]
+    name = nearest_anchor_name(anchor_set, toward)
+    if name is not None:
+        return anchor_set[name]
+    return fixed_point
+
+
+def build_routing(p1: Point, p2: Point, routing: str) -> list[Point]:
+    """`p1`->`p2` の経路点列を返す。
+
+    - straight: [p1, p2]。
+    - orthogonal: 3セグメントの直角折れ線 [p1, elbow1, elbow2, p2]。
+      水平差(dx)が垂直差(dy)より大きければ中点xで縦に折れ、そうでなければ
+      中点yで横に折れる、という単純規則。
+    """
+    if routing == "straight":
+        return [p1, p2]
+    if routing == "orthogonal":
+        x1, y1 = p1
+        x2, y2 = p2
+        if abs(x2 - x1) > abs(y2 - y1):
+            mid_x = (x1 + x2) / 2.0
+            elbow1: Point = (mid_x, y1)
+            elbow2: Point = (mid_x, y2)
+        else:
+            mid_y = (y1 + y2) / 2.0
+            elbow1 = (x1, mid_y)
+            elbow2 = (x2, mid_y)
+        return [p1, elbow1, elbow2, p2]
+    raise ValueError(f"unknown routing: {routing!r}")
+
+
+def endpoint_direction(points: list[Point]) -> Point:
+    """末端セグメント `points[-2] -> points[-1]` の単位ベクトル。長さ0は (1,0)。"""
+    if len(points) < 2:
+        return (1.0, 0.0)
+    p_from = points[-2]
+    p_to = points[-1]
+    dx = p_to[0] - p_from[0]
+    dy = p_to[1] - p_from[1]
+    length = math.hypot(dx, dy)
+    if length == 0.0:
+        return (1.0, 0.0)
+    return (dx / length, dy / length)
+
+
+def compute_endpoints(
+    src_set: dict[str, Point] | None,
+    src_point: Point,
+    src_anchor: str,
+    tgt_set: dict[str, Point] | None,
+    tgt_point: Point,
+    tgt_anchor: str,
+) -> tuple[Point, Point]:
+    """接続先のアンカー集合（無ければ固定点）から始点・終点を解く。
+
+    `src_set`/`tgt_set` が `None` の場合はそのまま `src_point`/`tgt_point` を使う側の
+    フォールバックを含め、`resolve_anchor` に委譲する。「相手の参照点」（相手の
+    `center`、無ければ相手の固定点）を `toward` として渡す。
+    """
+    src_ref: Point = set_reference(tgt_set, tgt_point)
+    tgt_ref: Point = set_reference(src_set, src_point)
+
+    p1 = resolve_anchor(src_set, src_point, src_anchor, src_ref)
+    p2 = resolve_anchor(tgt_set, tgt_point, tgt_anchor, tgt_ref)
+    return (p1, p2)
