@@ -127,6 +127,20 @@ def test_drop_import_fills_viewport_without_margin(window: Any, tmp_path: Path) 
     _assert_fills_viewport(window, QRectF(obj.x, obj.y, obj.width, obj.height))
 
 
+def test_first_drop_of_artboard_sized_image_fills_viewport(window: Any, tmp_path: Path) -> None:
+    """初回ドロップでアートボード全面を占める画像も余白なく満たす（回帰: 初回のみ左右に隙間）。
+
+    起動直後（ズーム1.0・アートボードがビューポートより大きい＝スクロールバー表示中）に
+    chrome を測ってウィンドウをリサイズすると、フィット後にスクロールバーが消えて
+    ビューポートが広がり、左右へ数 px の余白が残っていた。スクロールバーの
+    有無でビューポート寸法が変わらないこと（＝初回ドロップでも余白ゼロ）を検証する。
+    """
+    # アートボード(1920x1080)と同アスペクトの大きい画像 → 全面 1920x1080 に配置される。
+    obj, _item = _drop_image(window, tmp_path, w=3840, h=2160)
+    assert (obj.width, obj.height) == (1920.0, 1080.0)
+    _assert_fills_viewport(window, QRectF(obj.x, obj.y, obj.width, obj.height))
+
+
 def test_menu_import_fills_viewport_without_margin(
     window: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -50,6 +50,13 @@ class CanvasView(QGraphicsView):
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
         )
+        # スクロールバーは常時非表示にする。AsNeeded だとズーム／フィットの前後で
+        # スクロールバーが出没してビューポート寸法が変わり、`_resize_window_to_fit` が
+        # 測った chrome とずれて「取り込み直後の余白なしフィット」が数 px 狂う
+        # （初回ドロップのみ左右に隙間が出る回帰の原因）。パンは Space/中ボタン
+        # ドラッグ（非表示スクロールバーの値を内部的に操作する）で従来どおり可能。
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)

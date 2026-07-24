@@ -273,6 +273,10 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         copy_action = edit_menu.addAction("コピー", self.copy_selection)
         copy_action.setShortcut(QKeySequence("Ctrl+C"))
+        copy_image_action = edit_menu.addAction(
+            "画面を画像としてコピー", self._export.copy_canvas_to_clipboard
+        )
+        copy_image_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
         paste_action = edit_menu.addAction("貼付", self.paste_clipboard)
         paste_action.setShortcut(QKeySequence("Ctrl+V"))
         duplicate_action = edit_menu.addAction("複製", self.duplicate_selection)

@@ -7,10 +7,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 
 from app.export.pdf_exporter import export_pdf
-from app.export.png_exporter import export_png
+from app.export.png_exporter import export_png, render_artboard_image
 from app.export.svg_exporter import export_svg
 from app.scene.canvas_scene import CanvasScene
 
@@ -88,6 +89,20 @@ class ExportController:
             )
             == QMessageBox.StandardButton.Yes
         )
+
+    def copy_canvas_to_clipboard(self) -> None:
+        """アートボード全体を高DPI画像としてクリップボードへコピーする。
+
+        PNG エクスポートと同じレンダリング経路（`render_artboard_image`）を使う。
+        パワポ等へそのまま貼り付ける用途のため背景は不透過（アートボード背景色）。
+        成功時はオブジェクトのコピーと同様サイレント（ダイアログを出さない）。
+        """
+        try:
+            image = render_artboard_image(self._scene.document)
+        except Exception as exc:  # noqa: BLE001 - ユーザーへのエラー表示のため捕捉
+            QMessageBox.critical(self._window, "コピーに失敗しました", str(exc))
+            return
+        QGuiApplication.clipboard().setImage(image)
 
     def export_action(self, kind: ExportKind) -> None:
         """`kind`（"png"/"pdf"/"svg"）でエクスポートする（M4契約 §8）。"""

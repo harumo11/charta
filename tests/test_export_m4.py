@@ -174,6 +174,38 @@ def test_png_transparent_has_zero_alpha_corners(
         assert arr[cy, cx, 3] == 0, f"corner ({cy},{cx}) should be fully transparent"
 
 
+def test_render_artboard_image_matches_export_png_size(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """クリップボードコピーが使う `render_artboard_image` も PNG と同じ寸法・内容を持つ。"""
+    from app.export.png_exporter import render_artboard_image
+
+    doc = _build_document(project_dir, tmp_path)
+    image = render_artboard_image(doc)
+    assert (image.width(), image.height()) == artboard_pixel_size(doc)
+
+
+def test_copy_canvas_to_clipboard_puts_artboard_image(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """`copy_canvas_to_clipboard` でクリップボードに高DPI画像が載る。"""
+    from PySide6.QtGui import QGuiApplication
+
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+    scene = CanvasScene(doc)
+    controller = ExportController(None, scene, lambda: None)
+
+    QGuiApplication.clipboard().clear()
+    controller.copy_canvas_to_clipboard()
+
+    image = QGuiApplication.clipboard().image()
+    assert not image.isNull()
+    assert (image.width(), image.height()) == artboard_pixel_size(doc)
+
+
 # --------------------------------------------------------------------------
 # PDF
 # --------------------------------------------------------------------------

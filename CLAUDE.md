@@ -42,13 +42,6 @@
   - 用語定義: **mathtext** = matplotlib 内蔵の、LaTeX 記法の一部を LaTeX を使わず描画する機能。
   - 制約（事実）: mathtext は LaTeX 完全互換ではない。`\usepackage` 系・任意マクロは不可。分数・上下付き・ギリシャ文字・総和・積分・行列など一般的な数式はカバー。将来 `usetex=True`（LaTeX 本体呼び出し）へ切替可能な抽象化を設けておく。
 
-### `pyproject.toml` の依存グループ方針
-```
-[project]
-name = "charta"              # 実行名・パッケージ名（小文字統一）
-                             # コア依存: pyside6, matplotlib, numpy, pillow
-```
-
 ---
 
 ## 4. Qt の検証済み制約（実装前に必読）
@@ -68,50 +61,7 @@ Qt 公式ドキュメント・フォーラムで確認した、エクスポー�
 
 ## 5. アプリのディレクトリ構成
 
-```
-charta/
-├── pyproject.toml
-├── main.py                      # エントリポイント（QApplication 起動のみ）
-├── app/
-│   ├── model/                   # ★Qt非依存。データモデル＝単一の真実源
-│   │   ├── document.py          # Document（アートボード＋オブジェクトのリスト）
-│   │   ├── objects.py           # 各オブジェクトのデータクラス（下記データモデル）
-│   │   ├── properties.py        # プロパティ定義・型・既定値
-│   │   └── serialize.py         # project.json 読み書き
-│   ├── graphics/                 # ★Qt非依存。view/export 共有の幾何・画像処理層（model のみに依存可）
-│   │   ├── routing.py            # コネクタのアンカー計算・経路生成（旧 scene/connector_routing.py）
-│   │   ├── image_pipeline.py     # crop/brightness/contrast 等の画像処理パイプライン
-│   │   └── arrows.py             # 矢じり幾何（線端短縮量・triangle/circle/open 点列）
-│   ├── scene/                   # ★ビュー層。モデル↔QGraphicsItem の同期
-│   │   ├── canvas_view.py       # QGraphicsView（ズーム/パン/ラバーバンド選択）
-│   │   ├── canvas_scene.py      # QGraphicsScene（sceneRect=アートボード）
-│   │   ├── items/               # 各 QGraphicsItem サブクラス（モデルを描画）
-│   │   │   ├── base_item.py     # 共通: 選択・変形ハンドル・itemChange 通知
-│   │   │   ├── image_item.py
-│   │   │   ├── shape_item.py    # 矩形/楕円/直線
-│   │   │   ├── arrow_item.py
-│   │   │   ├── freehand_item.py
-│   │   │   ├── text_item.py
-│   │   │   ├── math_item.py     # QGraphicsSvgItem ベース（数式）
-│   │   │   └── connector_item.py
-│   │   └── handles.py           # 8方向リサイズ＋回転ハンドル
-│   ├── tools/                   # 入力ツール（状態機械: 選択/矩形/矢印/テキスト等）
-│   │   └── tool_manager.py
-│   ├── commands/                # ★アンドゥ（コマンドパターン）
-│   │   └── commands.py          # QUndoCommand サブクラス群
-│   ├── panels/                  # 右側プロパティパネル・レイヤーパネル等
-│   │   ├── property_panel.py
-│   │   └── layer_panel.py
-│   ├── export/                  # ★エクスポート
-│   │   ├── svg_exporter.py      # 自前 SVG シリアライザ（モデル駆動）
-│   │   ├── pdf_exporter.py      # QPrinter 経由（scene.render）
-│   │   └── png_exporter.py      # QImage 高DPIレンダリング
-│   ├── math/
-│   │   └── mathtext_render.py   # LaTeX文字列 → SVG（matplotlib）
-│   └── ui/
-│       └── main_window.py       # メニュー・ツールバー・ドック配置
-└── tests/
-```
+実装済みのため実構成はリポジトリ自体を参照する（`app/` 配下: model / graphics / scene / tools / commands / panels / export / math / ui）。層の依存規約（`model/`・`graphics/` の Qt 非依存等）は「## 13. コーディング規約・注意」を参照。
 
 用語定義: **コマンドパターン** = ユーザー操作を「実行/取り消しができるオブジェクト（コマンド）」として表現し、履歴スタックで管理する設計。Qt では `QUndoStack` / `QUndoCommand` を使う。
 
@@ -335,14 +285,4 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 
 ## 14. 新オブジェクト型追加手順書
 
-Phase 3（型ディスパッチのレジストリ化）により、新しいオブジェクト型の追加は各レイヤに **1 つずつの加法的登録を足すだけ** で完結する。**すべて追記のみ・既存分岐の編集不要**。既存の if/elif ラダーや型名リストを探して編集する必要はない。
-
-新しい型 `"foo"` を追加する場合の手順:
-
-1. **`app/model/objects.py`**: `BaseObject` を継承した `@dataclass` を定義し、`@register_object("foo")` を付与する。幾何の真実源が `x/y/width/height`（既定の `"box"`）以外なら `GEOMETRY: ClassVar[str] = "endpoints"` 等をオーバーライドする（`LineObject`/`ConnectorObject` の例を参照）。
-2. **`app/model/properties.py`**: プロパティパネル用の `PROPERTIES` 定義を追加する（フィールド名・型・既定値・UI ウィジェット種別）。
-3. **`app/scene/items/`**: 新しい item ファイル（または既存ファイルへの追記）を作り、`QGraphicsItem` サブクラスに `@register_item("foo")` を付与する（`ITEM_FACTORIES` への登録。`app/scene/items/__init__.py` の `create_item` は変更不要）。
-4. **`app/export/svg_exporter.py`**: `@register_svg_renderer("foo")` を付けたレンダラ関数を追加する（`SVG_RENDERERS` への登録。`_render_object` の分岐は変更不要）。
-5. **作成ツールが必要な場合**: `app/tools/tool_manager.py` の `self._handlers` テーブルに `"foo"` のエントリ（`_ToolHandlers(press, move, release)`）を追加し、`app/ui/main_window.py` の `_TOOL_LABELS` にツールバー表示名のタプルを追記する。
-
-いずれの手順も、既存の分岐・レジストリ辞書・テーブルへの **追記** のみで完結する（既存コードの編集は不要）。幾何（bbox・平行移動）が `"box"`/`"endpoints"`/`"connector"` のいずれとも異なる新しい `GEOMETRY` 種別が必要な場合のみ、`app/model/geometry.py` の `bounding_box`/`translate_geom` と `app/graphics/routing.py` の `anchors_for` に分岐を追加する（この場合に限り既存分岐への追記が必要）。
+新しいオブジェクト型の追加は各レイヤへの **加法的登録のみ** で完結する（すべて追記のみ・既存分岐の編集不要）。具体的な 5 ステップの手順はスキル `add-object-type`（`.claude/skills/add-object-type/SKILL.md`）を参照 — 型追加の作業時に自動ロードされる。

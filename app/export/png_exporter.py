@@ -21,8 +21,12 @@ def artboard_pixel_size(document: Document) -> tuple[int, int]:
     return (width_px, height_px)
 
 
-def export_png(document: Document, path: str, transparent: bool = False) -> None:
-    """document を高DPI PNG として書き出す。`transparent=True` で背景を透過にする。"""
+def render_artboard_image(document: Document, transparent: bool = False) -> QImage:
+    """document のアートボード全体を高DPI QImage にレンダリングして返す。
+
+    PNG 書き出しとクリップボードコピーが共有するレンダリング経路。
+    `transparent=True` で背景を透過にする。
+    """
     width_px, height_px = artboard_pixel_size(document)
 
     scene = CanvasScene(document)
@@ -37,7 +41,7 @@ def export_png(document: Document, path: str, transparent: bool = False) -> None
 
     painter = QPainter(image)
     if not painter.isActive():
-        raise OSError(f"PNG 描画用の QPainter を初期化できませんでした: {path}")
+        raise OSError("アートボード描画用の QPainter を初期化できませんでした")
     try:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -45,6 +49,11 @@ def export_png(document: Document, path: str, transparent: bool = False) -> None
         scene.render(painter, target, scene.sceneRect())
     finally:
         painter.end()
+    return image
 
+
+def export_png(document: Document, path: str, transparent: bool = False) -> None:
+    """document を高DPI PNG として書き出す。`transparent=True` で背景を透過にする。"""
+    image = render_artboard_image(document, transparent=transparent)
     if not image.save(path, "PNG"):
         raise OSError(f"PNG の書き出しに失敗しました: {path}")

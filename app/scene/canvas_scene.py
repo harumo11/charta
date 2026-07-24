@@ -141,13 +141,22 @@ class CanvasScene(QGraphicsScene):
         self.update()
 
     def other_boxes_excluding(self, item: BaseItem | None) -> list[Box]:
-        """`item`（移動中アイテム）以外の box 系オブジェクトのモデル bbox 一覧を返す。
+        """`item`（移動中アイテム）以外のスナップ吸着先 bbox 一覧を返す。
 
         line/arrow/connector（`GEOMETRY != "box"`）は x/y/width/height を真実源として
         持たないため除外する。非表示オブジェクトもスナップ対象から除外する。
+        アートボード自身も 1 つの box として含める（縁・中央線への吸着で、
+        画像等をアートボードに余白なくフィットさせられるようにする）。
         """
         exclude_obj = getattr(item, "obj", None) if item is not None else None
-        boxes: list[Box] = []
+        boxes: list[Box] = [
+            (
+                0.0,
+                0.0,
+                float(self.document.artboard.width_px),
+                float(self.document.artboard.height_px),
+            )
+        ]
         for obj in self.document.objects:
             if obj is exclude_obj:
                 continue

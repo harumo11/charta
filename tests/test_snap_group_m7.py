@@ -277,6 +277,23 @@ def test_item_position_change_snaps_to_other_object(window: Any) -> None:
     assert scene.snap_guides != []
 
 
+def test_item_position_change_snaps_to_artboard_edges(window: Any) -> None:
+    """アートボードの縁もスナップ吸着先になる（画像等を余白なくフィットさせる用）。"""
+    scene = window.scene
+    aw = float(scene.document.artboard.width_px)
+    rect = _add_rect(window, 100.0, 100.0, 50.0, 50.0)
+    item = scene.item_for(rect)
+
+    scene.set_grid(False, 20.0)  # グリッド吸着は無効のまま
+    item.setPos(aw - 50.0 - 4.0, 100.0)  # 右端がアートボード右端の 4px 手前
+    assert item.pos().x() == pytest.approx(aw - 50.0)
+    assert ("v", aw) in scene.snap_guides
+
+    item.setPos(3.0, 100.0)  # 左端がアートボード左端の 3px 手前
+    assert item.pos().x() == pytest.approx(0.0)
+    assert ("v", 0.0) in scene.snap_guides
+
+
 def test_snap_disabled_does_not_snap(window: Any) -> None:
     scene = window.scene
     scene.set_grid(True, 20.0)

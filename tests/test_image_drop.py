@@ -413,7 +413,8 @@ def test_menu_import_action_places_center_and_fits(
     assert obj.y + obj.height / 2.0 == pytest.approx(artboard.height_px / 2.0)
 
     visible = _visible_scene_rect(window.view)
-    assert visible.contains(QRectF(obj.x, obj.y, obj.width, obj.height))
+    # centerOn のスクロール値丸めでサブピクセル欠けが出うるため 1px 内側で判定する。
+    assert visible.contains(QRectF(obj.x, obj.y, obj.width, obj.height).adjusted(1, 1, -1, -1))
     assert visible.width() < artboard.width_px * 0.5  # 全景ではなく画像に寄っている
 
 
@@ -438,7 +439,8 @@ def test_offboard_drop_is_clamped_and_stays_visible(window: Any, tmp_path: Path)
     assert obj.y >= 0.0 and obj.y + obj.height <= artboard.height_px
 
     visible = _visible_scene_rect(window.view)
-    assert visible.contains(QRectF(obj.x, obj.y, obj.width, obj.height))
+    # centerOn のスクロール値丸めでサブピクセル欠けが出うるため 1px 内側で判定する。
+    assert visible.contains(QRectF(obj.x, obj.y, obj.width, obj.height).adjusted(1, 1, -1, -1))
 
 
 def test_fit_to_rect_clamps_min_zoom(window: Any) -> None:

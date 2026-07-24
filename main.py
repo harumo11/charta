@@ -9,6 +9,9 @@ from app.ui.main_window import MainWindow
 
 def main() -> None:
     app = QApplication(sys.argv)
+    # デスクトップ統合: charta.desktop / アイコンとウィンドウを紐づける
+    app.setApplicationName("charta")
+    app.setDesktopFileName("charta")
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
