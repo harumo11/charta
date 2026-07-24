@@ -51,6 +51,7 @@ class BaseObject:
     group_id: int | None = None
 
     TYPE: ClassVar[str] = ""
+    GEOMETRY: ClassVar[str] = "box"
 
     def to_dict(self) -> dict[str, Any]:
         """`_` で始まるフィールドを除外して辞書化する。`type` を必ず含む。"""
@@ -125,6 +126,7 @@ class LineObject(BaseObject):
     arrow_size: float = 12.0
 
     TYPE: ClassVar[str] = "line"
+    GEOMETRY: ClassVar[str] = "endpoints"
 
 
 @dataclass(kw_only=True)
@@ -171,7 +173,6 @@ class MathObject(BaseObject):
     latex: str = ""
     font_size: float = 18.0
     color: str = "#000000"
-    _svg_cache: str = ""
 
     TYPE: ClassVar[str] = "math"
 
@@ -192,6 +193,7 @@ class ConnectorObject(BaseObject):
     arrow_end: str = "triangle"
 
     TYPE: ClassVar[str] = "connector"
+    GEOMETRY: ClassVar[str] = "connector"
 
 
 # --------------------------------------------------------------------------
@@ -214,3 +216,11 @@ def new_object(type: str, id: int, **kwargs: Any) -> BaseObject:  # noqa: A002
         raise ValueError(f"unknown object type: {type!r}")
     concrete_cls = OBJECT_REGISTRY[type]
     return concrete_cls(id=id, type=type, **kwargs)
+
+
+def geometry_kind(type_name: str) -> str:
+    """`type_name` に対応するクラスの `GEOMETRY` を `OBJECT_REGISTRY` 経由で返す。
+
+    未知の型名は `KeyError` を送出する（`OBJECT_REGISTRY[type_name]` の素の挙動に従う）。
+    """
+    return OBJECT_REGISTRY[type_name].GEOMETRY

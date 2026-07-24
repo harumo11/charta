@@ -185,4 +185,4 @@ class BaseItem(QGraphicsObject):
             return
         from app.commands.commands import SetGeometryCommand
 
-        undo_stack.push(SetGeometryCommand(scene, self.obj, new_geom, old_geom))
+        undo_stack.push(SetGeometryCommand(self._document, self.obj, new_geom, old_geom))

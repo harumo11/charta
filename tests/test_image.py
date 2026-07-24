@@ -177,7 +177,7 @@ def test_crop_begin_set_commit_and_undo(qapp: Any, project_dir: Path, tmp_path: 
 
     stack = QUndoStack()
     scene.set_undo_stack(stack)
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
 
     item = scene.item_for(obj)
     assert isinstance(item, ImageItem)
@@ -233,7 +233,7 @@ def test_crop_preserves_per_axis_display_scale_when_prescaled(
 
     stack = QUndoStack()
     scene.set_undo_stack(stack)
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
 
     item = scene.item_for(obj)
     assert isinstance(item, ImageItem)

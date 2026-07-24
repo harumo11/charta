@@ -61,7 +61,7 @@ def _add_line(window: Any, p1: list[float], p2: list[float], obj_type: str) -> t
     scene = window.scene
     stack = window.undo_stack
     obj = LineObject(id=scene.document.new_id(), type=obj_type, p1=list(p1), p2=list(p2))
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert isinstance(item, LineItem)
     return obj, item
@@ -123,7 +123,7 @@ def test_mixed_selection_box_moves_via_qt_line_follows_via_tool_both_commit_on_r
     tm = window.tool_manager
 
     rect = RectObject(id=scene.document.new_id(), x=300.0, y=300.0, width=100.0, height=80.0)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     rect_item = scene.item_for(rect)
     assert rect_item is not None
 
@@ -180,7 +180,7 @@ def _add_math(window: Any, x: float, y: float, w: float, h: float, latex: str) -
     scene = window.scene
     stack = window.undo_stack
     obj = MathObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h, latex=latex)
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert isinstance(item, MathItem)
     return obj, item
@@ -190,7 +190,7 @@ def _push_geometry(stack: Any, scene: Any, obj: Any, width: float, height: float
     """`obj` の width/height を差分適用する `SetGeometryCommand` を push するヘルパ。"""
     stack.push(
         SetGeometryCommand(
-            scene,
+            scene.document,
             obj,
             {"width": width, "height": height},
             {"width": obj.width, "height": obj.height},

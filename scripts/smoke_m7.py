@@ -45,7 +45,7 @@ def _add_rect(
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -87,7 +87,7 @@ def main() -> None:
     r1 = _add_rect(w, 20.0, 0.0)
     r2 = _add_rect(w, 40.0, 0.0)
 
-    stack.push(ReorderCommand(scene, r0, 2, document.index_of(r0)))
+    stack.push(ReorderCommand(scene.document, r0, 2, document.index_of(r0)))
     assert document.index_of(r0) == 2
     assert scene.item_for(r0).zValue() == 2.0
     stack.undo()
@@ -136,7 +136,7 @@ def main() -> None:
 
     # --- 4. グループ化: GroupCommand + 選択拡張 + まとめ移動 + Ungroup ------
     group_id = document.new_id()
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
     assert r0.group_id == group_id and r1.group_id == group_id
 
     scene.clearSelection()
@@ -193,7 +193,7 @@ def main() -> None:
         physical=Physical(width_mm=84.0, target_dpi=300),
         background="#FFFFFF",
     )
-    stack.push(SetArtboardCommand(scene, new_artboard, old_artboard))
+    stack.push(SetArtboardCommand(scene.document, new_artboard, old_artboard))
     assert document.artboard.width_px == 992
     assert scene.sceneRect().width() == 992.0
     stack.undo()

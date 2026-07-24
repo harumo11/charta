@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import tempfile
+from dataclasses import fields
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from app.model.document import Artboard, Document, Physical
+from app.model.geometry import bounding_box, translate_geom
 from app.model.objects import (
     OBJECT_REGISTRY,
     BaseObject,
@@ -19,6 +22,7 @@ from app.model.objects import (
     MathObject,
     RectObject,
     TextObject,
+    geometry_kind,
     new_object,
 )
 from app.model.serialize import (
@@ -106,17 +110,19 @@ def test_text_roundtrip() -> None:
     assert restored.align == "center"
 
 
-def test_math_roundtrip_excludes_underscore_field() -> None:
+def test_math_roundtrip_has_no_svg_cache_field() -> None:
+    # MathObject は SVG レンダーキャッシュをモデルに保持しない(get_math_svg に一本化、
+    # 契約 P6: ビューがモデルへ書き込む層違反の解消)。_svg_cache フィールド自体が
+    # dataclass から削除されており、to_dict()/project.json のどちらにも現れない。
+    assert "_svg_cache" not in {f.name for f in fields(MathObject)}
     obj = MathObject(id=8, latex=r"\alpha^2", font_size=20.0)
-    obj._svg_cache = "<svg>cached</svg>"
     d = obj.to_dict()
     assert "_svg_cache" not in d
     assert d["latex"] == r"\alpha^2"
     restored = BaseObject.from_dict(d)
     assert isinstance(restored, MathObject)
     assert restored.latex == r"\alpha^2"
-    # _svg_cache は除外されるため既定値に戻る
-    assert restored._svg_cache == ""
+    assert not hasattr(restored, "_svg_cache")
 
 
 def test_connector_roundtrip() -> None:
@@ -252,6 +258,153 @@ def test_save_and_load_document(tmp_path: Path) -> None:
     assert loaded.artboard.width_px == doc.artboard.width_px
 
 
+# --------------------------------------------------------------------------
+# Document リスナー機構
+# --------------------------------------------------------------------------
+
+
+class RecordingListener:
+    """呼ばれた通知を順に記録する DocumentListener 実装（Qt 不使用）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def on_object_added(self, obj: BaseObject, index: int) -> None:
+        self.calls.append(("added", obj, index))
+
+    def on_object_removed(self, obj: BaseObject) -> None:
+        self.calls.append(("removed", obj))
+
+    def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None:
+        self.calls.append(("changed", obj, keys))
+
+    def on_order_changed(self) -> None:
+        self.calls.append(("order_changed",))
+
+    def on_artboard_changed(self) -> None:
+        self.calls.append(("artboard_changed",))
+
+
+def test_add_object_notifies_on_object_added_once() -> None:
+    doc = Document()
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    r1 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+
+    assert listener.calls == [("added", r1, 0)]
+
+
+def test_add_object_with_explicit_index_reports_correct_index() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id())
+    r2 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+    doc.add_object(r2)
+
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    r3 = RectObject(id=doc.new_id())
+    doc.add_object(r3, index=1)
+
+    assert doc.objects == [r1, r3, r2]
+    assert listener.calls == [("added", r3, 1)]
+
+
+def test_remove_object_notifies_on_object_removed_once() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id())
+    r2 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+    doc.add_object(r2)
+
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    doc.remove_object(r1)
+
+    assert listener.calls == [("removed", r1)]
+
+
+def test_move_to_index_notifies_on_order_changed_once() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id())
+    r2 = RectObject(id=doc.new_id())
+    r3 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+    doc.add_object(r2)
+    doc.add_object(r3)
+
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    doc.move_to_index(r3, 0)
+
+    assert doc.objects == [r3, r1, r2]
+    assert listener.calls == [("order_changed",)]
+
+
+def test_set_values_notifies_once_and_returns_old_values() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id(), x=1, y=2, fill="#FF0000")
+    doc.add_object(r1)
+
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    old_values = doc.set_values(r1, {"x": 10, "fill": "#00FF00"})
+
+    assert old_values == {"x": 1, "fill": "#FF0000"}
+    assert r1.x == 10
+    assert r1.fill == "#00FF00"
+    assert listener.calls == [("changed", r1, ("x", "fill"))]
+
+
+def test_set_artboard_notifies_on_artboard_changed_once() -> None:
+    doc = Document()
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    new_artboard = Artboard(width_px=800, height_px=600)
+    doc.set_artboard(new_artboard)
+
+    assert doc.artboard is new_artboard
+    assert listener.calls == [("artboard_changed",)]
+
+
+def test_remove_listener_stops_further_notifications() -> None:
+    doc = Document()
+    listener = RecordingListener()
+    doc.add_listener(listener)
+    doc.remove_listener(listener)
+
+    doc.add_object(RectObject(id=doc.new_id()))
+
+    assert listener.calls == []
+
+
+def test_remove_listener_not_registered_does_not_raise() -> None:
+    doc = Document()
+    listener = RecordingListener()
+    # 未登録の listener を remove しても例外にならない。
+    doc.remove_listener(listener)
+
+
+def test_normalize_z_emits_no_notification() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+
+    listener = RecordingListener()
+    doc.add_listener(listener)
+
+    doc.normalize_z()
+
+    assert listener.calls == []
+
+
 def test_save_document_with_tempdir() -> None:
     """tempfile.TemporaryDirectory との併用でも問題なく保存/読込できることを確認。"""
     doc = Document()
@@ -261,3 +414,95 @@ def test_save_document_with_tempdir() -> None:
         save_document(doc, project_dir)
         loaded = load_document(project_dir)
         assert len(loaded.objects) == 1
+
+
+# --------------------------------------------------------------------------
+# GEOMETRY ClassVar / geometry_kind / app.model.geometry（P3 契約 Stage 1A）
+# --------------------------------------------------------------------------
+
+
+def test_geometry_classvar_defaults_and_overrides() -> None:
+    """box 系は既定 "box"、line/arrow は "endpoints"、connector は "connector"。"""
+    assert RectObject.GEOMETRY == "box"
+    assert EllipseObject.GEOMETRY == "box"
+    assert ImageObject.GEOMETRY == "box"
+    assert FreehandObject.GEOMETRY == "box"
+    assert TextObject.GEOMETRY == "box"
+    assert MathObject.GEOMETRY == "box"
+    assert LineObject.GEOMETRY == "endpoints"
+    assert ConnectorObject.GEOMETRY == "connector"
+
+
+def test_geometry_is_classvar_not_serialized() -> None:
+    """GEOMETRY は dataclass フィールドではないため to_dict()/from_dict() に混入しない。"""
+    line = LineObject(id=1, p1=[0, 0], p2=[10, 10])
+    d = line.to_dict()
+    assert "GEOMETRY" not in d
+    restored = BaseObject.from_dict(d)
+    assert isinstance(restored, LineObject)
+    assert restored.GEOMETRY == "endpoints"
+
+    conn = ConnectorObject(id=2)
+    assert "GEOMETRY" not in conn.to_dict()
+
+
+def test_geometry_kind_dispatches_via_registry() -> None:
+    assert geometry_kind("rect") == "box"
+    assert geometry_kind("ellipse") == "box"
+    assert geometry_kind("image") == "box"
+    assert geometry_kind("freehand") == "box"
+    assert geometry_kind("text") == "box"
+    assert geometry_kind("math") == "box"
+    assert geometry_kind("line") == "endpoints"
+    assert geometry_kind("arrow") == "endpoints"
+    assert geometry_kind("connector") == "connector"
+
+
+def test_geometry_kind_unknown_type_raises_keyerror() -> None:
+    with pytest.raises(KeyError):
+        geometry_kind("no_such_type")
+
+
+def test_bounding_box_box_type() -> None:
+    obj = RectObject(id=1, x=3.0, y=4.0, width=10.0, height=20.0)
+    assert bounding_box(obj) == (3.0, 4.0, 10.0, 20.0)
+
+
+def test_bounding_box_endpoints_type() -> None:
+    """line/arrow は p1/p2 の外接矩形（座標順によらず正の幅/高さ）。"""
+    obj = LineObject(id=1, p1=[10.0, 20.0], p2=[4.0, 30.0])
+    assert bounding_box(obj) == (4.0, 20.0, 6.0, 10.0)
+
+    arrow = new_object("arrow", id=2, p1=[4.0, 30.0], p2=[10.0, 20.0])
+    assert bounding_box(arrow) == (4.0, 20.0, 6.0, 10.0)
+
+
+def test_bounding_box_connector_type() -> None:
+    """connector は source_point/target_point の外接矩形（実際の幾何の真実源）。"""
+    obj = ConnectorObject(id=1, source_point=[10.0, 20.0], target_point=[4.0, 30.0])
+    assert bounding_box(obj) == (4.0, 20.0, 6.0, 10.0)
+
+
+def test_translate_geom_box_type() -> None:
+    obj = RectObject(id=1, x=3.0, y=4.0, width=10.0, height=20.0)
+    old_geom, new_geom = translate_geom(obj, dx=5.0, dy=-2.0)
+    assert old_geom == {"x": 3.0, "y": 4.0}
+    assert new_geom == {"x": 8.0, "y": 2.0}
+    # 元オブジェクトは変更しない。
+    assert obj.x == 3.0 and obj.y == 4.0
+
+
+def test_translate_geom_endpoints_type() -> None:
+    obj = LineObject(id=1, p1=[0.0, 0.0], p2=[10.0, 5.0])
+    old_geom, new_geom = translate_geom(obj, dx=2.0, dy=3.0)
+    assert old_geom == {"p1": [0.0, 0.0], "p2": [10.0, 5.0]}
+    assert new_geom == {"p1": [2.0, 3.0], "p2": [12.0, 8.0]}
+    assert obj.p1 == [0.0, 0.0] and obj.p2 == [10.0, 5.0]
+
+
+def test_translate_geom_connector_type() -> None:
+    obj = ConnectorObject(id=1, source_point=[0.0, 0.0], target_point=[10.0, 5.0])
+    old_geom, new_geom = translate_geom(obj, dx=2.0, dy=3.0)
+    assert old_geom == {"source_point": [0.0, 0.0], "target_point": [10.0, 5.0]}
+    assert new_geom == {"source_point": [2.0, 3.0], "target_point": [12.0, 8.0]}
+    assert obj.source_point == [0.0, 0.0] and obj.target_point == [10.0, 5.0]

@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import math
 
+from app.model.objects import geometry_kind
+
 Box = tuple[float, float, float, float]  # (x, y, w, h) 軸並行bbox
 Point = tuple[float, float]
-
-_LINE_LIKE_TYPES = {"line", "arrow"}
 
 
 def _box_center(box: Box) -> Point:
@@ -52,7 +52,7 @@ def anchors_for(
 ) -> dict[str, Point]:
     """`obj_type` に応じた種類別アンカー集合を返す。
 
-    - 直線/矢印(`obj_type` が "line"/"arrow" かつ `p1`/`p2` が両方 not None):
+    - 直線/矢印(`geometry_kind(obj_type) == "endpoints"` かつ `p1`/`p2` が両方 not None):
       `{"start": p1, "center": 中点, "end": p2}` の3点。`rotation` は無関係
       （p1/p2 は絶対座標で回転を既に反映済みのため）。
     - それ以外で `box` が not None: 箱型の9点
@@ -61,10 +61,11 @@ def anchors_for(
       （Qt の回転規約に一致: 正=時計回り、y下向き）。
     - どちらの条件も満たさない場合は空 dict。
     """
-    if obj_type in _LINE_LIKE_TYPES and p1 is not None and p2 is not None:
+    is_endpoints = geometry_kind(obj_type) == "endpoints"
+    if is_endpoints and p1 is not None and p2 is not None:
         mid: Point = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
         return {"start": p1, "center": mid, "end": p2}
-    if box is not None and obj_type not in _LINE_LIKE_TYPES:
+    if box is not None and not is_endpoints:
         x, y, w, h = box
         cx, cy = _box_center(box)
         points: dict[str, Point] = {

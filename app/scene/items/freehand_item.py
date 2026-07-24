@@ -7,18 +7,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QPainterPath, QPainterPathStroker
 
-from app.model.objects import BaseObject
-from app.scene.handles import BoxHandleSet
-from app.scene.items.base_item import BaseItem
+from app.scene.items.box_item import BoxItem
+from app.scene.items.registry import register_item
 from app.scene.items.shape_item import pen_for
-
-if TYPE_CHECKING:
-    from app.model.document import Document
 
 _MIN_DIMENSION = 1.0
 
@@ -50,21 +46,9 @@ def normalize_freehand_points(
     return (min_x, min_y, width, height, normalized)
 
 
-class FreehandItem(BaseItem):
+@register_item("freehand")
+class FreehandItem(BoxItem):
     """freehand オブジェクトを描画するアイテム。BoxHandleSet で変形する。"""
-
-    def __init__(self, obj: BaseObject, document: Document | None = None) -> None:
-        super().__init__(obj, document)
-        self._w: float = obj.width
-        self._h: float = obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-
-    def sync_from_model(self) -> None:
-        self.prepareGeometryChange()
-        self._w = self.obj.width
-        self._h = self.obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-        super().sync_from_model()
 
     def boundingRect(self) -> QRectF:
         margin = max(float(self.obj.stroke_width), 0.0) / 2.0
@@ -122,44 +106,3 @@ class FreehandItem(BaseItem):
         stroker = QPainterPathStroker()
         stroker.setWidth(max(float(self.obj.stroke_width), 8.0))
         return stroker.createStroke(path)
-
-    def create_handles(self) -> BoxHandleSet:
-        return BoxHandleSet(self)
-
-    # ------------------------------------------------------------------
-    # ライブ更新（ハンドル/ツールから呼ばれる。モデルは書かない）
-    # ------------------------------------------------------------------
-    def set_live_rect(self, x: float, y: float, w: float, h: float) -> None:
-        self.prepareGeometryChange()
-        self.setPos(x, y)
-        self._w = w
-        self._h = h
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-        self.update()
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def set_live_rotation(self, rotation: float) -> None:
-        self.setRotation(rotation)
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def live_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.pos().x(),
-            "y": self.pos().y(),
-            "width": self._w,
-            "height": self._h,
-            "rotation": self.rotation(),
-        }
-
-    def model_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.obj.x,
-            "y": self.obj.y,
-            "width": self.obj.width,
-            "height": self.obj.height,
-            "rotation": self.obj.rotation,
-        }

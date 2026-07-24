@@ -41,7 +41,7 @@ def _add_rect(window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -49,7 +49,7 @@ def _add_line(window: Any, p1: tuple[float, float], p2: tuple[float, float]) -> 
     scene = window.scene
     stack = window.undo_stack
     line = LineObject(id=scene.document.new_id(), type="line", p1=list(p1), p2=list(p2))
-    stack.push(AddObjectCommand(scene, line))
+    stack.push(AddObjectCommand(scene.document, line))
     return line
 
 
@@ -57,7 +57,7 @@ def _add_connector(window: Any, **kwargs: Any) -> ConnectorObject:
     scene = window.scene
     stack = window.undo_stack
     conn = ConnectorObject(id=scene.document.new_id(), **kwargs)
-    stack.push(AddObjectCommand(scene, conn))
+    stack.push(AddObjectCommand(scene.document, conn))
     return conn
 
 
@@ -318,7 +318,7 @@ def test_drag_near_invisible_rect_anchor_does_not_snap(window: Any) -> None:
     stack = window.undo_stack
 
     rect_a = _add_rect(window, 0.0, 0.0, 100.0, 80.0)  # top アンカー = (50, 0)
-    stack.push(SetPropertyCommand(scene, rect_a, "visible", False, True))
+    stack.push(SetPropertyCommand(scene.document, rect_a, "visible", False, True))
     assert scene.item_for(rect_a).isVisible() is False
 
     conn = _add_connector(

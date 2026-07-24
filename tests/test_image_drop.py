@@ -251,7 +251,8 @@ def test_save_as_migrates_temp_assets(
 
     target = tmp_path / "real_proj"
     monkeypatch.setattr(
-        "app.ui.main_window.QFileDialog.getExistingDirectory", lambda *a, **k: str(target)
+        "app.ui.controllers.project_io.QFileDialog.getExistingDirectory",
+        lambda *a, **k: str(target),
     )
     window.save_project_as()
 
@@ -398,7 +399,8 @@ def test_menu_import_action_places_center_and_fits(
     png = tmp_path / "a.png"
     _make_png(png)
     monkeypatch.setattr(
-        "app.ui.main_window.QFileDialog.getOpenFileName", lambda *a, **k: (str(png), "")
+        "app.ui.controllers.image_import.QFileDialog.getOpenFileName",
+        lambda *a, **k: (str(png), ""),
     )
 
     window.import_image_action()
@@ -482,7 +484,7 @@ def test_broken_file_leaves_no_orphan_and_aggregates_errors(
     bad.write_text("this is not an image")
     dialogs: list[Any] = []
     monkeypatch.setattr(
-        "app.ui.main_window.QMessageBox.critical", lambda *a, **k: dialogs.append(a)
+        "app.ui.controllers.image_import.QMessageBox.critical", lambda *a, **k: dialogs.append(a)
     )
 
     window._import_dropped_images([str(bad), str(png)], QPointF(300.0, 200.0))

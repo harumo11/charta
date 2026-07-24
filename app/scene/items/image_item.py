@@ -4,26 +4,30 @@
 （ベクトル化）→ QImage/QPixmap の順。すべて numpy に委譲し Python の for ループで
 画素処理をしない（§13）。crop はメソッド駆動（begin_crop/set_crop_rect/commit_crop/
 cancel_crop）で編集し、確定は `SetPropertyCommand` で undoable にする。
+
+画像処理の自由関数（load_source_rgba/apply_crop/apply_brightness_contrast/
+build_processed_rgba/processed_png_base64/compute_default_size）は Qt 非依存の
+`app.graphics.image_pipeline` に移設済み。SVG エクスポート等はそちらから import する。
 """
 
 from __future__ import annotations
 
-import base64
-import io
 import sys
 import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
+from app.graphics.image_pipeline import apply_brightness_contrast, apply_crop
 from app.model.objects import BaseObject
 from app.model.serialize import resolve_asset_path
 from app.scene.handles import BoxHandleSet
-from app.scene.items.base_item import BaseItem
+from app.scene.items.box_item import BoxItem
+from app.scene.items.registry import register_item
 
 if TYPE_CHECKING:
     from app.model.document import Document
@@ -32,77 +36,12 @@ CropTuple = tuple[float, float, float, float]
 CacheKey = tuple[str, CropTuple | None, float, float]
 
 
-# --------------------------------------------------------------------------
-# モジュール関数（M4契約 §4）: SVG エクスポート等がモデルのみから最終ビットマップを
-# 得るための再利用ヘルパ。ImageItem インスタンス無しで document/obj から呼べる。
-# --------------------------------------------------------------------------
-
-
-def load_source_rgba(document: Document, obj: BaseObject) -> np.ndarray | None:
-    """`obj.src` を PIL で読み込み RGBA numpy 配列にする。失敗時は warn して None を返す。"""
-    src = obj.src
-    try:
-        path = resolve_asset_path(document, src) if document is not None else src
-        with Image.open(path) as im:
-            rgba = im.convert("RGBA")
-            arr = np.asarray(rgba, dtype=np.uint8)
-        return np.ascontiguousarray(arr)
-    except (
-        Exception
-    ) as exc:  # noqa: BLE001 - 画像読込失敗は呼び出し側でプレースホルダ等の対応をする
-        message = f"charta: 画像の読込に失敗しました src={src!r}: {exc}"
-        warnings.warn(message, stacklevel=2)
-        print(message, file=sys.stderr)
-        return None
-
-
-def build_processed_rgba(document: Document, obj: BaseObject) -> np.ndarray | None:
-    """crop・brightness/contrast を反映した最終 RGBA 配列を返す（読込失敗時 None）。"""
-    arr = load_source_rgba(document, obj)
-    if arr is None:
-        return None
-    arr = ImageItem._apply_crop(arr, getattr(obj, "crop", None))
-    arr = ImageItem._apply_brightness_contrast(arr, obj.brightness, obj.contrast)
-    return arr
-
-
-def processed_png_base64(document: Document, obj: BaseObject) -> str | None:
-    """最終ビットマップを PNG 化して base64 文字列を返す（失敗時 None）。"""
-    arr = build_processed_rgba(document, obj)
-    if arr is None:
-        return None
-    image = Image.fromarray(arr, mode="RGBA")
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def compute_default_size(
-    orig_width: float, orig_height: float, artboard_width: float, artboard_height: float
-) -> tuple[float, float]:
-    """取り込み時の既定表示サイズを計算する。
-
-    アートボードより大きい場合はアスペクト比を保って縮小する。元画素は保持し、
-    表示側でスケールするだけなので画質は劣化しない。
-    """
-    w = float(orig_width)
-    h = float(orig_height)
-    if w <= 0.0 or h <= 0.0:
-        return (max(w, 1.0), max(h, 1.0))
-    if w <= artboard_width and h <= artboard_height:
-        return (w, h)
-    scale = min(artboard_width / w, artboard_height / h)
-    return (w * scale, h * scale)
-
-
-class ImageItem(BaseItem):
+@register_item("image")
+class ImageItem(BoxItem):
     """image オブジェクトを描画するアイテム。BoxHandleSet（8リサイズ+回転）で変形する。"""
 
     def __init__(self, obj: BaseObject, document: Document | None = None) -> None:
         super().__init__(obj, document)
-        self._w: float = obj.width
-        self._h: float = obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
 
         self._loaded_src: str | None = None
         self._source_rgba: np.ndarray | None = None
@@ -122,14 +61,9 @@ class ImageItem(BaseItem):
     # ------------------------------------------------------------------
     # モデル同期
     # ------------------------------------------------------------------
-    def sync_from_model(self) -> None:
-        self.prepareGeometryChange()
-        self._w = self.obj.width
-        self._h = self.obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
+    def _on_sync_geometry(self) -> None:
         if not self._crop_mode:
             self._recompute_display()
-        super().sync_from_model()
 
     def _cache_key_for(self) -> CacheKey:
         crop = getattr(self.obj, "crop", None)
@@ -162,34 +96,6 @@ class ImageItem(BaseItem):
             self._source_size = None
             self._load_failed = True
 
-    @staticmethod
-    def _apply_crop(arr: np.ndarray, crop: list[float] | None) -> np.ndarray:
-        h, w = arr.shape[0], arr.shape[1]
-        if not crop:
-            return arr
-        x, y, cw, ch = crop
-        x0 = int(np.clip(round(x), 0, w))
-        y0 = int(np.clip(round(y), 0, h))
-        x1 = int(np.clip(round(x + cw), 0, w))
-        y1 = int(np.clip(round(y + ch), 0, h))
-        if x1 <= x0 or y1 <= y0:
-            return arr
-        return arr[y0:y1, x0:x1]
-
-    @staticmethod
-    def _apply_brightness_contrast(
-        arr: np.ndarray, brightness: float, contrast: float
-    ) -> np.ndarray:
-        if brightness == 0.0 and contrast == 0.0:
-            return np.ascontiguousarray(arr)
-        rgb = arr[..., :3].astype(np.float32)
-        alpha = arr[..., 3:4]
-        f = 1.0 + float(contrast)
-        rgb = (rgb - 128.0) * f + 128.0
-        rgb = rgb + float(brightness) * 255.0
-        rgb = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
-        return np.ascontiguousarray(np.concatenate([rgb, alpha], axis=-1))
-
     def _recompute_display(self) -> None:
         key = self._cache_key_for()
         if key == self._cache_key and not self._display_pixmap.isNull():
@@ -200,8 +106,8 @@ class ImageItem(BaseItem):
             self._display_pixmap = QPixmap()
             self._display_buffer = None
             return
-        arr = self._apply_crop(self._source_rgba, getattr(self.obj, "crop", None))
-        arr = self._apply_brightness_contrast(arr, self.obj.brightness, self.obj.contrast)
+        arr = apply_crop(self._source_rgba, getattr(self.obj, "crop", None))
+        arr = apply_brightness_contrast(arr, self.obj.brightness, self.obj.contrast)
         self._set_display_buffer(arr)
 
     def _set_display_buffer(self, arr: np.ndarray) -> None:
@@ -235,47 +141,6 @@ class ImageItem(BaseItem):
         painter.drawRect(rect)
         painter.drawLine(rect.topLeft(), rect.bottomRight())
         painter.drawLine(rect.topRight(), rect.bottomLeft())
-
-    def create_handles(self) -> BoxHandleSet:
-        return BoxHandleSet(self)
-
-    # ------------------------------------------------------------------
-    # ライブ更新（ハンドル/ツールから呼ばれる。モデルは書かない）
-    # ------------------------------------------------------------------
-    def set_live_rect(self, x: float, y: float, w: float, h: float) -> None:
-        self.prepareGeometryChange()
-        self.setPos(x, y)
-        self._w = w
-        self._h = h
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-        self.update()
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def set_live_rotation(self, rotation: float) -> None:
-        self.setRotation(rotation)
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def live_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.pos().x(),
-            "y": self.pos().y(),
-            "width": self._w,
-            "height": self._h,
-            "rotation": self.rotation(),
-        }
-
-    def model_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.obj.x,
-            "y": self.obj.y,
-            "width": self.obj.width,
-            "height": self.obj.height,
-            "rotation": self.obj.rotation,
-        }
 
     # ------------------------------------------------------------------
     # crop モード（M2契約 §3）
@@ -360,12 +225,14 @@ class ImageItem(BaseItem):
         undo_stack.beginMacro("crop")
         try:
             undo_stack.push(
-                SetPropertyCommand(scene, self.obj, "crop", new_crop, old_crop, text="crop")
+                SetPropertyCommand(
+                    self._document, self.obj, "crop", new_crop, old_crop, text="crop"
+                )
             )
             if (new_width, new_height) != (old_width, old_height):
                 undo_stack.push(
                     SetGeometryCommand(
-                        scene,
+                        self._document,
                         self.obj,
                         {"width": new_width, "height": new_height},
                         {"width": old_width, "height": old_height},

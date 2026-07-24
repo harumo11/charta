@@ -69,7 +69,7 @@ class LayerPanel(QWidget):
         """
         if not shiboken6.isValid(self) or not shiboken6.isValid(self.scene):
             return
-        objects = sorted(self.scene.document.objects, key=lambda o: o.z, reverse=True)
+        objects = list(reversed(self.scene.document.objects))
         signature = tuple(obj.id for obj in objects)
         if signature == self._current_signature:
             self._refresh_rows_in_place(objects)
@@ -151,13 +151,13 @@ class LayerPanel(QWidget):
             old_value = obj.visible
             if checked == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene, obj, "visible", checked, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, "visible", checked, old_value))
 
         def on_locked_toggled(checked: bool, obj: BaseObject = obj) -> None:
             old_value = obj.locked
             if checked == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene, obj, "locked", checked, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, "locked", checked, old_value))
 
         visible_cb.toggled.connect(on_visible_toggled)
         locked_cb.toggled.connect(on_locked_toggled)

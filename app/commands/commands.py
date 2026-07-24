@@ -1,7 +1,9 @@
 """Undo/Redo コマンド群（§5）。モデル変更の唯一の入口。
 
-各コマンドは `Document` を変更したのち、`CanvasScene` の
-`add_item_for`/`remove_item_for`/`sync_item` でビューを同期する。
+コマンドは `Document` のみに依存し、ビュー同期は Document の変更通知
+（`DocumentListener`、契約 Stage A）が担う。コマンドは `Document` の
+通知内蔵メソッド（`add_object`/`remove_object`/`move_to_index`/
+`set_values`/`set_artboard`）を呼ぶのみで、`CanvasScene` を直接操作しない。
 """
 
 from __future__ import annotations
@@ -12,44 +14,39 @@ from typing import TYPE_CHECKING, Any
 from PySide6.QtGui import QUndoCommand
 
 if TYPE_CHECKING:
-    from app.model.document import Artboard
+    from app.model.document import Artboard, Document
     from app.model.objects import BaseObject
-    from app.scene.canvas_scene import CanvasScene
 
 
 class AddObjectCommand(QUndoCommand):
-    """オブジェクトを Document に追加し、対応する item を生成する。"""
+    """オブジェクトを Document に追加する（ビュー同期は Document 通知経由）。"""
 
-    def __init__(self, scene: CanvasScene, obj: BaseObject, text: str = "add object") -> None:
+    def __init__(self, document: Document, obj: BaseObject, text: str = "add object") -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._obj = obj
 
     def redo(self) -> None:
-        self._scene.document.add_object(self._obj)
-        self._scene.add_item_for(self._obj)
+        self._document.add_object(self._obj)
 
     def undo(self) -> None:
-        self._scene.remove_item_for(self._obj)
-        self._scene.document.remove_object(self._obj)
+        self._document.remove_object(self._obj)
 
 
 class RemoveObjectCommand(QUndoCommand):
     """オブジェクトを Document から削除する。undo で元の z 位置に復元する。"""
 
-    def __init__(self, scene: CanvasScene, obj: BaseObject, text: str = "remove object") -> None:
+    def __init__(self, document: Document, obj: BaseObject, text: str = "remove object") -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._obj = obj
-        self._index = scene.document.index_of(obj)
+        self._index = document.index_of(obj)
 
     def redo(self) -> None:
-        self._scene.remove_item_for(self._obj)
-        self._scene.document.remove_object(self._obj)
+        self._document.remove_object(self._obj)
 
     def undo(self) -> None:
-        self._scene.document.add_object(self._obj, index=self._index)
-        self._scene.add_item_for(self._obj)
+        self._document.add_object(self._obj, index=self._index)
 
 
 class SetGeometryCommand(QUndoCommand):
@@ -62,7 +59,7 @@ class SetGeometryCommand(QUndoCommand):
 
     def __init__(
         self,
-        scene: CanvasScene,
+        document: Document,
         obj: BaseObject,
         new_geom: dict[str, Any],
         old_geom: dict[str, Any],
@@ -70,7 +67,7 @@ class SetGeometryCommand(QUndoCommand):
         mergeable: bool = False,
     ) -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._obj = obj
         self._new_geom = dict(new_geom)
         self._old_geom = dict(old_geom)
@@ -94,14 +91,10 @@ class SetGeometryCommand(QUndoCommand):
         return True
 
     def redo(self) -> None:
-        for key, value in self._new_geom.items():
-            setattr(self._obj, key, value)
-        self._scene.sync_item(self._obj)
+        self._document.set_values(self._obj, self._new_geom)
 
     def undo(self) -> None:
-        for key, value in self._old_geom.items():
-            setattr(self._obj, key, value)
-        self._scene.sync_item(self._obj)
+        self._document.set_values(self._obj, self._old_geom)
 
 
 class SetPropertyCommand(QUndoCommand):
@@ -109,7 +102,7 @@ class SetPropertyCommand(QUndoCommand):
 
     def __init__(
         self,
-        scene: CanvasScene,
+        document: Document,
         obj: BaseObject,
         key: str,
         new_value: Any,
@@ -117,7 +110,7 @@ class SetPropertyCommand(QUndoCommand):
         text: str | None = None,
     ) -> None:
         super().__init__(text if text is not None else f"set {key}")
-        self._scene = scene
+        self._document = document
         self._obj = obj
         self._key = key
         self._new_value = new_value
@@ -137,12 +130,10 @@ class SetPropertyCommand(QUndoCommand):
         return True
 
     def redo(self) -> None:
-        setattr(self._obj, self._key, self._new_value)
-        self._scene.sync_item(self._obj)
+        self._document.set_values(self._obj, {self._key: self._new_value})
 
     def undo(self) -> None:
-        setattr(self._obj, self._key, self._old_value)
-        self._scene.sync_item(self._obj)
+        self._document.set_values(self._obj, {self._key: self._old_value})
 
 
 class ReorderCommand(QUndoCommand):
@@ -150,25 +141,23 @@ class ReorderCommand(QUndoCommand):
 
     def __init__(
         self,
-        scene: CanvasScene,
+        document: Document,
         obj: BaseObject,
         new_index: int,
         old_index: int,
         text: str = "reorder",
     ) -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._obj = obj
         self._new_index = new_index
         self._old_index = old_index
 
     def redo(self) -> None:
-        self._scene.document.move_to_index(self._obj, self._new_index)
-        self._scene.resync_z()
+        self._document.move_to_index(self._obj, self._new_index)
 
     def undo(self) -> None:
-        self._scene.document.move_to_index(self._obj, self._old_index)
-        self._scene.resync_z()
+        self._document.move_to_index(self._obj, self._old_index)
 
 
 class GroupCommand(QUndoCommand):
@@ -176,26 +165,24 @@ class GroupCommand(QUndoCommand):
 
     def __init__(
         self,
-        scene: CanvasScene,
+        document: Document,
         objs: list[BaseObject],
         group_id: int,
         text: str = "group",
     ) -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._objs = list(objs)
         self._group_id = group_id
         self._old_group_ids: list[int | None] = [obj.group_id for obj in self._objs]
 
     def redo(self) -> None:
         for obj in self._objs:
-            obj.group_id = self._group_id
-            self._scene.sync_item(obj)
+            self._document.set_values(obj, {"group_id": self._group_id})
 
     def undo(self) -> None:
         for obj, old_group_id in zip(self._objs, self._old_group_ids, strict=True):
-            obj.group_id = old_group_id
-            self._scene.sync_item(obj)
+            self._document.set_values(obj, {"group_id": old_group_id})
 
 
 class UngroupCommand(QUndoCommand):
@@ -203,24 +190,22 @@ class UngroupCommand(QUndoCommand):
 
     def __init__(
         self,
-        scene: CanvasScene,
+        document: Document,
         objs: list[BaseObject],
         text: str = "ungroup",
     ) -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._objs = list(objs)
         self._old_group_ids: list[int | None] = [obj.group_id for obj in self._objs]
 
     def redo(self) -> None:
         for obj in self._objs:
-            obj.group_id = None
-            self._scene.sync_item(obj)
+            self._document.set_values(obj, {"group_id": None})
 
     def undo(self) -> None:
         for obj, old_group_id in zip(self._objs, self._old_group_ids, strict=True):
-            obj.group_id = old_group_id
-            self._scene.sync_item(obj)
+            self._document.set_values(obj, {"group_id": old_group_id})
 
 
 class SetArtboardCommand(QUndoCommand):
@@ -232,20 +217,18 @@ class SetArtboardCommand(QUndoCommand):
 
     def __init__(
         self,
-        scene: CanvasScene,
+        document: Document,
         new_artboard: Artboard,
         old_artboard: Artboard,
         text: str = "artboard",
     ) -> None:
         super().__init__(text)
-        self._scene = scene
+        self._document = document
         self._new_artboard = copy.deepcopy(new_artboard)
         self._old_artboard = copy.deepcopy(old_artboard)
 
     def redo(self) -> None:
-        self._scene.document.artboard = copy.deepcopy(self._new_artboard)
-        self._scene.apply_artboard_change()
+        self._document.set_artboard(copy.deepcopy(self._new_artboard))
 
     def undo(self) -> None:
-        self._scene.document.artboard = copy.deepcopy(self._old_artboard)
-        self._scene.apply_artboard_change()
+        self._document.set_artboard(copy.deepcopy(self._old_artboard))

@@ -330,7 +330,11 @@ class PropertyPanel(QWidget):
             if new_point == old_point:
                 return
             cmd = SetGeometryCommand(
-                self.scene, obj, {spec.key: new_point}, {spec.key: old_point}, mergeable=True
+                self.scene.document,
+                obj,
+                {spec.key: new_point},
+                {spec.key: old_point},
+                mergeable=True,
             )
             self._push(cmd)
 
@@ -379,7 +383,7 @@ class PropertyPanel(QWidget):
             if new_value == old_value:
                 return
             self._apply_button_color(button, new_value)
-            self._push(SetPropertyCommand(self.scene, obj, spec.key, new_value, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
 
         button.clicked.connect(on_click)
 
@@ -424,7 +428,7 @@ class PropertyPanel(QWidget):
             new_value: str | None = None if checked else stored_color
             if new_value == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene, obj, spec.key, new_value, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
 
         def on_click(
             _checked: bool = False,
@@ -441,7 +445,7 @@ class PropertyPanel(QWidget):
             if new_value == old_value:
                 return
             self._apply_button_color(button, new_value)
-            self._push(SetPropertyCommand(self.scene, obj, spec.key, new_value, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
 
         checkbox.toggled.connect(on_toggle)
         button.clicked.connect(on_click)
@@ -489,7 +493,7 @@ class PropertyPanel(QWidget):
             new_value = combo.currentText()
             if new_value == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene, obj, spec.key, new_value, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
 
         combo.currentIndexChanged.connect(on_changed)
 
@@ -520,7 +524,7 @@ class PropertyPanel(QWidget):
             old_value = getattr(obj, spec.key)
             if checked == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene, obj, spec.key, checked, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, checked, old_value))
 
         checkbox.toggled.connect(on_toggled)
 
@@ -553,7 +557,7 @@ class PropertyPanel(QWidget):
             new_value = le.text()
             if new_value == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene, obj, spec.key, new_value, old_value))
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
 
         line_edit.editingFinished.connect(on_finished)
 
@@ -578,10 +582,10 @@ class PropertyPanel(QWidget):
     def _commit_scalar(self, obj: BaseObject, key: str, new_value: Any, old_value: Any) -> None:
         if key in _GEOMETRY_KEYS:
             cmd = SetGeometryCommand(
-                self.scene, obj, {key: new_value}, {key: old_value}, mergeable=True
+                self.scene.document, obj, {key: new_value}, {key: old_value}, mergeable=True
             )
         else:
-            cmd = SetPropertyCommand(self.scene, obj, key, new_value, old_value)
+            cmd = SetPropertyCommand(self.scene.document, obj, key, new_value, old_value)
         self._push(cmd)
 
     def _push(self, cmd: Any) -> None:

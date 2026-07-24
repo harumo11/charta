@@ -79,7 +79,7 @@ def main() -> None:
         scene = CanvasScene(doc)
         stack = QUndoStack()
         scene.set_undo_stack(stack)
-        stack.push(AddObjectCommand(scene, obj))
+        stack.push(AddObjectCommand(scene.document, obj))
 
         item = scene.item_for(obj)
         assert isinstance(item, ImageItem), "item が ImageItem でない"
@@ -91,7 +91,7 @@ def main() -> None:
 
         # 3. brightness で表示画素平均が上がること。
         base_mean = _pixmap_mean(item._display_pixmap)
-        stack.push(SetPropertyCommand(scene, obj, "brightness", 0.5, obj.brightness))
+        stack.push(SetPropertyCommand(scene.document, obj, "brightness", 0.5, obj.brightness))
         bright_mean = _pixmap_mean(item._display_pixmap)
         assert bright_mean > base_mean + 10.0, "brightness 変更が反映されていない"
 

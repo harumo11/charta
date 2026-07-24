@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QStyleOptionGraphicsItem
 from app.export.pdf_exporter import export_pdf
 from app.export.png_exporter import artboard_pixel_size, export_png
 from app.export.svg_exporter import document_to_svg, export_svg
-from app.math.mathtext_render import MathRenderError, render_latex_to_svg
+from app.math.mathtext_render import MathRenderError, get_math_svg, render_latex_to_svg
 from app.model.document import Artboard, Document, Physical
 from app.model.objects import MathObject
 from app.model.serialize import load_document, save_document
@@ -161,7 +161,7 @@ def test_commit_latex_success_updates_model_and_undo_restores(qapp: Any) -> None
     from app.commands.commands import AddObjectCommand
 
     obj = MathObject(id=scene.document.new_id(), x=10.0, y=10.0, width=80.0, height=40.0, latex="a")
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert isinstance(item, MathItem)
 
@@ -183,7 +183,7 @@ def test_commit_latex_invalid_does_not_commit(qapp: Any) -> None:
     from app.commands.commands import AddObjectCommand
 
     obj = MathObject(id=scene.document.new_id(), x=10.0, y=10.0, width=80.0, height=40.0, latex="a")
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert isinstance(item, MathItem)
 
@@ -206,20 +206,20 @@ def test_invalid_latex_repeated_sync_renders_and_warns_only_once(
     qapp: Any, monkeypatch: Any
 ) -> None:
     """同一の不正 (latex, font_size, color) キーが続く間、`sync_from_model` を
-    何度呼んでも `render_latex_to_svg` の再呼び出し・再 warn は起きない
+    何度呼んでも `get_math_svg` の再呼び出し・再 warn は起きない
     （プロパティパネルが latex を無検証で編集し得るため、不正キー固定のまま
     繰り返し sync される経路が実到達する。失敗キーをキャッシュして防ぐ）。
     """
     doc, obj = _make_math_document(latex=r"\frac{")
 
     calls = {"n": 0}
-    original = math_item_mod.render_latex_to_svg
+    original = math_item_mod.get_math_svg
 
     def _counting(latex: str, font_size: float, color: str) -> str:
         calls["n"] += 1
         return original(latex, font_size, color)
 
-    monkeypatch.setattr(math_item_mod, "render_latex_to_svg", _counting)
+    monkeypatch.setattr(math_item_mod, "get_math_svg", _counting)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -247,7 +247,7 @@ def test_invalid_latex_repeated_sync_renders_and_warns_only_once(
 
 
 def test_commit_latex_success_renders_exactly_once(qapp: Any, monkeypatch: Any) -> None:
-    """成功する commit_latex 呼び出し1回につき `render_latex_to_svg` は合計1回だけ
+    """成功する commit_latex 呼び出し1回につき `get_math_svg` は合計1回だけ
     （検証レンダリングの結果をこの item にその場で反映し、`SetPropertyCommand` push
     後の `sync_from_model`/`_ensure_renderer` はキャッシュ鍵一致で再レンダリングしない）。
     """
@@ -258,18 +258,18 @@ def test_commit_latex_success_renders_exactly_once(qapp: Any, monkeypatch: Any) 
     from app.commands.commands import AddObjectCommand
 
     obj = MathObject(id=scene.document.new_id(), x=10.0, y=10.0, width=80.0, height=40.0, latex="a")
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert isinstance(item, MathItem)
 
     calls = {"n": 0}
-    original = math_item_mod.render_latex_to_svg
+    original = math_item_mod.get_math_svg
 
     def _counting(latex: str, font_size: float, color: str) -> str:
         calls["n"] += 1
         return original(latex, font_size, color)
 
-    monkeypatch.setattr(math_item_mod, "render_latex_to_svg", _counting)
+    monkeypatch.setattr(math_item_mod, "get_math_svg", _counting)
 
     ok = item.commit_latex(r"\alpha")
 
@@ -316,7 +316,7 @@ def test_math_tool_click_creates_object_with_reasonable_size_and_returns_to_sele
 
 
 # --------------------------------------------------------------------------
-# 5. save/load 往復: latex/font_size/color が一致(_svg_cache は非シリアライズ)
+# 5. save/load 往復: latex/font_size/color が一致(SVG はモデルにキャッシュされない)
 # --------------------------------------------------------------------------
 
 
@@ -324,15 +324,19 @@ def test_math_object_save_load_roundtrip(qapp: Any) -> None:
     doc, obj = _make_math_document(latex=r"\sum_{i=1}^n x_i")
     obj.font_size = 22.5
     obj.color = "#123456"
-    _ = create_item(obj, doc)  # _svg_cache を populate させる
-    assert obj._svg_cache != ""
+    item = create_item(obj, doc)
+    assert isinstance(item, MathItem)
+    # get_math_svg のキー付きキャッシュがヒットしていること(MathItem 自身の
+    # レンダラが正常生成されたことの確認。モデル側に SVG は保持しない、契約 P6)。
+    assert item._renderer is not None
+    assert get_math_svg.cache_info().currsize > 0
 
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp) / "math_project"
         save_document(doc, project_dir)
 
         raw = (project_dir / "project.json").read_text(encoding="utf-8")
-        assert "_svg_cache" not in raw, "_svg_cache は非シリアライズであること"
+        assert "_svg_cache" not in raw, "_svg_cache は project.json に一切現れないこと"
 
         loaded = load_document(project_dir)
 
@@ -381,6 +385,45 @@ def test_svg_export_embeds_nested_math_svg_and_is_well_formed(qapp: Any) -> None
     # matplotlib 生成 SVG の中身(path/use/g 等)が含まれていること(空でない)。
     children = list(nested)
     assert len(children) > 0, "ネスト svg の中身が空"
+
+
+def test_export_after_latex_change_reflects_new_formula_not_stale_cache(qapp: Any) -> None:
+    """P6 回帰テスト: latex 変更後に即 export しても新しい式が反映されること。
+
+    旧実装では `MathItem` が `self.obj._svg_cache = svg` へ書き込み、
+    `svg_exporter._render_math` はまず `obj._svg_cache` があればそれを優先して
+    使っていた。そのため、ビューを介さずモデルの `latex` だけを `set_values` で
+    書き換えて export すると、`_svg_cache` に残った旧式の SVG がそのまま出力
+    されてしまう潜在バグがあった。P6 で `_svg_cache` を全廃し `get_math_svg`
+    （キー付き lru_cache）に一本化したことで、export は常にモデルの現在値
+    (`obj.latex`)からレンダリングされ、この種の残留は構造的に起こり得ない。
+    """
+    latex_old = r"\alpha"
+    latex_new = r"\beta + \gamma^2"
+    doc, obj = _make_math_document(latex=latex_old)
+    item = create_item(obj, doc)  # ビュー側のレンダラ/(旧実装なら)_svg_cache を populate
+    assert isinstance(item, MathItem)
+    assert not hasattr(obj, "_svg_cache"), "MathObject は _svg_cache フィールドを持たない"
+
+    svg_old = document_to_svg(doc)
+
+    # ビュー(MathItem.sync_from_model/commit_latex)を経由せず、モデルだけを直接
+    # 書き換える(旧実装ならここで `_svg_cache` が古いまま残留していたシナリオ)。
+    doc.set_values(obj, {"latex": latex_new})
+    assert not hasattr(obj, "_svg_cache")
+
+    svg_after_change = document_to_svg(doc)
+    assert svg_after_change != svg_old, "latex 変更後は export される SVG も変わること"
+
+    # 「新式のパスが含まれ、旧式的な残留がない」ことを、latex_new のみを持つ
+    # 独立ドキュメントの export 結果とのバイト同一性で検証する(id は SVG に
+    # 現れないため、同一ジオメトリ・同一 latex なら出力は完全一致するはず)。
+    fresh_doc, _fresh_obj = _make_math_document(latex=latex_new)
+    svg_fresh = document_to_svg(fresh_doc)
+    assert svg_after_change == svg_fresh, (
+        "set_values 直後の export は、新式のみを持つ document の export と一致すること"
+        "（旧式の残留がないことの確認）"
+    )
 
 
 def test_svg_export_math_render_failure_falls_back_to_comment(qapp: Any) -> None:

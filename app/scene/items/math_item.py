@@ -12,7 +12,7 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt
+from PySide6.QtCore import QByteArray, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QPen
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -24,10 +24,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.math.mathtext_render import MathRenderError, render_latex_to_svg
+from app.math.mathtext_render import MathRenderError, get_math_svg
 from app.model.objects import BaseObject
-from app.scene.handles import BoxHandleSet
-from app.scene.items.base_item import BaseItem
+from app.scene.items.box_item import BoxItem
+from app.scene.items.registry import register_item
 
 if TYPE_CHECKING:
     from app.model.document import Document
@@ -45,15 +45,21 @@ def _cache_key(obj: BaseObject) -> tuple[str, float, str]:
 
 
 def _build_renderer(latex: str, font_size: float, color: str) -> tuple[QSvgRenderer, str]:
-    """latex を検証レンダリングし (renderer, svg文字列) を返す。失敗時 MathRenderError。"""
-    svg = render_latex_to_svg(latex, font_size, color)
+    """latex を検証レンダリングし (renderer, svg文字列) を返す。失敗時 MathRenderError。
+
+    SVG 生成は `get_math_svg`（キー付き lru_cache）経由に一本化する。同一キーでの
+    再呼び出しはキャッシュヒットするため、`commit_latex` の「1回のレンダリングで
+    完結させる」性能特性は自然に保たれる。
+    """
+    svg = get_math_svg(latex, font_size, color)
     renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
     if not renderer.isValid():
         raise MathRenderError("QSvgRenderer failed to parse generated SVG")
     return renderer, svg
 
 
-class MathItem(BaseItem):
+@register_item("math")
+class MathItem(BoxItem):
     """math オブジェクトを描画するアイテム。`BoxHandleSet`（8リサイズ+回転）で変形する。
 
     `aspect_locked = True`: リサイズハンドル（`BoxHandleSet`）は常にこのアイテムの
@@ -64,9 +70,6 @@ class MathItem(BaseItem):
 
     def __init__(self, obj: BaseObject, document: Document | None = None) -> None:
         super().__init__(obj, document)
-        self._w: float = obj.width
-        self._h: float = obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
         self._renderer: QSvgRenderer | None = None
         self._cache_key: tuple[str, float, str] | None = None
         self._render_error: bool = False
@@ -91,7 +94,7 @@ class MathItem(BaseItem):
         if self._render_error and key == self._failed_cache_key:
             return
         try:
-            renderer, svg = _build_renderer(self.obj.latex, self.obj.font_size, self.obj.color)
+            renderer, _svg = _build_renderer(self.obj.latex, self.obj.font_size, self.obj.color)
         except MathRenderError as exc:
             warnings.warn(f"math render failed for latex={self.obj.latex!r}: {exc}", stacklevel=2)
             self._render_error = True
@@ -101,7 +104,6 @@ class MathItem(BaseItem):
         self._cache_key = key
         self._render_error = False
         self._failed_cache_key = None
-        self.obj._svg_cache = svg
 
     def default_size(self) -> tuple[float, float]:
         """現在のレンダラの `defaultSize()` を px サイズとして返す（新規作成時の既定寸法用）。"""
@@ -126,13 +128,8 @@ class MathItem(BaseItem):
             return None
         return float(size.width()) / h
 
-    def sync_from_model(self) -> None:
-        self.prepareGeometryChange()
-        self._w = self.obj.width
-        self._h = self.obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
+    def _on_sync_geometry(self) -> None:
         self._ensure_renderer()
-        super().sync_from_model()
 
     def boundingRect(self) -> QRectF:
         return QRectF(0.0, 0.0, self._w, self._h).adjusted(-1.0, -1.0, 1.0, 1.0)
@@ -171,47 +168,6 @@ class MathItem(BaseItem):
         fit_x = rect.x() + (rect.width() - fit_w) / 2.0
         fit_y = rect.y() + (rect.height() - fit_h) / 2.0
         return QRectF(fit_x, fit_y, fit_w, fit_h)
-
-    def create_handles(self) -> BoxHandleSet:
-        return BoxHandleSet(self)
-
-    # ------------------------------------------------------------------
-    # ライブ更新（ハンドル/ツールから呼ばれる。モデルは書かない）
-    # ------------------------------------------------------------------
-    def set_live_rect(self, x: float, y: float, w: float, h: float) -> None:
-        self.prepareGeometryChange()
-        self.setPos(x, y)
-        self._w = w
-        self._h = h
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-        self.update()
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def set_live_rotation(self, rotation: float) -> None:
-        self.setRotation(rotation)
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def live_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.pos().x(),
-            "y": self.pos().y(),
-            "width": self._w,
-            "height": self._h,
-            "rotation": self.rotation(),
-        }
-
-    def model_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.obj.x,
-            "y": self.obj.y,
-            "width": self.obj.width,
-            "height": self.obj.height,
-            "rotation": self.obj.rotation,
-        }
 
     # ------------------------------------------------------------------
     # LaTeX 再編集
@@ -292,7 +248,7 @@ class MathItem(BaseItem):
             self._last_commit_error = None
             return True
         try:
-            renderer, svg = _build_renderer(new_latex, self.obj.font_size, self.obj.color)
+            renderer, _svg = _build_renderer(new_latex, self.obj.font_size, self.obj.color)
         except MathRenderError as exc:
             warnings.warn(f"commit_latex rejected invalid latex={new_latex!r}: {exc}", stacklevel=2)
             self._last_commit_error = str(exc)
@@ -323,7 +279,6 @@ class MathItem(BaseItem):
         # 検証レンダリング結果をこの item に先出し反映する。push 後に走る
         # sync_from_model/_ensure_renderer が同一キャッシュ鍵とみなして
         # 再レンダリングしないようにするため（1回のレンダリングで完結させる）。
-        self.obj._svg_cache = svg
         self._renderer = renderer
         self._cache_key = _cache_key_for(new_latex, self.obj.font_size, self.obj.color)
         self._render_error = False
@@ -332,12 +287,14 @@ class MathItem(BaseItem):
         undo_stack.beginMacro("edit math")
         try:
             undo_stack.push(
-                SetPropertyCommand(scene, self.obj, "latex", new_latex, old_latex, text="edit math")
+                SetPropertyCommand(
+                    self._document, self.obj, "latex", new_latex, old_latex, text="edit math"
+                )
             )
             if needs_resize:
                 undo_stack.push(
                     SetGeometryCommand(
-                        scene,
+                        self._document,
                         self.obj,
                         {"width": target_w, "height": target_h},
                         {"width": old_w, "height": old_h},

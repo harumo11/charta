@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QPen
 from PySide6.QtWidgets import (
     QDialog,
@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
 
 from app.export.text_outline import text_to_path
 from app.model.objects import BaseObject
-from app.scene.handles import BoxHandleSet
-from app.scene.items.base_item import BaseItem
+from app.scene.items.box_item import BoxItem
+from app.scene.items.registry import register_item
 
 if TYPE_CHECKING:
     from app.model.document import Document
@@ -59,27 +59,18 @@ def default_text_size(text: str, font: QFont) -> tuple[float, float]:
     return (width, height)
 
 
-class TextItem(BaseItem):
+@register_item("text")
+class TextItem(BoxItem):
     """text オブジェクトを描画するアイテム。BoxHandleSet（8リサイズ+回転）で変形する。"""
 
     def __init__(self, obj: BaseObject, document: Document | None = None) -> None:
         super().__init__(obj, document)
-        self._w: float = obj.width
-        self._h: float = obj.height
         self._export_outline: bool = False
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
 
     def set_export_outline(self, enabled: bool) -> None:
         """エクスポート用のアウトライン描画モードを切り替える（既定 False = 通常表示）。"""
         self._export_outline = enabled
         self.update()
-
-    def sync_from_model(self) -> None:
-        self.prepareGeometryChange()
-        self._w = self.obj.width
-        self._h = self.obj.height
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-        super().sync_from_model()
 
     def boundingRect(self) -> QRectF:
         return QRectF(0.0, 0.0, self._w, self._h).adjusted(-1.0, -1.0, 1.0, 1.0)
@@ -106,47 +97,6 @@ class TextItem(BaseItem):
         align = _ALIGN_MAP.get(self.obj.align, Qt.AlignmentFlag.AlignLeft)
         flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
         painter.drawText(rect, flags, text)
-
-    def create_handles(self) -> BoxHandleSet:
-        return BoxHandleSet(self)
-
-    # ------------------------------------------------------------------
-    # ライブ更新（ハンドル/ツールから呼ばれる。モデルは書かない）
-    # ------------------------------------------------------------------
-    def set_live_rect(self, x: float, y: float, w: float, h: float) -> None:
-        self.prepareGeometryChange()
-        self.setPos(x, y)
-        self._w = w
-        self._h = h
-        self.setTransformOriginPoint(QPointF(self._w / 2.0, self._h / 2.0))
-        self.update()
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def set_live_rotation(self, rotation: float) -> None:
-        self.setRotation(rotation)
-        if self._handles is not None:
-            self._handles.update_positions()
-        self.geometryChanged.emit()
-
-    def live_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.pos().x(),
-            "y": self.pos().y(),
-            "width": self._w,
-            "height": self._h,
-            "rotation": self.rotation(),
-        }
-
-    def model_geometry(self) -> dict[str, float]:
-        return {
-            "x": self.obj.x,
-            "y": self.obj.y,
-            "width": self.obj.width,
-            "height": self.obj.height,
-            "rotation": self.obj.rotation,
-        }
 
     # ------------------------------------------------------------------
     # テキスト編集
@@ -213,12 +163,14 @@ class TextItem(BaseItem):
         undo_stack.beginMacro("edit text")
         try:
             undo_stack.push(
-                SetPropertyCommand(scene, self.obj, "text", new_text, old_text, text="edit text")
+                SetPropertyCommand(
+                    self._document, self.obj, "text", new_text, old_text, text="edit text"
+                )
             )
             if abs(new_height - old_height) > 1.0:
                 undo_stack.push(
                     SetGeometryCommand(
-                        scene,
+                        self._document,
                         self.obj,
                         {"height": new_height},
                         {"height": old_height},

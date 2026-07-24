@@ -18,8 +18,8 @@ import pytest
 from PySide6.QtCore import QPointF, Qt
 
 from app.commands.commands import AddObjectCommand
+from app.graphics.routing import anchors_for, nearest_anchor_name
 from app.model.objects import ConnectorObject, RectObject
-from app.scene.connector_routing import anchors_for, nearest_anchor_name
 from app.scene.items.connector_item import ConnectorItem
 from app.ui.main_window import MainWindow
 
@@ -48,7 +48,7 @@ def _add_rect(window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -56,7 +56,7 @@ def _add_connector(window: Any, **kwargs: Any) -> ConnectorObject:
     scene = window.scene
     stack = window.undo_stack
     conn = ConnectorObject(id=scene.document.new_id(), **kwargs)
-    stack.push(AddObjectCommand(scene, conn))
+    stack.push(AddObjectCommand(scene.document, conn))
     return conn
 
 

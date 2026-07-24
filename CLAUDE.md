@@ -78,6 +78,10 @@ charta/
 │   │   ├── objects.py           # 各オブジェクトのデータクラス（下記データモデル）
 │   │   ├── properties.py        # プロパティ定義・型・既定値
 │   │   └── serialize.py         # project.json 読み書き
+│   ├── graphics/                 # ★Qt非依存。view/export 共有の幾何・画像処理層（model のみに依存可）
+│   │   ├── routing.py            # コネクタのアンカー計算・経路生成（旧 scene/connector_routing.py）
+│   │   ├── image_pipeline.py     # crop/brightness/contrast 等の画像処理パイプライン
+│   │   └── arrows.py             # 矢じり幾何（線端短縮量・triangle/circle/open 点列）
 │   ├── scene/                   # ★ビュー層。モデル↔QGraphicsItem の同期
 │   │   ├── canvas_view.py       # QGraphicsView（ズーム/パン/ラバーバンド選択）
 │   │   ├── canvas_scene.py      # QGraphicsScene（sceneRect=アートボード）
@@ -216,7 +220,6 @@ myproject/
 | `latex` | str | LaTeX ソース（mathtext サブセット）。**再編集の真実源** |
 | `font_size` | float | pt |
 | `color` | str | 数式色 |
-| `_svg_cache` | str | 生成済み SVG（表示・PDF用。再生成可能なので保存は任意） |
 
 **connector**（図形に追従する矢印）
 | フィールド | 型 | 説明 |
@@ -323,6 +326,23 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 
 ## 13. コーディング規約・注意
 - モデル層（`model/`）に PySide6 を import しない（テスト容易性・分離のため）。
+- `app/graphics/`・`app/model/` は PySide6 を import しない（Qt 非依存の共有層。`app/graphics/` は model のみに依存可）。
 - モデルへの変更は必ず `QUndoCommand` 経由。ビューやパネルからモデルを直接変更しない。
 - 重い数値処理を Python の for ループで書かない（NumPy/QPainterPath に委譲）。
 - 型ヒントを付ける。`ruff` / `black` を CI 相当のローカルチェックに使う。
+
+---
+
+## 14. 新オブジェクト型追加手順書
+
+Phase 3（型ディスパッチのレジストリ化）により、新しいオブジェクト型の追加は各レイヤに **1 つずつの加法的登録を足すだけ** で完結する。**すべて追記のみ・既存分岐の編集不要**。既存の if/elif ラダーや型名リストを探して編集する必要はない。
+
+新しい型 `"foo"` を追加する場合の手順:
+
+1. **`app/model/objects.py`**: `BaseObject` を継承した `@dataclass` を定義し、`@register_object("foo")` を付与する。幾何の真実源が `x/y/width/height`（既定の `"box"`）以外なら `GEOMETRY: ClassVar[str] = "endpoints"` 等をオーバーライドする（`LineObject`/`ConnectorObject` の例を参照）。
+2. **`app/model/properties.py`**: プロパティパネル用の `PROPERTIES` 定義を追加する（フィールド名・型・既定値・UI ウィジェット種別）。
+3. **`app/scene/items/`**: 新しい item ファイル（または既存ファイルへの追記）を作り、`QGraphicsItem` サブクラスに `@register_item("foo")` を付与する（`ITEM_FACTORIES` への登録。`app/scene/items/__init__.py` の `create_item` は変更不要）。
+4. **`app/export/svg_exporter.py`**: `@register_svg_renderer("foo")` を付けたレンダラ関数を追加する（`SVG_RENDERERS` への登録。`_render_object` の分岐は変更不要）。
+5. **作成ツールが必要な場合**: `app/tools/tool_manager.py` の `self._handlers` テーブルに `"foo"` のエントリ（`_ToolHandlers(press, move, release)`）を追加し、`app/ui/main_window.py` の `_TOOL_LABELS` にツールバー表示名のタプルを追記する。
+
+いずれの手順も、既存の分岐・レジストリ辞書・テーブルへの **追記** のみで完結する（既存コードの編集は不要）。幾何（bbox・平行移動）が `"box"`/`"endpoints"`/`"connector"` のいずれとも異なる新しい `GEOMETRY` 種別が必要な場合のみ、`app/model/geometry.py` の `bounding_box`/`translate_geom` と `app/graphics/routing.py` の `anchors_for` に分岐を追加する（この場合に限り既存分岐への追記が必要）。

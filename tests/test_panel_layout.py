@@ -67,7 +67,7 @@ def _select_only(env: dict[str, Any], obj: Any) -> None:
 
 
 def _add(env: dict[str, Any], obj: Any) -> Any:
-    env["stack"].push(AddObjectCommand(env["scene"], obj))
+    env["stack"].push(AddObjectCommand(env["scene"].document, obj))
     return obj
 
 

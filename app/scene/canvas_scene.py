@@ -22,10 +22,6 @@ from app.scene.items.base_item import BaseItem
 Box = tuple[float, float, float, float]  # (x, y, w, h)
 Guide = tuple[str, float]  # ("v", x) 縦ガイド / ("h", y) 横ガイド
 
-# コネクタ/line 等、x/y/width/height を bbox の真実源として持たない種別
-# （p1/p2 や source_point/target_point が真実源）はスナップ対象の box から除く（M7契約 §5）。
-_NON_BOX_TYPES = frozenset({"line", "arrow", "connector"})
-
 _GRID_COLOR = QColor(0, 0, 0, 40)
 _GUIDE_COLOR = QColor(255, 0, 170, 200)
 
@@ -36,6 +32,7 @@ class CanvasScene(QGraphicsScene):
     def __init__(self, document: Document) -> None:
         super().__init__()
         self.document = document
+        self.document.add_listener(self)
         self.undo_stack: QUndoStack | None = None
         self._items: dict[int, BaseItem] = {}
         self._background_visible: bool = True
@@ -72,6 +69,51 @@ class CanvasScene(QGraphicsScene):
         self.update()
 
     # ------------------------------------------------------------------
+    # DocumentListener 実装（Stage B: モデル→ビュー同期の唯一の経路）
+    # ------------------------------------------------------------------
+    def on_object_added(self, obj: BaseObject, index: int) -> None:
+        """`document.add_object` の通知。item を生成する（resync_z は呼ばない）。"""
+        self.add_item_for(obj)
+
+    def on_object_removed(self, obj: BaseObject) -> None:
+        """`document.remove_object` の通知。対応 item を除去する。"""
+        self.remove_item_for(obj)
+
+    def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None:
+        """`document.set_values` の通知。対応 item をモデル値に同期する。"""
+        self.sync_item(obj)
+
+    def on_order_changed(self) -> None:
+        """`document.move_to_index` の通知。全 item の z 値を並び順に合わせ直す。"""
+        self.resync_z()
+
+    def on_artboard_changed(self) -> None:
+        """`document.set_artboard` の通知。sceneRect/背景を更新する。"""
+        self.apply_artboard_change()
+
+    def set_document(self, document: Document) -> None:
+        """`document` を差し替え、全 item を再構築する（プロジェクト読込/新規作成用）。
+
+        旧 document のリスナー登録を解除してから全 item を除去し（コネクタの
+        `destroy_bindings` 等、既存の削除経路の後始末を踏襲）、新 document を
+        設定してリスナー登録し直し、初期構築と同じ経路で item を再構築する。
+        """
+        self.document.remove_listener(self)
+        for item in list(self._items.values()):
+            destroy_bindings = getattr(item, "destroy_bindings", None)
+            if callable(destroy_bindings):
+                destroy_bindings()
+            self.removeItem(item)
+        self._items.clear()
+        self.document = document
+        self.document.add_listener(self)
+        for obj in list(self.document.objects):
+            self._try_add_item_for(obj)
+        self.rebind_connectors()
+        self.apply_artboard_change()
+        self.clearSelection()
+
+    # ------------------------------------------------------------------
     # グリッド（M7契約 §5）
     # ------------------------------------------------------------------
     def set_grid(self, visible: bool, size: float) -> None:
@@ -101,15 +143,15 @@ class CanvasScene(QGraphicsScene):
     def other_boxes_excluding(self, item: BaseItem | None) -> list[Box]:
         """`item`（移動中アイテム）以外の box 系オブジェクトのモデル bbox 一覧を返す。
 
-        line/arrow/connector は x/y/width/height を真実源として持たないため除外する。
-        非表示オブジェクトもスナップ対象から除外する。
+        line/arrow/connector（`GEOMETRY != "box"`）は x/y/width/height を真実源として
+        持たないため除外する。非表示オブジェクトもスナップ対象から除外する。
         """
         exclude_obj = getattr(item, "obj", None) if item is not None else None
         boxes: list[Box] = []
         for obj in self.document.objects:
             if obj is exclude_obj:
                 continue
-            if obj.type in _NON_BOX_TYPES:
+            if obj.GEOMETRY != "box":
                 continue
             if not obj.visible:
                 continue

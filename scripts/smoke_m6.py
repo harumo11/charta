@@ -24,10 +24,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from app.commands.commands import AddObjectCommand, SetGeometryCommand  # noqa: E402
 from app.export.pdf_exporter import export_pdf  # noqa: E402
 from app.export.svg_exporter import document_to_svg, export_svg  # noqa: E402
-from app.model.document import Document  # noqa: E402
-from app.model.objects import ConnectorObject, RectObject  # noqa: E402
-from app.model.serialize import load_document, save_document  # noqa: E402
-from app.scene.connector_routing import (  # noqa: E402
+from app.graphics.routing import (  # noqa: E402
     anchors_for,
     build_routing,
     compute_endpoints,
@@ -35,6 +32,9 @@ from app.scene.connector_routing import (  # noqa: E402
     nearest_anchor_name,
     resolve_anchor,
 )
+from app.model.document import Document  # noqa: E402
+from app.model.objects import ConnectorObject, RectObject  # noqa: E402
+from app.model.serialize import load_document, save_document  # noqa: E402
 from app.scene.items.connector_item import ConnectorItem  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 
@@ -54,7 +54,7 @@ def main() -> None:
     app = QApplication.instance() or QApplication([])
     assert app is not None
 
-    # --- 1. connector_routing: 純関数 ------------------------------------
+    # --- 1. app.graphics.routing: 純関数 ------------------------------------
     box = (0.0, 0.0, 100.0, 100.0)
     box_set = anchors_for("rect", box, None, None)
     assert len(box_set) == 9, "箱型は9点アンカー"
@@ -83,8 +83,8 @@ def main() -> None:
 
     rect1 = RectObject(id=scene.document.new_id(), x=0.0, y=0.0, width=100.0, height=80.0)
     rect2 = RectObject(id=scene.document.new_id(), x=300.0, y=300.0, width=100.0, height=80.0)
-    stack.push(AddObjectCommand(scene, rect1))
-    stack.push(AddObjectCommand(scene, rect2))
+    stack.push(AddObjectCommand(scene.document, rect1))
+    stack.push(AddObjectCommand(scene.document, rect2))
 
     conn = ConnectorObject(
         id=scene.document.new_id(),
@@ -95,7 +95,7 @@ def main() -> None:
         routing="straight",
         arrow_end="triangle",
     )
-    stack.push(AddObjectCommand(scene, conn))
+    stack.push(AddObjectCommand(scene.document, conn))
     conn_item = scene.item_for(conn)
     assert isinstance(
         conn_item, ConnectorItem
@@ -104,7 +104,9 @@ def main() -> None:
     # --- 3. 追従: rect1 移動 -> connector の端点追従、undo で戻る ---------
     before_points = list(conn_item._points)
     stack.push(
-        SetGeometryCommand(scene, rect1, {"x": 150.0, "y": 120.0}, {"x": rect1.x, "y": rect1.y})
+        SetGeometryCommand(
+            scene.document, rect1, {"x": 150.0, "y": 120.0}, {"x": rect1.x, "y": rect1.y}
+        )
     )
     after_points = list(conn_item._points)
     assert after_points != before_points, "connector should follow moved source"
@@ -205,7 +207,7 @@ def main() -> None:
 
     # --- 8. コネクタ編集UX: 端点ドラッグ付け替え/切り離し ------------------
     ux_rect_a = RectObject(id=scene.document.new_id(), x=1000.0, y=0.0, width=100.0, height=80.0)
-    stack.push(AddObjectCommand(scene, ux_rect_a))
+    stack.push(AddObjectCommand(scene.document, ux_rect_a))
     ux_conn = ConnectorObject(
         id=scene.document.new_id(),
         source_id=None,
@@ -214,7 +216,7 @@ def main() -> None:
         target_point=[1600.0, 600.0],
         routing="straight",
     )
-    stack.push(AddObjectCommand(scene, ux_conn))
+    stack.push(AddObjectCommand(scene.document, ux_conn))
     ux_conn_item = scene.item_for(ux_conn)
     assert isinstance(ux_conn_item, ConnectorItem)
     scene.clearSelection()
@@ -247,7 +249,7 @@ def main() -> None:
 
     # --- 9. コネクタ編集UX: アンカークリック --------------------------------
     ux_rect_b = RectObject(id=scene.document.new_id(), x=1000.0, y=300.0, width=100.0, height=80.0)
-    stack.push(AddObjectCommand(scene, ux_rect_b))
+    stack.push(AddObjectCommand(scene.document, ux_rect_b))
     anchor_conn = ConnectorObject(
         id=scene.document.new_id(),
         source_id=ux_rect_a.id,
@@ -256,7 +258,7 @@ def main() -> None:
         target_anchor="nearest",
         routing="straight",
     )
-    stack.push(AddObjectCommand(scene, anchor_conn))
+    stack.push(AddObjectCommand(scene.document, anchor_conn))
     anchor_conn_item = scene.item_for(anchor_conn)
     scene.clearSelection()
     anchor_conn_item.setSelected(True)
@@ -280,7 +282,7 @@ def main() -> None:
         target_point=[1200.0, 900.0],
         routing="straight",
     )
-    stack.push(AddObjectCommand(scene, body_conn))
+    stack.push(AddObjectCommand(scene.document, body_conn))
     body_conn_item = scene.item_for(body_conn)
 
     tm.set_tool("select")

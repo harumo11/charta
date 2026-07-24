@@ -55,7 +55,7 @@ def rect_env(window: Any, qapp: Any) -> dict[str, Any]:
     rect = RectObject(
         id=scene.document.new_id(), x=100, y=100, width=120, height=90, fill="#FF0000"
     )
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     item = scene.item_for(rect)
     assert item is not None
     scene.clearSelection()
@@ -204,7 +204,7 @@ def test_undo_redo_resync_does_not_crash(rect_env: dict[str, Any]) -> None:
     app.processEvents()
 
     old_fill = rect.fill
-    stack.push(SetPropertyCommand(scene, rect, "fill", "#00FF00", old_fill))
+    stack.push(SetPropertyCommand(scene.document, rect, "fill", "#00FF00", old_fill))
     assert rect.fill == "#00FF00"
     stack.undo()
     assert rect.fill == old_fill
@@ -229,7 +229,7 @@ def test_normal_operation_panels_stay_in_sync(rect_env: dict[str, Any]) -> None:
     window.property_panel.on_selection_changed()
     assert window.property_panel._form.rowCount() == len(PROPERTIES["rect"])
 
-    stack.push(SetPropertyCommand(scene, rect, "stroke_width", 5.0, rect.stroke_width))
+    stack.push(SetPropertyCommand(scene.document, rect, "stroke_width", 5.0, rect.stroke_width))
     app.processEvents()
     assert window.property_panel._form.rowCount() == len(PROPERTIES["rect"])
 
@@ -266,7 +266,7 @@ def test_property_panel_handles_arrow_selection_without_keyerror(
     app = rect_env["app"]
 
     arrow = new_object("arrow", id=scene.document.new_id(), p1=[0.0, 0.0], p2=[50.0, 60.0])
-    stack.push(AddObjectCommand(scene, arrow))
+    stack.push(AddObjectCommand(scene.document, arrow))
     item = scene.item_for(arrow)
     scene.clearSelection()
     item.setSelected(True)
@@ -308,16 +308,20 @@ def test_set_geometry_command_merge_behavior(rect_env: dict[str, Any]) -> None:
     rect = rect_env["rect"]
 
     idx_before = stack.index()
-    stack.push(SetGeometryCommand(scene, rect, {"x": 105.0}, {"x": 100.0}, mergeable=True))
-    stack.push(SetGeometryCommand(scene, rect, {"x": 110.0}, {"x": 105.0}, mergeable=True))
-    stack.push(SetGeometryCommand(scene, rect, {"x": 120.0}, {"x": 110.0}, mergeable=True))
+    stack.push(SetGeometryCommand(scene.document, rect, {"x": 105.0}, {"x": 100.0}, mergeable=True))
+    stack.push(SetGeometryCommand(scene.document, rect, {"x": 110.0}, {"x": 105.0}, mergeable=True))
+    stack.push(SetGeometryCommand(scene.document, rect, {"x": 120.0}, {"x": 110.0}, mergeable=True))
     assert stack.index() == idx_before + 1, "mergeable=True の連続編集は1エントリに統合される"
     assert rect.x == 120.0
     stack.undo()
     assert rect.x == 100.0, "統合されたコマンドの undo で最初の old 値に戻る"
 
     idx_before2 = stack.index()
-    stack.push(SetGeometryCommand(scene, rect, {"y": 105.0}, {"y": 100.0}, mergeable=False))
-    stack.push(SetGeometryCommand(scene, rect, {"y": 110.0}, {"y": 105.0}, mergeable=False))
+    stack.push(
+        SetGeometryCommand(scene.document, rect, {"y": 105.0}, {"y": 100.0}, mergeable=False)
+    )
+    stack.push(
+        SetGeometryCommand(scene.document, rect, {"y": 110.0}, {"y": 105.0}, mergeable=False)
+    )
     assert stack.index() == idx_before2 + 2, "mergeable=False の連続編集は統合されない"
     assert rect.y == 110.0

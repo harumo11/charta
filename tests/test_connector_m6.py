@@ -1,6 +1,6 @@
 """Milestone 6（コネクタ）テスト（M6契約 §10、CLAUDE.md §9.3）。
 
-connector_routing の純関数、追従（接続先移動→端点再計算、undo で復元）、
+app.graphics.routing の純関数、追従（接続先移動→端点再計算、undo で復元）、
 削除時の端点固定化（1回の undo で全復元）、connector ツールでの生成、
 save/load 往復、SVG/PDF エクスポート、base_item 変更の回帰を検証する。
 """
@@ -18,17 +18,17 @@ from PySide6.QtCore import QPointF, Qt
 from app.commands.commands import AddObjectCommand, SetGeometryCommand
 from app.export.pdf_exporter import export_pdf
 from app.export.svg_exporter import document_to_svg
-from app.model.document import Document
-from app.model.objects import ConnectorObject, RectObject
-from app.model.serialize import load_document, save_document
-from app.scene.canvas_scene import CanvasScene
-from app.scene.connector_routing import (
+from app.graphics.routing import (
     anchors_for,
     build_routing,
     compute_endpoints,
     endpoint_direction,
     resolve_anchor,
 )
+from app.model.document import Document
+from app.model.objects import ConnectorObject, RectObject
+from app.model.serialize import load_document, save_document
+from app.scene.canvas_scene import CanvasScene
 from app.scene.items.connector_item import ConnectorItem
 from app.ui.main_window import MainWindow
 
@@ -47,7 +47,7 @@ class _FakeEvent:
 
 
 # --------------------------------------------------------------------------
-# connector_routing: 純関数（Qt 非依存）
+# app.graphics.routing: 純関数（Qt 非依存）
 # --------------------------------------------------------------------------
 
 
@@ -157,7 +157,7 @@ def _add_rect(window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -176,7 +176,7 @@ def _add_connector(
         arrow_end=kwargs.pop("arrow_end", "triangle"),
         **kwargs,
     )
-    stack.push(AddObjectCommand(scene, conn))
+    stack.push(AddObjectCommand(scene.document, conn))
     return conn
 
 
@@ -201,7 +201,7 @@ def test_connector_follows_source_move_and_undo_restores(window: Any) -> None:
 
     old_geom = {"x": rect1.x, "y": rect1.y}
     new_geom = {"x": rect1.x + 150.0, "y": rect1.y + 120.0}
-    stack.push(SetGeometryCommand(scene, rect1, new_geom, old_geom))
+    stack.push(SetGeometryCommand(scene.document, rect1, new_geom, old_geom))
 
     after_points = list(conn_item._points)
     after_bbox = conn_item.boundingRect()
@@ -226,7 +226,7 @@ def test_connector_follows_target_move_too(window: Any) -> None:
 
     old_geom = {"x": rect2.x, "y": rect2.y}
     new_geom = {"x": rect2.x + 80.0, "y": rect2.y - 40.0}
-    stack.push(SetGeometryCommand(scene, rect2, new_geom, old_geom))
+    stack.push(SetGeometryCommand(scene.document, rect2, new_geom, old_geom))
 
     after_points = list(conn_item._points)
     assert after_points != before_points
@@ -352,7 +352,7 @@ def test_delete_connector_stops_following_endpoint_moves_after_removal(window: A
 
     old_geom = {"x": rect1.x, "y": rect1.y}
     new_geom = {"x": rect1.x + 150.0, "y": rect1.y + 120.0}
-    stack.push(SetGeometryCommand(scene, rect1, new_geom, old_geom))
+    stack.push(SetGeometryCommand(scene.document, rect1, new_geom, old_geom))
 
     # 削除済みコネクタは購読が切れているため、接続先を動かしても再計算されない。
     assert (
@@ -632,6 +632,6 @@ def test_geometry_changed_emit_does_not_write_back_to_model(window: Any) -> None
 
     old_geom = {"x": rect1.x, "y": rect1.y}
     new_geom = {"x": rect1.x + 10.0, "y": rect1.y + 5.0}
-    stack.push(SetGeometryCommand(scene, rect1, new_geom, old_geom))
+    stack.push(SetGeometryCommand(scene.document, rect1, new_geom, old_geom))
 
     assert (rect2.x, rect2.y, rect2.width, rect2.height) == snapshot

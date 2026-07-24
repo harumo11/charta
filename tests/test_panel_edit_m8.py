@@ -88,7 +88,7 @@ def _select_only(env: dict[str, Any], obj: Any) -> None:
 
 
 def _add(env: dict[str, Any], obj: Any) -> Any:
-    env["stack"].push(AddObjectCommand(env["scene"], obj))
+    env["stack"].push(AddObjectCommand(env["scene"].document, obj))
     return obj
 
 
@@ -528,14 +528,14 @@ def test_layer_panel_rebuilds_on_add_and_remove(env: dict[str, Any]) -> None:
     assert list_widget.count() == 0
 
     rect_a = RectObject(id=scene.document.new_id(), x=0, y=0, width=10, height=10)
-    stack.push(AddObjectCommand(scene, rect_a))
+    stack.push(AddObjectCommand(scene.document, rect_a))
     assert list_widget.count() == 1
 
     rect_b = RectObject(id=scene.document.new_id(), x=20, y=0, width=10, height=10)
-    stack.push(AddObjectCommand(scene, rect_b))
+    stack.push(AddObjectCommand(scene.document, rect_b))
     assert list_widget.count() == 2
 
-    stack.push(RemoveObjectCommand(scene, rect_a))
+    stack.push(RemoveObjectCommand(scene.document, rect_a))
     assert list_widget.count() == 1
     remaining_ids = {list_widget.item(i).data(_ID_ROLE) for i in range(list_widget.count())}
     assert remaining_ids == {rect_b.id}

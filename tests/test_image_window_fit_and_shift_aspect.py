@@ -134,7 +134,8 @@ def test_menu_import_fills_viewport_without_margin(
     png = tmp_path / "menu.png"
     _make_png(png, 600, 300)
     monkeypatch.setattr(
-        "app.ui.main_window.QFileDialog.getOpenFileName", lambda *a, **k: (str(png), "")
+        "app.ui.controllers.image_import.QFileDialog.getOpenFileName",
+        lambda *a, **k: (str(png), ""),
     )
     window.import_image_action()
     obj = window.scene.document.objects[-1]

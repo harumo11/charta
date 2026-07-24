@@ -3,7 +3,7 @@
 接続端点が回転前の軸並行 bbox 位置に残っていた不整合）。
 
 - `anchors_for()` の箱型9点が `item.mapToScene()` と一致すること（オラクル照合）。
-  Qt の回転規約（正=時計回り、y下向き）と `connector_routing._rotate_point` が
+  Qt の回転規約（正=時計回り、y下向き）と `app.graphics.routing._rotate_point` が
   一致していることを担保する。
 - コネクタが rect の非中心アンカー（"tr"）に接続している状態で rotation を
   `SetGeometryCommand` 経由で変更すると、端点・アンカードットが回転後の位置へ
@@ -26,9 +26,9 @@ from PySide6.QtCore import QPointF
 
 from app.commands.commands import AddObjectCommand, SetGeometryCommand
 from app.export.svg_exporter import document_to_svg
+from app.graphics.routing import anchors_for
 from app.model.document import Document
 from app.model.objects import ConnectorObject, LineObject, RectObject
-from app.scene.connector_routing import anchors_for
 from app.scene.items.connector_item import ConnectorItem
 from app.ui.main_window import MainWindow
 
@@ -71,7 +71,7 @@ def _add_rect(window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -79,7 +79,7 @@ def _add_connector(window: Any, **kwargs: Any) -> ConnectorObject:
     scene = window.scene
     stack = window.undo_stack
     conn = ConnectorObject(id=scene.document.new_id(), **kwargs)
-    stack.push(AddObjectCommand(scene, conn))
+    stack.push(AddObjectCommand(scene.document, conn))
     return conn
 
 
@@ -95,7 +95,7 @@ def _set_rotation(window: Any, rect: RectObject, rotation: float) -> None:
     scene = window.scene
     old_geom = {"rotation": rect.rotation}
     new_geom = {"rotation": rotation}
-    window.undo_stack.push(SetGeometryCommand(scene, rect, new_geom, old_geom))
+    window.undo_stack.push(SetGeometryCommand(scene.document, rect, new_geom, old_geom))
 
 
 # --------------------------------------------------------------------------

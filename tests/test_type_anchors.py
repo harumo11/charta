@@ -22,10 +22,10 @@ from PySide6.QtWidgets import QFormLayout
 from app.commands.commands import AddObjectCommand, SetPropertyCommand
 from app.export.pdf_exporter import export_pdf
 from app.export.svg_exporter import document_to_svg, export_svg
+from app.graphics.routing import anchors_for
 from app.model.document import Document
 from app.model.objects import ConnectorObject, LineObject, RectObject
 from app.model.properties import PROPERTIES
-from app.scene.connector_routing import anchors_for
 from app.scene.items.connector_item import ConnectorItem
 from app.ui.main_window import MainWindow
 
@@ -55,7 +55,7 @@ def _add_rect(window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -63,7 +63,7 @@ def _add_line(window: Any, p1: tuple[float, float], p2: tuple[float, float]) -> 
     scene = window.scene
     stack = window.undo_stack
     line = LineObject(id=scene.document.new_id(), type="line", p1=list(p1), p2=list(p2))
-    stack.push(AddObjectCommand(scene, line))
+    stack.push(AddObjectCommand(scene.document, line))
     return line
 
 
@@ -71,7 +71,7 @@ def _add_connector(window: Any, **kwargs: Any) -> ConnectorObject:
     scene = window.scene
     stack = window.undo_stack
     conn = ConnectorObject(id=scene.document.new_id(), **kwargs)
-    stack.push(AddObjectCommand(scene, conn))
+    stack.push(AddObjectCommand(scene.document, conn))
     return conn
 
 
@@ -369,7 +369,7 @@ def test_reassign_source_from_box_to_line_with_stale_box_only_anchor_falls_back(
     assert conn_item._points[0] == pytest.approx((0.0, 0.0)), "tl は rect では左上隅"
 
     # 接続先を line に付け替える（source_anchor は "tl" のまま、line には無い名前）。
-    stack.push(SetPropertyCommand(scene, conn, "source_id", line.id, rect.id))
+    stack.push(SetPropertyCommand(scene.document, conn, "source_id", line.id, rect.id))
 
     # クラッシュせず、"tl" が line の anchor_set に無いため center（線分の中点）へ
     # フォールバックする（種類別アンカー契約: 旧名が無効な場合 center へフォールバック）。
@@ -459,7 +459,7 @@ def test_svg_export_line_connected_connector_endpoint_matches_p2() -> None:
     paths = root.findall(".//svg:path", _NS)
     # arrow_end="triangle" のため終端は矢じり分だけ手前に短縮された座標になる。
     # target_anchor="end" が line の p2=(260,260) に解決されていること自体は
-    # PDF/SVG 双方で connector_routing の compute_endpoints を経由するため、
+    # PDF/SVG 双方で app.graphics.routing の compute_endpoints を経由するため、
     # ここでは「整形式のベクター path が出力される」ことを確認する。
     assert len(paths) >= 2
 

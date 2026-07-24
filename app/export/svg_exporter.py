@@ -7,27 +7,32 @@ Qt の `QSvgGenerator` 経由の `scene.render()` は `QGraphicsSvgItem`・`QPix
 対応種別: rect / ellipse / line / arrow / freehand / text / image / math。
 math（数式）は matplotlib が生成した SVG をそのまま入れ子 `<svg>` として挿入する
 ことでベクター保持する（§8「そのまま入れ子挿入」）。未対応種別は XML コメントとして
-安全にスキップし将来の拡張を妨げない（`_render_object` の分岐に追加するだけで足りる
-構造）。
+安全にスキップし将来の拡張を妨げない（`SVG_RENDERERS` への `@register_svg_renderer`
+登録を追加するだけで足りる構造。Phase 3 契約 Stage 1C）。
 """
 
 from __future__ import annotations
 
-import math
 import os
 import re
 import sys
 import warnings
+from collections.abc import Callable
 from xml.sax.saxutils import escape, quoteattr
 
 from PySide6.QtCore import QRectF
 from PySide6.QtGui import QFont, QFontMetricsF, QPainterPath
 
 from app.export.text_outline import text_to_path
-from app.math.mathtext_render import MathRenderError, render_latex_to_svg
-from app.model.document import Document
-from app.model.objects import BaseObject
-from app.scene.connector_routing import (
+from app.graphics.arrows import (
+    circle_center_radius,
+    open_segment_ends,
+    shorten_amount,
+    triangle_points,
+    unit_vector,
+)
+from app.graphics.image_pipeline import processed_png_base64
+from app.graphics.routing import (
     Box,
     Point,
     anchors_for,
@@ -35,15 +40,12 @@ from app.scene.connector_routing import (
     compute_endpoints,
     endpoint_direction,
 )
-from app.scene.items.image_item import processed_png_base64
+from app.math.mathtext_render import MathRenderError, get_math_svg
+from app.model.document import Document
+from app.model.objects import BaseObject, geometry_kind
 
 _SVG_NS = "http://www.w3.org/2000/svg"
 _XLINK_NS = "http://www.w3.org/1999/xlink"
-
-# line/arrow の矢じり形状ごとに、線本体を端点側からどれだけ短縮するか
-# （shape_item.LineItem の描画と同じ値。突き抜け/隙間防止）。
-_ARROW_SHORTEN: dict[str, float] = {"triangle": 1.0, "circle": 0.5, "open": 0.0}
-_ARROW_OPEN_ANGLE = math.radians(28.0)
 
 _ALIGN_ANCHOR: dict[str, str] = {"left": "start", "center": "middle", "right": "end"}
 
@@ -205,14 +207,6 @@ def _render_freehand(obj: BaseObject) -> str:
     )
 
 
-def _unit_vector(x1: float, y1: float, x2: float, y2: float) -> tuple[float, float] | None:
-    dx, dy = x2 - x1, y2 - y1
-    length = math.hypot(dx, dy)
-    if length == 0.0:
-        return None
-    return (dx / length, dy / length)
-
-
 def _render_arrowhead(
     tip_x: float,
     tip_y: float,
@@ -223,33 +217,32 @@ def _render_arrowhead(
     stroke: str,
     stroke_width: float,
 ) -> str:
-    """`tip` に、線が `(dx, dy)` 向きに向かう前提での矢じりを描く（LineItem と同じ形状）。"""
+    """`tip` に、線が `(dx, dy)` 向きに向かう前提での矢じりを描く（LineItem と同じ形状）。
+
+    幾何計算（線端短縮量・triangle/circle/open の点列）は `app.graphics.arrows`
+    に委譲する（Phase 1 契約 §1C/Stage2 §3）。SVG 文字列組み立てのみここで行う。
+    """
+    tip = (tip_x, tip_y)
+    direction = (dx, dy)
     if shape == "triangle":
-        base_cx, base_cy = tip_x - dx * size, tip_y - dy * size
-        perp = (-dy, dx)
-        half_w = size * 0.4
-        b1x, b1y = base_cx + perp[0] * half_w, base_cy + perp[1] * half_w
-        b2x, b2y = base_cx - perp[0] * half_w, base_cy - perp[1] * half_w
+        tip_pt, b1, b2 = triangle_points(tip, direction, size)
         d = (
-            f"M {_fmt(tip_x)} {_fmt(tip_y)} L {_fmt(b1x)} {_fmt(b1y)} "
-            f"L {_fmt(b2x)} {_fmt(b2y)} Z"
+            f"M {_fmt(tip_pt[0])} {_fmt(tip_pt[1])} L {_fmt(b1[0])} {_fmt(b1[1])} "
+            f"L {_fmt(b2[0])} {_fmt(b2[1])} Z"
         )
         return f'<path d="{d}" fill={quoteattr(stroke)}/>'
     if shape == "circle":
-        r = size * 0.5
+        center, r = circle_center_radius(tip, size)
         return (
-            f'<circle cx="{_fmt(tip_x)}" cy="{_fmt(tip_y)}" r="{_fmt(r)}"'
+            f'<circle cx="{_fmt(center[0])}" cy="{_fmt(center[1])}" r="{_fmt(r)}"'
             f" fill={quoteattr(stroke)}/>"
         )
     if shape == "open":
-        back = (-dx, -dy)
-        segs = []
-        for sign in (1.0, -1.0):
-            angle = sign * _ARROW_OPEN_ANGLE
-            rx = back[0] * math.cos(angle) - back[1] * math.sin(angle)
-            ry = back[0] * math.sin(angle) + back[1] * math.cos(angle)
-            ex, ey = tip_x + rx * size, tip_y + ry * size
-            segs.append(f"M {_fmt(tip_x)} {_fmt(tip_y)} L {_fmt(ex)} {_fmt(ey)}")
+        end_plus, end_minus = open_segment_ends(tip, direction, size)
+        segs = [
+            f"M {_fmt(tip_x)} {_fmt(tip_y)} L {_fmt(end_plus[0])} {_fmt(end_plus[1])}",
+            f"M {_fmt(tip_x)} {_fmt(tip_y)} L {_fmt(end_minus[0])} {_fmt(end_minus[1])}",
+        ]
         d = " ".join(segs)
         return (
             f'<path d="{d}" fill="none" stroke={quoteattr(stroke)}'
@@ -261,16 +254,16 @@ def _render_arrowhead(
 def _render_line(obj: BaseObject) -> str:
     x1, y1 = float(obj.p1[0]), float(obj.p1[1])
     x2, y2 = float(obj.p2[0]), float(obj.p2[1])
-    direction = _unit_vector(x1, y1, x2, y2)
+    direction = unit_vector((x1, y1), (x2, y2))
     arrow_size = max(float(obj.arrow_size), 0.0)
     lx1, ly1, lx2, ly2 = x1, y1, x2, y2
     if direction is not None and arrow_size > 0.0:
         dx, dy = direction
         if obj.arrow_end != "none":
-            shorten = _ARROW_SHORTEN.get(obj.arrow_end, 0.0) * arrow_size
+            shorten = shorten_amount(obj.arrow_end, arrow_size)
             lx2, ly2 = x2 - dx * shorten, y2 - dy * shorten
         if obj.arrow_start != "none":
-            shorten = _ARROW_SHORTEN.get(obj.arrow_start, 0.0) * arrow_size
+            shorten = shorten_amount(obj.arrow_start, arrow_size)
             lx1, ly1 = x1 + dx * shorten, y1 + dy * shorten
 
     stroke_width_attr = f' stroke-width="{_fmt(obj.stroke_width)}"'
@@ -314,7 +307,7 @@ def _connector_anchor_set(document: Document, oid: int | None) -> dict[str, Poin
     obj = document.object_by_id(oid)
     if obj is None:
         return None
-    if obj.type in ("line", "arrow"):
+    if geometry_kind(obj.type) == "endpoints":
         p1: Point = (float(obj.p1[0]), float(obj.p1[1]))
         p2: Point = (float(obj.p2[0]), float(obj.p2[1]))
         return anchors_for(obj.type, None, p1, p2)
@@ -323,7 +316,7 @@ def _connector_anchor_set(document: Document, oid: int | None) -> dict[str, Poin
 
 
 def _render_connector(document: Document, obj: BaseObject) -> str:
-    """connector を `connector_routing` でモデルから端点/ルーティングを解いて描画する。"""
+    """connector を `app.graphics.routing` でモデルから端点/ルーティングを解いて描画する。"""
     src_set = _connector_anchor_set(document, obj.source_id)
     tgt_set = _connector_anchor_set(document, obj.target_id)
     src_point: Point = (float(obj.source_point[0]), float(obj.source_point[1]))
@@ -337,7 +330,7 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
     arrow_size = _CONNECTOR_ARROW_SIZE
     if obj.arrow_end != "none":
         dx, dy = endpoint_direction(points)
-        shorten = _ARROW_SHORTEN.get(obj.arrow_end, 0.0) * arrow_size
+        shorten = shorten_amount(obj.arrow_end, arrow_size)
         if shorten > 0.0:
             last_x, last_y = points[-1]
             line_points = points[:-1] + [(last_x - dx * shorten, last_y - dy * shorten)]
@@ -444,20 +437,20 @@ def _split_matplotlib_svg(svg_text: str) -> tuple[dict[str, str], str]:
 def _render_math(obj: BaseObject) -> str:
     """math を、matplotlib 生成 SVG の入れ子 `<svg>` としてそのまま挿入する（§8）。
 
-    `obj._svg_cache` があればそれを使い、無ければ `render_latex_to_svg` で生成する。
+    SVG 生成は `get_math_svg`（キー付き lru_cache）に一本化する。モデル側に古い
+    キャッシュを持たせない（層違反・鮮度バグの回避）ため、`obj.latex` が変わった
+    直後にエクスポートしても常に最新の latex に対応する SVG が使われる。
     生成/解析に失敗した場合は例外を握りつぶさず warn した上で、要素を省略し XML
     コメントで警告を残す（§9.4: 直前の有効表示維持はビュー側の責務、エクスポートは
     そのフレームでの最善描画を返せばよい）。
     """
-    svg_text = getattr(obj, "_svg_cache", "") or ""
-    if not svg_text:
-        try:
-            svg_text = render_latex_to_svg(obj.latex, obj.font_size, obj.color)
-        except MathRenderError as exc:
-            message = f"charta: 数式のレンダリングに失敗しました latex={obj.latex!r}: {exc}"
-            warnings.warn(message, stacklevel=2)
-            print(message, file=sys.stderr)
-            return _xml_comment(f"math: render failed for latex={obj.latex!r}: {exc}")
+    try:
+        svg_text = get_math_svg(obj.latex, obj.font_size, obj.color)
+    except MathRenderError as exc:
+        message = f"charta: 数式のレンダリングに失敗しました latex={obj.latex!r}: {exc}"
+        warnings.warn(message, stacklevel=2)
+        print(message, file=sys.stderr)
+        return _xml_comment(f"math: render failed for latex={obj.latex!r}: {exc}")
     try:
         attrs, inner = _split_matplotlib_svg(svg_text)
     except ValueError as exc:
@@ -474,25 +467,75 @@ def _render_math(obj: BaseObject) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# 型 → 描画関数のレジストリ（加法的登録、Phase 3 契約 Stage 1C）
+# --------------------------------------------------------------------------
+
+_SvgRenderFn = Callable[[Document, BaseObject, bool], str]
+
+SVG_RENDERERS: dict[str, _SvgRenderFn] = {}
+
+
+def register_svg_renderer(*type_names: str) -> Callable[[_SvgRenderFn], _SvgRenderFn]:
+    """`type_names` それぞれに対して `SVG_RENDERERS` へ描画関数を登録するデコレータ。
+
+    新しいオブジェクト型を SVG 出力に対応させるには、この形で登録関数を追加する
+    だけでよい（`_render_object` 側の分岐を編集する必要はない）。
+    """
+
+    def decorator(fn: _SvgRenderFn) -> _SvgRenderFn:
+        for name in type_names:
+            SVG_RENDERERS[name] = fn
+        return fn
+
+    return decorator
+
+
+@register_svg_renderer("rect")
+def _render_rect_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_rect(obj), obj)
+
+
+@register_svg_renderer("ellipse")
+def _render_ellipse_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_ellipse(obj), obj)
+
+
+@register_svg_renderer("line", "arrow")
+def _render_line_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_opacity(_render_line(obj), obj.opacity)
+
+
+@register_svg_renderer("freehand")
+def _render_freehand_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_freehand(obj), obj)
+
+
+@register_svg_renderer("text")
+def _render_text_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_text(obj, outline_text), obj)
+
+
+@register_svg_renderer("image")
+def _render_image_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_image(document, obj), obj)
+
+
+@register_svg_renderer("math")
+def _render_math_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_math(obj), obj)
+
+
+@register_svg_renderer("connector")
+def _render_connector_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _render_connector(document, obj)
+
+
 def _render_object(document: Document, obj: BaseObject, outline_text: bool) -> str:
-    obj_type = obj.type
-    if obj_type == "rect":
-        return _wrap_box(_render_rect(obj), obj)
-    if obj_type == "ellipse":
-        return _wrap_box(_render_ellipse(obj), obj)
-    if obj_type in ("line", "arrow"):
-        return _wrap_opacity(_render_line(obj), obj.opacity)
-    if obj_type == "freehand":
-        return _wrap_box(_render_freehand(obj), obj)
-    if obj_type == "text":
-        return _wrap_box(_render_text(obj, outline_text), obj)
-    if obj_type == "image":
-        return _wrap_box(_render_image(document, obj), obj)
-    if obj_type == "math":
-        return _wrap_box(_render_math(obj), obj)
-    if obj_type == "connector":
-        return _render_connector(document, obj)
-    return _xml_comment(f"unsupported object type for SVG export: {obj_type}")
+    renderer = SVG_RENDERERS.get(obj.type)
+    if renderer is None:
+        return _xml_comment(f"unsupported object type for SVG export: {obj.type}")
+    return renderer(document, obj, outline_text)
 
 
 # --------------------------------------------------------------------------

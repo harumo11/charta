@@ -204,7 +204,7 @@ def _add_rect(window: Any, x: float, y: float) -> RectObject:
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=10.0, height=10.0)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -219,7 +219,7 @@ def test_reorder_command_changes_document_order_and_item_z(window: Any) -> None:
 
     assert document.index_of(r0) == 0
     old_index = document.index_of(r0)
-    stack.push(ReorderCommand(scene, r0, 2, old_index))
+    stack.push(ReorderCommand(scene.document, r0, 2, old_index))
 
     assert document.index_of(r0) == 2
     assert [document.index_of(o) for o in (r1, r2)] == [0, 1]

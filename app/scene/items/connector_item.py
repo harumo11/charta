@@ -2,7 +2,7 @@
 
 端点は座標そのものではなく `source_id`/`target_id` + アンカーから都度計算される。
 接続先アイテムの `geometryChanged` を購読し、接続先が動く度に再計算・再描画する
-（`bind_endpoints()`）。アンカー計算・経路生成は `connector_routing`（Qt非依存）に委譲する。
+（`bind_endpoints()`）。アンカー計算・経路生成は `app.graphics.routing`（Qt非依存）に委譲する。
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ from typing import TYPE_CHECKING, Any
 
 import shiboken6
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainterPath, QPainterPathStroker, QPen, QTransform
+from PySide6.QtGui import QBrush, QColor, QPainterPath, QPainterPathStroker, QTransform
 from PySide6.QtWidgets import QGraphicsItem
 
 from app.commands.commands import SetPropertyCommand
-from app.model.objects import BaseObject
-from app.scene.connector_routing import (
+from app.graphics.arrows import shorten_amount
+from app.graphics.routing import (
     Box,
     Point,
     anchors_for,
@@ -27,15 +27,17 @@ from app.scene.connector_routing import (
     nearest_anchor_name,
     resolve_anchor,
 )
-from app.scene.handles import _HandleItem
+from app.model.objects import BaseObject
+from app.scene.handles import ConnectorHandleSet
+from app.scene.items.arrow_paint import paint_arrowhead
 from app.scene.items.base_item import BaseItem
+from app.scene.items.registry import register_item
 from app.scene.items.shape_item import pen_for
 
 if TYPE_CHECKING:
     from app.model.document import Document
 
 _ARROW_SIZE = 12.0  # ConnectorObject は arrow_size を持たないため既定値固定(§3)。
-_ARROW_SHORTEN: dict[str, float] = {"triangle": 1.0, "circle": 0.5, "open": 0.0}
 _SNAP_SCREEN_PX = 12.0  # アンカー磁石スナップの判定距離(画面px。回転ハンドル等と同様に換算)。
 
 
@@ -99,6 +101,7 @@ def _anchor_set_for_item(item: BaseItem) -> dict[str, Point]:
     return anchors_for(obj_type, box, None, None)
 
 
+@register_item("connector")
 class ConnectorItem(BaseItem):
     """connector オブジェクトを描画するアイテム。pos=(0,0) 固定・移動不可。"""
 
@@ -482,11 +485,11 @@ class ConnectorItem(BaseItem):
 
         if len(changes) == 1:
             key, new_value, old_value = changes[0]
-            undo_stack.push(SetPropertyCommand(scene, conn, key, new_value, old_value))
+            undo_stack.push(SetPropertyCommand(self._document, conn, key, new_value, old_value))
         else:
             undo_stack.beginMacro("connector endpoint")
             for key, new_value, old_value in changes:
-                undo_stack.push(SetPropertyCommand(scene, conn, key, new_value, old_value))
+                undo_stack.push(SetPropertyCommand(self._document, conn, key, new_value, old_value))
             undo_stack.endMacro()
         self.clear_live()
 
@@ -503,7 +506,7 @@ class ConnectorItem(BaseItem):
         if undo_stack is None or scene is None:
             # §13: undo_stack 不在時はモデルを直接変更しない。
             return
-        undo_stack.push(SetPropertyCommand(scene, self.obj, key, anchor, old_value))
+        undo_stack.push(SetPropertyCommand(self._document, self.obj, key, anchor, old_value))
 
     def bind_endpoints(self) -> None:
         """接続先 item の `geometryChanged` を購読する（張り替え時は旧接続を解除）。"""
@@ -604,7 +607,7 @@ class ConnectorItem(BaseItem):
         draw_points = [QPointF(*p) for p in points]
         if self._has_arrowhead():
             dx, dy = direction
-            shorten = _ARROW_SHORTEN.get(self.obj.arrow_end, 0.0) * _ARROW_SIZE
+            shorten = shorten_amount(self.obj.arrow_end, _ARROW_SIZE)
             if shorten:
                 draw_points[-1] = QPointF(tip.x() - dx * shorten, tip.y() - dy * shorten)
 
@@ -612,229 +615,10 @@ class ConnectorItem(BaseItem):
             painter.drawLine(draw_points[i], draw_points[i + 1])
 
         if self._has_arrowhead():
-            self._paint_arrowhead(painter, tip, direction, self.obj.arrow_end)
-
-    def _paint_arrowhead(self, painter: Any, tip: QPointF, direction: Point, shape: str) -> None:
-        dx, dy = direction
-        size = _ARROW_SIZE
-        color = QColor(self.obj.stroke) if self.obj.stroke else QColor(0, 0, 0)
-        if shape == "triangle":
-            base_center = QPointF(tip.x() - dx * size, tip.y() - dy * size)
-            perp = (-dy, dx)
-            half_w = size * 0.4
-            base1 = QPointF(base_center.x() + perp[0] * half_w, base_center.y() + perp[1] * half_w)
-            base2 = QPointF(base_center.x() - perp[0] * half_w, base_center.y() - perp[1] * half_w)
-            path = QPainterPath()
-            path.moveTo(tip)
-            path.lineTo(base1)
-            path.lineTo(base2)
-            path.closeSubpath()
-            painter.setPen(QPen(Qt.PenStyle.NoPen))
-            painter.setBrush(QBrush(color))
-            painter.drawPath(path)
-        elif shape == "circle":
-            radius = size * 0.5
-            painter.setPen(QPen(Qt.PenStyle.NoPen))
-            painter.setBrush(QBrush(color))
-            painter.drawEllipse(tip, radius, radius)
-        elif shape == "open":
-            angle_step = math.radians(28.0)
-            back = (-dx, -dy)
-            painter.setPen(pen_for(self.obj))
-            painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-            for sign in (1.0, -1.0):
-                angle = sign * angle_step
-                rx = back[0] * math.cos(angle) - back[1] * math.sin(angle)
-                ry = back[0] * math.sin(angle) + back[1] * math.cos(angle)
-                end = QPointF(tip.x() + rx * size, tip.y() + ry * size)
-                painter.drawLine(tip, end)
+            color = QColor(self.obj.stroke) if self.obj.stroke else QColor(0, 0, 0)
+            paint_arrowhead(
+                painter, tip, direction, self.obj.arrow_end, _ARROW_SIZE, pen_for(self.obj), color
+            )
 
     def create_handles(self) -> ConnectorHandleSet:
         return ConnectorHandleSet(self)
-
-
-_ANCHOR_DOT_SIZE = 6.0
-_ANCHOR_DOT_COLOR = "#FF6D00"  # 端点ハンドル(青四角)と区別するオレンジの円。
-_AUTO_DOT_COLOR = "#00C853"  # 自動(nearest)ドットを識別する緑系の円。
-_AUTO_DOT_OFFSET = 24.0  # 回転ハンドルと同様、画面上で一定距離になるよう view スケールで換算。
-
-
-class ConnectorHandleSet:
-    """connector 用ハンドル集合（種類別アンカー契約 §3）。
-
-    - 端点ハンドル×2（role "source"/"target"）: ドラッグで再ルーティング/付け替え/切り離し。
-      `_HandleItem` の既定スタイル（青枠白四角）をそのまま使い、他 item の選択ハンドルと
-      統一する。
-    - アンカードット（role "anchor:<which>:<name>"）: 接続端ごとに、接続先の種類別
-      アンカー集合（箱型9点/直線3点、`parent.anchor_positions(which)`）の全点に表示する。
-      図形に接続している端にのみ表示し、クリックでアンカーを変更する。オレンジの円で
-      端点ハンドルと視覚的に区別し、現在アンカーは塗りをアクセント色にしてハイライトする。
-    - 自動ドット（role "anchor:<which>:nearest"）: 接続端ごとに1個、接続先 bbox の上辺
-      中央から画面上一定距離だけ上にオフセットした位置に緑系の円で表示する。クリックで
-      アンカーを "nearest"（自動）に戻す。
-    """
-
-    def __init__(self, parent_item: ConnectorItem) -> None:
-        self.parent_item = parent_item
-        self._endpoint_handles: dict[str, _HandleItem] = {
-            "source": _HandleItem(self, "source", parent_item),
-            "target": _HandleItem(self, "target", parent_item),
-        }
-        self._anchor_dots: dict[str, _HandleItem] = {}
-        self.update_positions()
-
-    def destroy(self) -> None:
-        for handle in list(self._endpoint_handles.values()) + list(self._anchor_dots.values()):
-            handle.setParentItem(None)
-            scene = handle.scene()
-            if scene is not None:
-                scene.removeItem(handle)
-        self._anchor_dots = {}
-
-    def update_positions(self) -> None:
-        p1, p2 = self.parent_item.endpoint_scene_points()
-        self._endpoint_handles["source"].setPos(QPointF(*p1))
-        self._endpoint_handles["target"].setPos(QPointF(*p2))
-        self._sync_anchor_dots()
-
-    def _auto_dot_offset(self) -> float:
-        """自動ドットのオフセットを画面上で一定距離になるよう view の現在スケールで換算する。"""
-        scene = self.parent_item.scene()
-        if scene is not None:
-            views = scene.views()
-            if views:
-                scale = views[0].transform().m11()
-                if scale:
-                    return _AUTO_DOT_OFFSET / scale
-        return _AUTO_DOT_OFFSET
-
-    def _connected_anchor_sets(self) -> dict[str, dict[str, Point]]:
-        connected: dict[str, dict[str, Point]] = {}
-        for which in ("source", "target"):
-            anchor_set = self.parent_item.anchor_positions(which)
-            if anchor_set is not None:
-                connected[which] = anchor_set
-        return connected
-
-    def _expected_roles(self, connected: dict[str, dict[str, Point]]) -> set[str]:
-        expected: set[str] = set()
-        for which, anchor_set in connected.items():
-            for name in anchor_set:
-                expected.add(f"anchor:{which}:{name}")
-            expected.add(f"anchor:{which}:nearest")
-        return expected
-
-    def _sync_anchor_dots(self) -> None:
-        connected = self._connected_anchor_sets()
-        if set(self._anchor_dots) != self._expected_roles(connected):
-            # 接続状態(付け替え/切り離し)や接続先の種類(箱型9点<->直線3点)が
-            # 変わった場合は作り直す(契約 §3)。
-            self._rebuild_anchor_dots(connected)
-            return
-        for which, anchor_set in connected.items():
-            current = self.parent_item.current_anchor(which)
-            for name, (px, py) in anchor_set.items():
-                dot = self._anchor_dots.get(f"anchor:{which}:{name}")
-                if dot is None:
-                    continue
-                dot.setPos(QPointF(px, py))
-                dot.set_highlighted(name == current)
-            self._position_auto_dot(which, current)
-
-    def _position_auto_dot(self, which: str, current: str) -> None:
-        """自動(nearest)ドットを接続先の**種類別アンカー基準点**の少し上に置く。
-
-        軸並行 bbox の上辺中央（旧実装）だと、直線/矢印のように bbox が実体から
-        大きく外れる形状（対角線など）では緑ドットが線から離れた空間に浮いて
-        見えてしまう（バグ報告）。種類別アンカー集合（箱型9点/直線3点、
-        `anchor_positions()`）を基準にすることで、箱型は従来どおり上辺の上、
-        直線/矢印は線分の中点（`center`）の少し上＝線のすぐ近くに追従する。
-        """
-        auto_dot = self._anchor_dots.get(f"anchor:{which}:nearest")
-        if auto_dot is None:
-            return
-        anchor_set = self.parent_item.anchor_positions(which)
-        ref: Point | None = None
-        if anchor_set is not None:
-            ref = anchor_set.get("top") or anchor_set.get("center")
-        if ref is None:
-            box = self.parent_item.bound_box(which)
-            if box is not None:
-                x, y, w, _h = box
-                ref = (x + w / 2.0, y)
-        if ref is not None:
-            offset = self._auto_dot_offset()
-            auto_dot.setPos(QPointF(ref[0], ref[1] - offset))
-        auto_dot.set_highlighted(current == "nearest")
-
-    def _rebuild_anchor_dots(self, connected: dict[str, dict[str, Point]]) -> None:
-        for handle in self._anchor_dots.values():
-            handle.setParentItem(None)
-            scene = handle.scene()
-            if scene is not None:
-                scene.removeItem(handle)
-        self._anchor_dots = {}
-        for which, anchor_set in connected.items():
-            current = self.parent_item.current_anchor(which)
-            for name, (px, py) in anchor_set.items():
-                role = f"anchor:{which}:{name}"
-                dot = _HandleItem(
-                    self,
-                    role,
-                    self.parent_item,
-                    shape="circle",
-                    pen_color=_ANCHOR_DOT_COLOR,
-                    brush_color=_ANCHOR_DOT_COLOR if name == current else "#FFFFFF",
-                    size=_ANCHOR_DOT_SIZE,
-                )
-                dot.setPos(QPointF(px, py))
-                self._anchor_dots[role] = dot
-            auto_role = f"anchor:{which}:nearest"
-            auto_dot = _HandleItem(
-                self,
-                auto_role,
-                self.parent_item,
-                shape="circle",
-                pen_color=_AUTO_DOT_COLOR,
-                brush_color=_AUTO_DOT_COLOR if current == "nearest" else "#FFFFFF",
-                size=_ANCHOR_DOT_SIZE,
-            )
-            self._anchor_dots[auto_role] = auto_dot
-            self._position_auto_dot(which, current)
-
-    # ------------------------------------------------------------------
-    # `_HandleItem` から呼ばれるドラッグコールバック
-    # ------------------------------------------------------------------
-    def begin_drag(self, role: str, scene_pos: QPointF) -> None:
-        if role in ("source", "target"):
-            # 新しいドラッグセッションの開始。前回セッションのスナップ先を持ち
-            # 越さないようリセットする（コネクタ端点スナップ契約 §4）。
-            self.parent_item._snap_target = None
-            return
-        if role.startswith("anchor:"):
-            _, which, side = role.split(":")
-            self.parent_item.set_anchor(which, side)
-
-    def drag_to(
-        self,
-        role: str,
-        scene_pos: QPointF,
-        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
-    ) -> None:
-        if role in ("source", "target"):
-            self.parent_item.drag_endpoint(role, (scene_pos.x(), scene_pos.y()))
-
-    def set_endpoint_snapped(self, which: str, snapped: bool) -> None:
-        """`which`（"source"/"target"）の端点ハンドルの見た目をスナップ中/非スナップで
-        切り替える（コネクタ端点スナップ契約 §5）。
-        """
-        handle = self._endpoint_handles.get(which)
-        if handle is not None:
-            handle.set_snapped(snapped)
-
-    def end_drag(self, role: str) -> None:
-        if role not in ("source", "target"):
-            return
-        p1, p2 = self.parent_item.endpoint_scene_points()
-        drop = p1 if role == "source" else p2
-        self.parent_item.commit_endpoint_drop(role, drop)

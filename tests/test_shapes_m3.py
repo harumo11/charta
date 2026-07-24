@@ -201,7 +201,7 @@ def test_freehand_move_and_rotate_undoable_via_commit_geometry(window: Any, qapp
         height=height,
         points=normalized,
     )
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert item is not None
 
@@ -308,7 +308,7 @@ def test_text_commit_text_undo_restores_old_text(window: Any, qapp: Any) -> None
     stack = window.undo_stack
 
     obj = TextObject(id=scene.document.new_id(), text="テキスト", x=50, y=50, width=100, height=40)
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     assert isinstance(item, TextItem)
 
@@ -327,7 +327,7 @@ def test_text_commit_text_locked_is_noop(window: Any, qapp: Any) -> None:
     obj = TextObject(
         id=scene.document.new_id(), text="テキスト", x=0, y=0, width=80, height=30, locked=True
     )
-    stack.push(AddObjectCommand(scene, obj))
+    stack.push(AddObjectCommand(scene.document, obj))
     item = scene.item_for(obj)
     idx_before = stack.index()
 

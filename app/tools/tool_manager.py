@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainterPath, QPen, QTransform, QUndoCommand
@@ -27,6 +28,7 @@ from app.model.objects import (
     MathObject,
     RectObject,
     TextObject,
+    geometry_kind,
 )
 
 if TYPE_CHECKING:
@@ -42,6 +44,16 @@ _FREEHAND_MIN_DIST = 2.0
 # math: 新規生成時の既定 latex とレンダリング失敗時のフォールバック最小サイズ(px)。
 _MATH_DEFAULT_LATEX = "E = mc^2"
 _MATH_MIN_SIZE = 20.0
+
+_MouseHandler = Callable[[Any, QPointF], bool]
+
+
+class _ToolHandlers(NamedTuple):
+    """1 ツール分の press/move/release ハンドラ束。`ToolManager._handlers` の値型。"""
+
+    press: _MouseHandler
+    move: _MouseHandler
+    release: _MouseHandler
 
 
 class ToolManager(QObject):
@@ -69,6 +81,23 @@ class ToolManager(QObject):
         self._math_start: QPointF | None = None
         # connector ツール: press 時に掴んだ source 候補オブジェクト（無ければ固定点）
         self._connector_source_obj: BaseObject | None = None
+        # ツール名 → press/move/release ハンドラのディスパッチテーブル。
+        # rect/ellipse/line/arrow(_DRAW_TOOLS)は同一の _draw_* 三つ組を共有する。
+        self._handlers: dict[str, _ToolHandlers] = {
+            "select": _ToolHandlers(self._select_press, self._select_move, self._select_release),
+            "freehand": _ToolHandlers(
+                self._freehand_press, self._freehand_move, self._freehand_release
+            ),
+            "text": _ToolHandlers(self._text_press, self._text_move, self._text_release),
+            "math": _ToolHandlers(self._math_press, self._math_move, self._math_release),
+            "connector": _ToolHandlers(
+                self._connector_press, self._connector_move, self._connector_release
+            ),
+        }
+        for _draw_tool in _DRAW_TOOLS:
+            self._handlers[_draw_tool] = _ToolHandlers(
+                self._draw_press, self._draw_move, self._draw_release
+            )
 
     def set_tool(self, name: str) -> None:
         if name not in _TOOLS:
@@ -100,49 +129,22 @@ class ToolManager(QObject):
         return self._tool
 
     def handle_mouse_press(self, event: Any, scene_pos: QPointF) -> bool:
-        if self._tool == "select":
-            return self._select_press(event, scene_pos)
-        if self._tool in _DRAW_TOOLS:
-            return self._draw_press(event, scene_pos)
-        if self._tool == "freehand":
-            return self._freehand_press(event, scene_pos)
-        if self._tool == "text":
-            return self._text_press(event, scene_pos)
-        if self._tool == "math":
-            return self._math_press(event, scene_pos)
-        if self._tool == "connector":
-            return self._connector_press(event, scene_pos)
-        return False
+        handlers = self._handlers.get(self._tool)
+        if handlers is None:
+            return False
+        return handlers.press(event, scene_pos)
 
     def handle_mouse_move(self, event: Any, scene_pos: QPointF) -> bool:
-        if self._tool == "select":
-            return self._select_move(event, scene_pos)
-        if self._tool in _DRAW_TOOLS:
-            return self._draw_move(event, scene_pos)
-        if self._tool == "freehand":
-            return self._freehand_move(event, scene_pos)
-        if self._tool == "text":
-            return self._text_move(event, scene_pos)
-        if self._tool == "math":
-            return self._math_move(event, scene_pos)
-        if self._tool == "connector":
-            return self._connector_move(event, scene_pos)
-        return False
+        handlers = self._handlers.get(self._tool)
+        if handlers is None:
+            return False
+        return handlers.move(event, scene_pos)
 
     def handle_mouse_release(self, event: Any, scene_pos: QPointF) -> bool:
-        if self._tool == "select":
-            return self._select_release(event, scene_pos)
-        if self._tool in _DRAW_TOOLS:
-            return self._draw_release(event, scene_pos)
-        if self._tool == "freehand":
-            return self._freehand_release(event, scene_pos)
-        if self._tool == "text":
-            return self._text_release(event, scene_pos)
-        if self._tool == "math":
-            return self._math_release(event, scene_pos)
-        if self._tool == "connector":
-            return self._connector_release(event, scene_pos)
-        return False
+        handlers = self._handlers.get(self._tool)
+        if handlers is None:
+            return False
+        return handlers.release(event, scene_pos)
 
     # ------------------------------------------------------------------
     # select: 非消費。press で「選択済み・movable な BaseItem 本体」を実際に
@@ -205,7 +207,7 @@ class ToolManager(QObject):
                     "source_point": list(target.source_point),
                     "target_point": list(target.target_point),
                 }
-            elif target.type in ("line", "arrow"):
+            elif geometry_kind(target.type) == "endpoints":
                 self._select_start[target.id] = {"p1": list(target.p1), "p2": list(target.p2)}
             else:
                 self._select_start[target.id] = {"x": target.x, "y": target.y}
@@ -279,17 +281,13 @@ class ToolManager(QObject):
                         old_sp = old_geom["source_point"]
                         new_sp = [old_sp[0] + dx, old_sp[1] + dy]
                         commands.append(
-                            SetPropertyCommand(
-                                self.scene, obj, "source_point", new_sp, list(old_sp)
-                            )
+                            SetPropertyCommand(document, obj, "source_point", new_sp, list(old_sp))
                         )
                     if obj.target_id is None:
                         old_tp = old_geom["target_point"]
                         new_tp = [old_tp[0] + dx, old_tp[1] + dy]
                         commands.append(
-                            SetPropertyCommand(
-                                self.scene, obj, "target_point", new_tp, list(old_tp)
-                            )
+                            SetPropertyCommand(document, obj, "target_point", new_tp, list(old_tp))
                         )
                 if item is not None:
                     clear_live = getattr(item, "clear_live", None)
@@ -317,7 +315,7 @@ class ToolManager(QObject):
                 if math.hypot(new_x - old_geom["x"], new_y - old_geom["y"]) < _MOVE_EPS:
                     continue
                 new_geom = {"x": new_x, "y": new_y}
-            commands.append(SetGeometryCommand(self.scene, obj, new_geom, old_geom))
+            commands.append(SetGeometryCommand(document, obj, new_geom, old_geom))
         if not commands:
             return False
         if len(commands) == 1:
@@ -411,7 +409,7 @@ class ToolManager(QObject):
         if undo_stack is None:
             # undo_stack 未設定時はモデルを直接変更しない(§13)。select と挙動を揃える。
             return True
-        undo_stack.push(AddObjectCommand(self.scene, obj))
+        undo_stack.push(AddObjectCommand(document, obj))
 
         self.set_tool("select")
         new_item = self.scene.item_for(obj)
@@ -436,7 +434,7 @@ class ToolManager(QObject):
         undo_stack = self.scene.undo_stack
         if undo_stack is None:
             return True
-        undo_stack.push(AddObjectCommand(self.scene, obj))
+        undo_stack.push(AddObjectCommand(self.scene.document, obj))
         self.set_tool("select")
         new_item = self.scene.item_for(obj)
         if new_item is not None:

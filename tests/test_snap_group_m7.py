@@ -97,7 +97,7 @@ def _add_rect(window: Any, x: float, y: float, w: float = 50.0, h: float = 50.0)
     scene = window.scene
     stack = window.undo_stack
     rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
 
@@ -114,7 +114,7 @@ def test_group_command_sets_group_id_and_undo_restores(window: Any) -> None:
     r1 = _add_rect(window, 100.0, 0.0)
     group_id = scene.document.new_id()
 
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
     assert r0.group_id == group_id
     assert r1.group_id == group_id
 
@@ -131,7 +131,7 @@ def test_selecting_one_grouped_item_expands_selection_to_group(window: Any) -> N
     r1 = _add_rect(window, 100.0, 0.0)
     r2 = _add_rect(window, 200.0, 0.0)  # 非グループ
     group_id = scene.document.new_id()
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
 
     scene.clearSelection()
     scene.item_for(r0).setSelected(True)
@@ -149,8 +149,8 @@ def test_locked_group_member_excluded_from_selection_expansion(window: Any) -> N
     r0 = _add_rect(window, 0.0, 0.0)
     r1 = _add_rect(window, 100.0, 0.0)
     group_id = scene.document.new_id()
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
-    stack.push(SetPropertyCommand(scene, r1, "locked", True, False))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
+    stack.push(SetPropertyCommand(scene.document, r1, "locked", True, False))
 
     scene.clearSelection()
     scene.item_for(r0).setSelected(True)
@@ -166,7 +166,7 @@ def test_group_moves_together_via_select_tool(window: Any) -> None:
     r0 = _add_rect(window, 0.0, 0.0)
     r1 = _add_rect(window, 200.0, 0.0)
     group_id = scene.document.new_id()
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
 
     scene.clearSelection()
     item0 = scene.item_for(r0)
@@ -199,9 +199,9 @@ def test_ungroup_command_clears_group_id_and_undo_restores(window: Any) -> None:
     r0 = _add_rect(window, 0.0, 0.0)
     r1 = _add_rect(window, 100.0, 0.0)
     group_id = scene.document.new_id()
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
 
-    stack.push(UngroupCommand(scene, [r0, r1]))
+    stack.push(UngroupCommand(scene.document, [r0, r1]))
     assert r0.group_id is None
     assert r1.group_id is None
 
@@ -217,7 +217,7 @@ def test_ungroup_selected_via_main_window(window: Any) -> None:
     r0 = _add_rect(window, 0.0, 0.0)
     r1 = _add_rect(window, 100.0, 0.0)
     group_id = scene.document.new_id()
-    stack.push(GroupCommand(scene, [r0, r1], group_id))
+    stack.push(GroupCommand(scene.document, [r0, r1], group_id))
 
     scene.clearSelection()
     scene.item_for(r0).setSelected(True)  # 拡張で r1 も選択される
@@ -312,7 +312,7 @@ def test_locked_object_not_movable_or_selectable(window: Any) -> None:
     from app.commands.commands import SetPropertyCommand
 
     rect = _add_rect(window, 0.0, 0.0, 10.0, 10.0)
-    stack.push(SetPropertyCommand(scene, rect, "locked", True, False))
+    stack.push(SetPropertyCommand(scene.document, rect, "locked", True, False))
     item = scene.item_for(rect)
     from PySide6.QtWidgets import QGraphicsItem
 
@@ -336,7 +336,7 @@ def test_set_artboard_command_changes_scene_rect_and_undo_restores(window: Any) 
         background="#EEEEEE",
     )
 
-    stack.push(SetArtboardCommand(scene, new_artboard, old_artboard))
+    stack.push(SetArtboardCommand(scene.document, new_artboard, old_artboard))
     assert scene.document.artboard.width_px == 500
     assert scene.document.artboard.height_px == 400
     assert scene.sceneRect().width() == pytest.approx(500.0)
@@ -353,7 +353,7 @@ def test_set_artboard_command_deep_copies_artboard(window: Any) -> None:
     stack = window.undo_stack
     old_artboard = scene.document.artboard
     mutable_new = Artboard(width_px=600, height_px=300)
-    stack.push(SetArtboardCommand(scene, mutable_new, old_artboard))
+    stack.push(SetArtboardCommand(scene.document, mutable_new, old_artboard))
     mutable_new.width_px = 99999  # 後から変更してもコマンド内部の deepcopy には影響しない
     stack.undo()
     stack.redo()

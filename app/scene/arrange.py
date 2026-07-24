@@ -11,6 +11,8 @@ import copy
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from app.model.objects import geometry_kind
+
 Box = tuple[float, float, float, float]  # (x, y, w, h)
 
 
@@ -131,12 +133,13 @@ def clone_object_dicts(
             d["group_id"] = group_remap.get(old_group)
 
         obj_type = d.get("type")
-        if obj_type in ("line", "arrow"):
+        kind = geometry_kind(obj_type)
+        if kind == "endpoints":
             if d.get("p1") is not None:
                 d["p1"] = [d["p1"][0] + dx, d["p1"][1] + dy]
             if d.get("p2") is not None:
                 d["p2"] = [d["p2"][0] + dx, d["p2"][1] + dy]
-        elif obj_type == "connector":
+        elif kind == "connector":
             if d.get("source_point") is not None:
                 d["source_point"] = [d["source_point"][0] + dx, d["source_point"][1] + dy]
             if d.get("target_point") is not None:

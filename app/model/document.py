@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from app.model.objects import BaseObject
+
+
+class DocumentListener(Protocol):
+    """Document の変更通知を受け取るリスナー（Qt 非依存）。
+
+    通知はリスナー登録順に同期呼び出しされる。リスナーの実装はこのコール
+    バックの中から Document を再変更しない前提とする（再入は想定外）。
+    """
+
+    def on_object_added(self, obj: BaseObject, index: int) -> None: ...
+
+    def on_object_removed(self, obj: BaseObject) -> None: ...
+
+    def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None: ...
+
+    def on_order_changed(self) -> None: ...
+
+    def on_artboard_changed(self) -> None: ...
 
 
 @dataclass(kw_only=True)
@@ -68,6 +86,17 @@ class Document:
         # プロジェクトディレクトリの絶対パス（画像 src の相対パス解決の基点）。
         # シリアライズしない（to_dict/from_dict に含めない）。
         self.base_dir: str | None = None
+        # 変更通知リスナー（Qt 非依存）。シリアライズには一切含めない。
+        self._listeners: list[DocumentListener] = []
+
+    def add_listener(self, listener: DocumentListener) -> None:
+        """変更通知リスナーを登録する。"""
+        self._listeners.append(listener)
+
+    def remove_listener(self, listener: DocumentListener) -> None:
+        """変更通知リスナーの登録を解除する。未登録でもエラーにしない。"""
+        if listener in self._listeners:
+            self._listeners.remove(listener)
 
     def new_id(self) -> int:
         """未使用の id を払い出す。"""
@@ -79,14 +108,20 @@ class Document:
         """オブジェクトを追加する。index 省略時は末尾（最前面）に追加。z を再正規化する。"""
         if index is None:
             self.objects.append(obj)
+            inserted_index = len(self.objects) - 1
         else:
             self.objects.insert(index, obj)
+            inserted_index = index
         self.normalize_z()
+        for listener in self._listeners:
+            listener.on_object_added(obj, inserted_index)
 
     def remove_object(self, obj: BaseObject) -> None:
         """オブジェクトを削除する。"""
         self.objects.remove(obj)
         self.normalize_z()
+        for listener in self._listeners:
+            listener.on_object_removed(obj)
 
     def object_by_id(self, oid: int) -> BaseObject | None:
         """id からオブジェクトを検索する。見つからなければ None。"""
@@ -104,9 +139,34 @@ class Document:
         self.objects.remove(obj)
         self.objects.insert(index, obj)
         self.normalize_z()
+        for listener in self._listeners:
+            listener.on_order_changed()
+
+    def set_values(self, obj: BaseObject, values: dict[str, Any]) -> dict[str, Any]:
+        """`obj` に `values` を setattr で一括適用し、適用前の旧値 dict を返す。
+
+        末尾で `on_object_changed(obj, tuple(values.keys()))` を 1 回だけ通知する。
+        """
+        old_values: dict[str, Any] = {key: getattr(obj, key) for key in values}
+        for key, value in values.items():
+            setattr(obj, key, value)
+        for listener in self._listeners:
+            listener.on_object_changed(obj, tuple(values.keys()))
+        return old_values
+
+    def set_artboard(self, artboard: Artboard) -> None:
+        """アートボードを差し替える（deepcopy はしない。呼び出し側の責務）。"""
+        self.artboard = artboard
+        for listener in self._listeners:
+            listener.on_artboard_changed()
 
     def normalize_z(self) -> None:
-        """各オブジェクトの `z` フィールドを配列インデックスに合わせて再設定する。"""
+        """各オブジェクトの `z` フィールドを配列インデックスに合わせて再設定する。
+
+        `obj.z` は配列順から導出される派生値（シリアライズ用キャッシュ）であり、
+        真実源は常に `objects` の配列順である。読み取りコードは `index_of` や
+        `reversed(objects)` など配列順を直接使い、`obj.z` を読んではならない。
+        """
         for i, obj in enumerate(self.objects):
             obj.z = i
 

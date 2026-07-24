@@ -42,7 +42,7 @@ def main() -> None:
 
     # 4. rect 追加。
     rect = RectObject(id=scene.document.new_id(), x=10, y=20, width=100, height=50, fill="#FF0000")
-    stack.push(AddObjectCommand(scene, rect))
+    stack.push(AddObjectCommand(scene.document, rect))
     assert scene.item_for(rect) is not None, "rect item が作成されていない"
     assert rect in scene.document.objects, "rect が document に追加されていない"
 
@@ -55,20 +55,20 @@ def main() -> None:
     assert rect in scene.document.objects, "redo 後に document に復活していない"
 
     # 6. SetPropertyCommand。
-    stack.push(SetPropertyCommand(scene, rect, "fill", "#00FF00", rect.fill))
+    stack.push(SetPropertyCommand(scene.document, rect, "fill", "#00FF00", rect.fill))
     assert rect.fill == "#00FF00", "SetPropertyCommand が反映されていない"
 
     # 7. SetGeometryCommand。
-    stack.push(SetGeometryCommand(scene, rect, {"x": 30}, {"x": rect.x}))
+    stack.push(SetGeometryCommand(scene.document, rect, {"x": 30}, {"x": rect.x}))
     assert rect.x == 30, "SetGeometryCommand が反映されていない"
 
     # 8. ellipse・line も追加してエラー無し。
     ellipse = EllipseObject(id=scene.document.new_id(), x=0, y=0, width=40, height=40)
-    stack.push(AddObjectCommand(scene, ellipse))
+    stack.push(AddObjectCommand(scene.document, ellipse))
     assert scene.item_for(ellipse) is not None
 
     line = LineObject(id=scene.document.new_id(), p1=[0.0, 0.0], p2=[50.0, 60.0])
-    stack.push(AddObjectCommand(scene, line))
+    stack.push(AddObjectCommand(scene.document, line))
     assert scene.item_for(line) is not None
 
     # 9. serialize: save_document -> load_document で objects 数・type・主要フィールドが一致。

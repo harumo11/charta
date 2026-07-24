@@ -31,7 +31,11 @@ from app.commands.commands import AddObjectCommand  # noqa: E402
 from app.export.pdf_exporter import export_pdf  # noqa: E402
 from app.export.png_exporter import artboard_pixel_size, export_png  # noqa: E402
 from app.export.svg_exporter import document_to_svg, export_svg  # noqa: E402
-from app.math.mathtext_render import MathRenderError, render_latex_to_svg  # noqa: E402
+from app.math.mathtext_render import (  # noqa: E402
+    MathRenderError,
+    get_math_svg,
+    render_latex_to_svg,
+)
 from app.model.document import Artboard, Document, Physical  # noqa: E402
 from app.model.objects import MathObject  # noqa: E402
 from app.model.serialize import load_document, save_document  # noqa: E402
@@ -110,7 +114,7 @@ def main() -> None:
     math_obj = MathObject(
         id=scene.document.new_id(), x=10.0, y=10.0, width=80.0, height=40.0, latex="a"
     )
-    stack.push(AddObjectCommand(scene, math_obj))
+    stack.push(AddObjectCommand(scene.document, math_obj))
     math_item = scene.item_for(math_obj)
     assert isinstance(math_item, MathItem)
 
@@ -156,7 +160,10 @@ def main() -> None:
         color="#123456",
     )
     doc2.add_object(sl_obj)
-    create_item(sl_obj, doc2)  # _svg_cache populate
+    sl_item = create_item(sl_obj, doc2)  # populates get_math_svg cache + item._renderer
+    assert isinstance(sl_item, MathItem)
+    assert sl_item._renderer is not None
+    assert get_math_svg.cache_info().currsize > 0
     with tempfile.TemporaryDirectory() as tmp:
         project_dir = Path(tmp) / "smoke_m5_project"
         save_document(doc2, project_dir)

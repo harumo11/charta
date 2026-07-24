@@ -68,7 +68,7 @@ def main() -> None:
         arrow_end="triangle",
         arrow_size=16.0,
     )
-    stack.push(AddObjectCommand(scene, arrow))
+    stack.push(AddObjectCommand(scene.document, arrow))
     arrow_item = scene.item_for(arrow)
     assert isinstance(arrow_item, LineItem), "arrow item が LineItem でない"
     _render(arrow_item)
@@ -85,7 +85,7 @@ def main() -> None:
         height=height,
         points=normalized,
     )
-    stack.push(AddObjectCommand(scene, freehand))
+    stack.push(AddObjectCommand(scene.document, freehand))
     freehand_item = scene.item_for(freehand)
     assert isinstance(freehand_item, FreehandItem), "freehand item が FreehandItem でない"
     _render(freehand_item)
@@ -112,7 +112,7 @@ def main() -> None:
     text = TextObject(
         id=scene.document.new_id(), text="テキスト", x=500.0, y=500.0, width=tw, height=th
     )
-    stack.push(AddObjectCommand(scene, text))
+    stack.push(AddObjectCommand(scene.document, text))
     text_item = scene.item_for(text)
     assert isinstance(text_item, TextItem), "text item が TextItem でない"
     _render(text_item)
