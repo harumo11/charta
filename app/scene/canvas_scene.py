@@ -31,6 +31,8 @@ class CanvasScene(QGraphicsScene):
 
     #: crop モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
     crop_mode_changed = Signal(bool)
+    #: SAM3 マスク編集モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
+    mask_mode_changed = Signal(bool)
 
     def __init__(self, document: Document) -> None:
         super().__init__()
@@ -53,6 +55,9 @@ class CanvasScene(QGraphicsScene):
 
         # crop モード中の ImageItem（ビュー状態。CanvasView/ToolManager が参照する）。
         self._active_crop_item: BaseItem | None = None
+
+        # SAM3 マスク編集セッション（ビュー状態。CanvasView/ToolManager が参照する）。
+        self._active_mask_session: object | None = None
 
         self.setSceneRect(
             0,
@@ -106,6 +111,7 @@ class CanvasScene(QGraphicsScene):
         """
         self.document.remove_listener(self)
         self.set_active_crop_item(None)
+        self._cancel_active_mask_session()
         for item in list(self._items.values()):
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
@@ -133,6 +139,35 @@ class CanvasScene(QGraphicsScene):
     def active_crop_item(self) -> BaseItem | None:
         """crop モード中の item を返す（無ければ None）。"""
         return self._active_crop_item
+
+    # ------------------------------------------------------------------
+    # SAM3 マスク編集セッション追跡（crop モード追跡と対に。contract_sam3_v2 モジュール F）
+    # ------------------------------------------------------------------
+    def set_active_mask_session(self, session: object | None) -> None:
+        """SAM3 マスク編集セッションを登録する（None で解除）。同一値は no-op で emit しない。"""
+        if session is self._active_mask_session:
+            return
+        self._active_mask_session = session
+        self.mask_mode_changed.emit(session is not None)
+
+    def active_mask_session(self) -> object | None:
+        """SAM3 マスク編集セッションを返す（無ければ None）。"""
+        return self._active_mask_session
+
+    def _cancel_active_mask_session(self, item: BaseItem | None = None) -> None:
+        """セッションを cancel する。item 指定時は対象一致のときだけ。
+
+        cancel は例外を伝播させない。
+        """
+        session = self._active_mask_session
+        if session is None:
+            return
+        if item is not None and getattr(session, "image_item", None) is not item:
+            return
+        cancel = getattr(session, "cancel", None)
+        if callable(cancel):
+            cancel()  # session.cancel() 内で set_active_mask_session(None) が呼ばれる
+        self._active_mask_session = None  # cancel が失敗しても参照は必ず切る
 
     # ------------------------------------------------------------------
     # グリッド（M7契約 §5）
@@ -294,6 +329,7 @@ class CanvasScene(QGraphicsScene):
             if item is self._active_crop_item:
                 # crop モード中に対象が削除された場合、破棄済み item への stale 参照を残さない。
                 self.set_active_crop_item(None)
+            self._cancel_active_mask_session(item)
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
                 destroy_bindings()
@@ -313,6 +349,7 @@ class CanvasScene(QGraphicsScene):
     def rebuild(self) -> None:
         """全 item を破棄し、document.objects から再生成する（load 後に使用）。"""
         self.set_active_crop_item(None)
+        self._cancel_active_mask_session()
         for item in list(self._items.values()):
             self.removeItem(item)
         self._items.clear()

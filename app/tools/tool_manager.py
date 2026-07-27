@@ -116,6 +116,7 @@ class ToolManager(QObject):
         # 後に置く）。同一ツールボタンの再クリックで crop 中の編集が不意に
         # 確定されないようにするため（レビュー所見 nit）。
         self._commit_active_crop()
+        self._commit_active_mask()
         self._tool = name
         self.tool_changed.emit(name)
 
@@ -129,6 +130,13 @@ class ToolManager(QObject):
         crop_item = getter() if callable(getter) else None
         if crop_item is not None:
             crop_item.commit_crop()
+
+    def _commit_active_mask(self) -> None:
+        """SAM3 マスク編集モード中ならツール切替前に確定する（ダックタイピング、crop と同方針）。"""
+        getter = getattr(self.scene, "active_mask_session", None)
+        session = getter() if callable(getter) else None
+        if session is not None:
+            session.commit()
 
     def _clear_snap_guides(self) -> None:
         """スナップガイドを消す(M7契約 §7)。

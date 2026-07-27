@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 import warnings
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -64,6 +65,10 @@ class ImageItem(BoxItem):
         self._crop_overlay: CropOverlay | None = None
         self._crop_overlay_px: list[float] | None = None
 
+        # SAM3 マスク編集モード（crop_mode と対称。scene への登録はセッション側の責務）。
+        self._mask_edit_mode: bool = False
+        self._mask_geometry_listener: Callable[[], None] | None = None
+
         self._recompute_display()
 
     # ------------------------------------------------------------------
@@ -71,15 +76,17 @@ class ImageItem(BoxItem):
     # ------------------------------------------------------------------
     def sync_from_model(self) -> None:
         super().sync_from_model()
-        if self._crop_mode:
+        if self._crop_mode or self._mask_edit_mode:
             # BaseItem.sync_from_model が movable を locked のみから再設定する
             # ため、crop 中のモデル変更（パネル編集等）で移動禁止が解除され
             # ないよう再適用する。
             self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
 
     def _on_sync_geometry(self) -> None:
-        if not self._crop_mode:
+        if not self._crop_mode and not self._mask_edit_mode:
             self._recompute_display()
+        if self._mask_edit_mode and self._mask_geometry_listener is not None:
+            self._mask_geometry_listener()
 
     def _cache_key_for(self) -> CacheKey:
         crop = getattr(self.obj, "crop", None)
@@ -128,7 +135,8 @@ class ImageItem(BoxItem):
             return
         arr = apply_crop(self._source_rgba, getattr(self.obj, "crop", None))
         arr = apply_brightness_contrast(arr, self.obj.brightness, self.obj.contrast)
-        arr = apply_mask_if_any(self._document, self.obj, arr, self._source_size)
+        if not self._mask_edit_mode:
+            arr = apply_mask_if_any(self._document, self.obj, arr, self._source_size)
         self._set_display_buffer(arr)
 
     def _set_display_buffer(self, arr: np.ndarray) -> None:
@@ -192,7 +200,7 @@ class ImageItem(BoxItem):
 
     def begin_crop(self) -> None:
         """crop モードへ入る。原画像全体を一時表示し、現 crop のオーバーレイを出す。"""
-        if self.obj.locked or self._crop_mode:
+        if self.obj.locked or self._crop_mode or self._mask_edit_mode:
             return
         self._ensure_source_loaded()
         if self._load_failed or self._source_size is None or self._source_rgba is None:
@@ -371,6 +379,50 @@ class ImageItem(BoxItem):
         lx, ly, lw, lh = self._px_to_local(self._crop_overlay_px)
         self._crop_overlay.set_rect_local(lx, ly, lw, lh)
         self.update()  # 暗転領域を crop 矩形に追従させる
+
+    # ------------------------------------------------------------------
+    # SAM3 マスク編集モード（contract_sam3_v2 モジュール F）
+    # ------------------------------------------------------------------
+    def begin_mask_edit(self) -> bool:
+        """マスク編集モードへ入る。成功で True。
+
+        locked / 読込失敗 / 既にマスク編集中なら False。crop モード中なら先に
+        commit_crop() する。表示は「crop+明るさ/コントラストのみ・既存マスク非適用」
+        に切り替える（全体を見ながら選択できるように）。ハンドル非表示・移動禁止
+        （begin_crop と同じ操作: _hide_handles() + ItemIsMovable False）。
+        scene への登録はセッション側の責務（ここでは set_active_mask_session を呼ばない）。
+        """
+        if self.obj.locked or self._mask_edit_mode:
+            return False
+        self._ensure_source_loaded()
+        if self._load_failed or self._source_rgba is None:
+            return False
+        if self._crop_mode:
+            self.commit_crop()
+        self._mask_edit_mode = True
+        self._hide_handles()
+        # マスク編集中は画像本体の移動を無効化する（crop モードと同じ理由）。
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self._cache_key = None
+        self._recompute_display()
+        self.update()
+        return True
+
+    def end_mask_edit(self) -> None:
+        """マスク編集モードを終了し通常表示へ戻す。
+
+        _end_crop_mode と同じ後始末（movable 復元・_cache_key=None・
+        _recompute_display・update・選択中なら _show_handles）を行う。冪等。
+        """
+        if not self._mask_edit_mode:
+            return
+        self._mask_edit_mode = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not self.obj.locked)
+        self._cache_key = None
+        self._recompute_display()
+        self.update()
+        if self.isSelected():
+            self._show_handles()
 
 
 class CropOverlay(QGraphicsItem):

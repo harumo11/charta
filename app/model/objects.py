@@ -143,6 +143,8 @@ class ImageObject(BaseObject):
     mask_color: str | None = "#FFFFFF"
     mask_opacity: float = 0.8
     mask_enabled: bool = True
+    # 最後に使ったテキストプロンプト（再編集時の初期値）。
+    mask_prompt: str = ""
 
     TYPE: ClassVar[str] = "image"
 

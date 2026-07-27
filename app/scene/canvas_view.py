@@ -168,6 +168,8 @@ class CanvasView(QGraphicsView):
         self.setDragMode(self._pre_pan_drag_mode)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._handle_mask_key(event):
+            return
         if self._handle_crop_key(event):
             return
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
@@ -225,6 +227,49 @@ class CanvasView(QGraphicsView):
         if hit is not None and (hit is crop_item or crop_item.isAncestorOf(hit)):
             return False
         crop_item.commit_crop()
+        event.accept()
+        return True
+
+    # -- SAM3 マスク編集モード（Enter=確定 / Esc=キャンセル / 外側クリック=確定） --
+
+    def _active_mask_session(self):  # noqa: ANN202 - MaskEditSession への import 循環を避ける
+        scene = self.scene()
+        getter = getattr(scene, "active_mask_session", None)
+        return getter() if callable(getter) else None
+
+    def _handle_mask_key(self, event: QKeyEvent) -> bool:
+        """マスク編集モード中の Enter=commit / Esc=cancel（処理したら True）。"""
+        session = self._active_mask_session()
+        if session is None:
+            return False
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            session.commit()
+            event.accept()
+            return True
+        if event.key() == Qt.Key.Key_Escape:
+            session.cancel()
+            event.accept()
+            return True
+        return False
+
+    def _commit_mask_on_outside_press(self, event: QMouseEvent) -> bool:
+        """対象画像（とその子孫）の外側を左クリックしたら session.commit() し、クリックを消費する。
+
+        画像自身・オーバーレイ（子孫アイテム）上の押下は通常処理へ通す。右/中ボタンは対象外。
+        判定は _commit_crop_on_outside_press と同一方式（itemAt → session.image_item /
+        isAncestorOf）。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        session = self._active_mask_session()
+        if session is None:
+            return False
+        image_item = session.image_item
+        scene_pos = self.mapToScene(event.position().toPoint())
+        hit = self.scene().itemAt(scene_pos, self.transform())
+        if hit is not None and (hit is image_item or image_item.isAncestorOf(hit)):
+            return False
+        session.commit()
         event.accept()
         return True
 
@@ -298,6 +343,9 @@ class CanvasView(QGraphicsView):
             )
             super().mousePressEvent(fake)
             event.accept()
+            return
+
+        if self._commit_mask_on_outside_press(event):
             return
 
         if self._commit_crop_on_outside_press(event):

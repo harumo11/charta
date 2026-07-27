@@ -138,6 +138,7 @@ myproject/
 | `mask_color` | str or null | 対象外領域の覆い色 `#RRGGBB`。**null=透明=切り取り**（対象外の alpha を落とす） |
 | `mask_opacity` | float | 覆い強度 0.0–1.0（切り取り時は透明化の強さ） |
 | `mask_enabled` | bool | マスクの一時 ON/OFF（`mask_src` を保持したまま無効化） |
+| `mask_prompt` | str | 最後に使ったテキストプロンプト（マスク再編集時の初期値。空可） |
 
 **rect / ellipse**（塗り+線を持つ図形）
 | フィールド | 型 | 説明 |
@@ -245,13 +246,16 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 
 **経緯**: かつて rembg（自動）＋ OpenCV GrabCut（手動補正）の2段構えの背景除去を実装していたが、専用の外部ツールの方が高品質・高使い勝手のため **2026-07-23 に全削除**した（自動背景除去は今もスコープ外。「## 12」参照）。その後、**「対象物以外を覆う/切り取る」選択的マスキングは 2026-07-27 にユーザー指示で正式スコープ化**し、SAM3 で実装した。
 
-**仕様**（非破壊・SAM3 推論はマスク生成時の 1 回のみ）:
-- 起動: 画像を 1 つ選択 → オブジェクトメニュー「SAM3 マスク…」（`app/ui/controllers/sam3_masking.py` + `app/ui/sam3_mask_dialog.py`）。
-- プロンプト: **テキスト**（例 "cat"、概念一致の全インスタンス検出）と**正/負ボックス**（プレビュー上で左ドラッグ=正・右ドラッグ=負）の併用可。検出候補はプレビュー上のクリックで採否トグル。
-- 確定: 採用候補の論理和マスクを `assets/mask_NNN.png`（mode "L"、crop 前の元画像座標、255=対象物）として保存し、undo マクロ「SAM3 マスク」で `mask_src`/`mask_color`/`mask_opacity`/`mask_enabled` を `SetPropertyCommand` 群として push。キャンセル時はファイルを残さない。
-- 合成: `app/graphics/image_pipeline.py` の `apply_mask_overlay()`（crop → brightness/contrast → mask の順、`apply_mask_if_any()` で共有）。**覆い色 null = 透明 = 切り取り**（対象外 alpha を落とす）。キャンバス表示・SVG・PNG/PDF の全経路が同一関数を通るため出力が一致する。
-- 事後編集: プロパティパネル（`mask_color`=color_opt「透明」チェック、`mask_opacity`、`mask_enabled`。`PropSpec.requires="mask_src"` で mask 保有時のみ表示）。再推論なしで変更可能。マスク解除はダイアログの「マスクを解除」。
-- 推論層: `app/ai/sam3.py`（`Sam3Engine` シングルトン、`is_available()`、遅延 import、Qt 非依存）。ダイアログ側の `Sam3Worker`（QThread）でロード・推論を非同期実行。CLI 検証は `scripts/smoke_sam3.py`。
+**仕様**（非破壊・SAM3 推論はマスク生成時のみ。**オンキャンバス編集モード方式** — 当初のダイアログ方式は 2026-07-27 に廃止し、crop モードと同じ設計文法でキャンバス直接編集に統一）:
+- 起動: 画像を 1 つ選択 → オブジェクトメニュー「SAM3 マスク…」で**マスク編集モード**へ（`Sam3MaskController.start_mask_edit_action` → `MaskEditSession`。`app/ui/controllers/sam3_masking.py`）。
+- キャンバス操作（`app/scene/items/mask_edit_overlay.py`、ImageItem の子オーバーレイ）: **左ドラッグ=正例ボックス（緑）/右ドラッグ=負例ボックス（赤）**、ボックス枠クリックで削除、候補ティントのクリックで採否トグル。モード中は画像をマスク非適用の素の表示にし、移動・ハンドルを無効化（crop モードと同じ）。
+- パネル（`app/ui/mask_edit_panel.py`、プロパティドック最上部にモード中のみ表示）: テキストプロンプト・ステータス・覆い色（透明=切り取り）/不透明度・確定/キャンセル/マスクを解除。
+- **自動検出**: ボックス変化・テキスト確定のたび `Sam3Worker`（QThread、generation カウンタで古い結果を破棄）が非同期推論。テキストとボックスは併用可。
+- 確定/キャンセル: Enter・対象外側クリック・ツール切替・パネル確定で commit、Esc/キャンセルで破棄（`CanvasScene.active_mask_session` / `mask_mode_changed`、`CanvasView._handle_mask_key`/`_commit_mask_on_outside_press`、`ToolManager._commit_active_mask` — いずれも crop 追跡と対称）。
+- 確定処理: 採用候補の論理和マスクを `assets/mask_NNN.png`（mode "L"、crop 前の元画像座標、255=対象物）として保存し、undo マクロ「SAM3 マスク」で `mask_src`/`mask_color`/`mask_opacity`/`mask_enabled`/`mask_prompt` を `SetPropertyCommand` 群として push（`Sam3MaskController.commit_mask` — ヘッドレステスト可能な公開 API）。キャンセル時はファイルを残さない。
+- 合成: `app/graphics/image_pipeline.py` の `apply_mask_overlay()`（crop → brightness/contrast → mask の順、`apply_mask_if_any()` で共有)。**覆い色 null = 透明 = 切り取り**（対象外 alpha を落とす)。キャンバス表示・SVG・PNG/PDF の全経路が同一関数を通るため出力が一致する。
+- 事後編集: プロパティパネル（`mask_color`=color_opt「透明」チェック、`mask_opacity`、`mask_enabled`。`PropSpec.requires="mask_src"` で mask 保有時のみ表示）。再推論なしで変更可能。
+- 推論層: `app/ai/sam3.py`（`Sam3Engine` シングルトン、`is_available()`、遅延 import、Qt 非依存）。CLI 検証は `scripts/smoke_sam3.py`。
 
 ### 9.6 その他 Must 機能
 - Undo/Redo（`QUndoStack`）。ドラッグ移動は「離した時点」で 1 コマンドに集約（毎フレーム記録しない）。

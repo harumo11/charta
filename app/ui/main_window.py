@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QMainWindow,
     QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from app.commands.commands import SetArtboardCommand
@@ -38,6 +40,7 @@ from app.ui.controllers.export_controller import ExportController
 from app.ui.controllers.image_import import ImageImportController
 from app.ui.controllers.project_io import ProjectIOController
 from app.ui.controllers.sam3_masking import Sam3MaskController
+from app.ui.mask_edit_panel import MaskEditPanel
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -90,8 +93,6 @@ class MainWindow(QMainWindow):
         self._image_import = ImageImportController(
             self, self.scene, self.undo_stack, self._on_images_imported
         )
-        self._sam3_masking = Sam3MaskController(self, self.scene, self.undo_stack)
-
         self.view: CanvasView = CanvasView(self.scene)
         self.setCentralWidget(self.view)
 
@@ -104,11 +105,20 @@ class MainWindow(QMainWindow):
             self._import_dropped_images, Qt.ConnectionType.QueuedConnection
         )
 
+        self.mask_edit_panel = MaskEditPanel()
+        self._sam3_masking = Sam3MaskController(
+            self, self.scene, self.undo_stack, self.mask_edit_panel
+        )
         self.property_panel: PropertyPanel = PropertyPanel(self.scene)
         self.layer_panel: LayerPanel = LayerPanel(self.scene)
 
         self._property_dock = QDockWidget("プロパティ", self)
-        self._property_dock.setWidget(self.property_panel)
+        dock_body = QWidget()
+        dock_layout = QVBoxLayout(dock_body)
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        dock_layout.addWidget(self.mask_edit_panel)
+        dock_layout.addWidget(self.property_panel)
+        self._property_dock.setWidget(dock_body)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._property_dock)
 
         self._layer_dock = QDockWidget("レイヤー", self)
@@ -125,6 +135,8 @@ class MainWindow(QMainWindow):
 
         # crop モード中の操作ヒントをステータスバーに出す（終了で消す。ダイアログは出さない）。
         self.scene.crop_mode_changed.connect(self._on_crop_mode_changed)
+        # SAM3 マスク編集モード中の操作ヒントをステータスバーに出す（crop と同じ流儀）。
+        self.scene.mask_mode_changed.connect(self._on_mask_mode_changed)
 
         # undo/redo後にパネル(プロパティ/レイヤー)をモデルへ再同期する。
         # _on_undo_index_changed は都度 self.property_panel/self.layer_panel を
@@ -475,6 +487,16 @@ class MainWindow(QMainWindow):
         if active:
             self.statusBar().showMessage(
                 "クロップ: ハンドルで調整 / Enter か外側クリックで確定 / Esc でキャンセル"
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    def _on_mask_mode_changed(self, active: bool) -> None:
+        """SAM3 マスク編集モードの開始/終了に合わせてステータスバーの操作ヒントを出し入れする。"""
+        if active:
+            self.statusBar().showMessage(
+                "SAM3 マスク: 左ドラッグ=正例 / 右ドラッグ=負例 / クリック=採否・ボックス削除"
+                " / Enter か外側クリックで確定 / Esc でキャンセル"
             )
         else:
             self.statusBar().clearMessage()
