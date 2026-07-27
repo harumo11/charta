@@ -368,9 +368,13 @@ class BoxHandleSet:
         new_w = max(right - left, _MIN_SIZE)
         new_h = max(bottom - top, _MIN_SIZE)
         new_center_local = QPointF((left + right) / 2.0, (top + bottom) / 2.0)
-        new_center_scene = parent.mapToScene(new_center_local)
-        new_x = new_center_scene.x() - new_w / 2.0
-        new_y = new_center_scene.y() - new_h / 2.0
+        # `set_live_rect` が期待する座標系は「parent_item の親座標系」
+        # （トップレベルアイテムなら scene 座標 = モデル x/y、crop オーバーレイの
+        # ような子アイテムなら親アイテムのローカル座標）。mapToScene だと子アイテムで
+        # 親の位置ぶんずれて crop 矩形が飛ぶ（バグ報告: ハンドルを掴むと四角が飛ぶ）。
+        new_center_parent = parent.mapToParent(new_center_local)
+        new_x = new_center_parent.x() - new_w / 2.0
+        new_y = new_center_parent.y() - new_h / 2.0
         if aspect is not None and aspect > 0.0:
             # アスペクトロック時はグリッド吸着でアスペクトを崩したくないためスキップする。
             _clear_snap_guides(parent.scene())
@@ -388,6 +392,10 @@ class BoxHandleSet:
         整合する範囲での最小限のグリッド吸着に留める(他オブジェクトへの
         吸着や move 系のガイド計算は base_item/snapping.py の担当)。
         """
+        if self.parent_item.parentItem() is not None:
+            # 子アイテム（crop オーバーレイ等）の座標系は scene 座標と一致しない
+            # ため、scene 座標基準のグリッド吸着は適用しない。
+            return x, y, w, h
         scene = self.parent_item.scene()
         grid_size = _grid_size_for_snap(scene)
         if not grid_size:

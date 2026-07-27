@@ -19,10 +19,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
-from app.graphics.image_pipeline import apply_brightness_contrast, apply_crop
+from app.graphics.image_pipeline import (
+    apply_brightness_contrast,
+    apply_crop,
+    apply_mask_if_any,
+)
 from app.model.objects import BaseObject
 from app.model.serialize import resolve_asset_path
 from app.scene.handles import BoxHandleSet
@@ -33,7 +37,11 @@ if TYPE_CHECKING:
     from app.model.document import Document
 
 CropTuple = tuple[float, float, float, float]
-CacheKey = tuple[str, CropTuple | None, float, float]
+# 末尾 4 要素は SAM3 選択的マスキング（mask_src, mask_color, mask_opacity, mask_enabled）。
+CacheKey = tuple[str, CropTuple | None, float, float, str | None, str | None, float, bool]
+
+#: crop モード中、切り落とされる領域に被せる半透明の暗転色。
+_CROP_DIM_COLOR = QColor(0, 0, 0, 110)
 
 
 @register_item("image")
@@ -61,6 +69,14 @@ class ImageItem(BoxItem):
     # ------------------------------------------------------------------
     # モデル同期
     # ------------------------------------------------------------------
+    def sync_from_model(self) -> None:
+        super().sync_from_model()
+        if self._crop_mode:
+            # BaseItem.sync_from_model が movable を locked のみから再設定する
+            # ため、crop 中のモデル変更（パネル編集等）で移動禁止が解除され
+            # ないよう再適用する。
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+
     def _on_sync_geometry(self) -> None:
         if not self._crop_mode:
             self._recompute_display()
@@ -73,6 +89,10 @@ class ImageItem(BoxItem):
             crop_t,
             round(float(self.obj.brightness), 4),
             round(float(self.obj.contrast), 4),
+            getattr(self.obj, "mask_src", None),
+            getattr(self.obj, "mask_color", None),
+            round(float(getattr(self.obj, "mask_opacity", 0.0) or 0.0), 4),
+            bool(getattr(self.obj, "mask_enabled", True)),
         )
 
     def _ensure_source_loaded(self) -> None:
@@ -108,6 +128,7 @@ class ImageItem(BoxItem):
             return
         arr = apply_crop(self._source_rgba, getattr(self.obj, "crop", None))
         arr = apply_brightness_contrast(arr, self.obj.brightness, self.obj.contrast)
+        arr = apply_mask_if_any(self._document, self.obj, arr, self._source_size)
         self._set_display_buffer(arr)
 
     def _set_display_buffer(self, arr: np.ndarray) -> None:
@@ -134,6 +155,23 @@ class ImageItem(BoxItem):
             0.0, 0.0, float(self._display_pixmap.width()), float(self._display_pixmap.height())
         )
         painter.drawPixmap(rect, self._display_pixmap, source_rect)
+        if self._crop_mode and self._crop_overlay_px is not None:
+            self._paint_crop_dim(painter, rect)
+
+    def _paint_crop_dim(self, painter: Any, rect: QRectF) -> None:
+        """crop 矩形の外側（切り落とされる領域）を半透明で暗くする。
+
+        子アイテム（CropOverlay の破線・ハンドル）は親の後に描画されるため、
+        ここで塗っても crop 枠の視認性は損なわれない。
+        """
+        lx, ly, lw, lh = self._px_to_local(self._crop_overlay_px or [0.0, 0.0, 0.0, 0.0])
+        outer = QPainterPath()
+        outer.addRect(rect)
+        inner = QPainterPath()
+        inner.addRect(QRectF(lx, ly, lw, lh))
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.setBrush(QBrush(_CROP_DIM_COLOR))
+        painter.drawPath(outer.subtracted(inner))
 
     def _paint_placeholder(self, painter: Any, rect: QRectF) -> None:
         painter.setPen(QPen(QColor("#B00020"), 2.0))
@@ -159,8 +197,18 @@ class ImageItem(BoxItem):
         self._ensure_source_loaded()
         if self._load_failed or self._source_size is None or self._source_rgba is None:
             return
+        # 別の画像が crop モード中なら先に確定する。追跡は scene 上 1 件のみの
+        # ため、これを怠ると前の画像が確定手段のない crop モードに取り残される。
+        scene = self.scene()
+        getter = getattr(scene, "active_crop_item", None)
+        other = getter() if callable(getter) else None
+        if other is not None and other is not self:
+            other.commit_crop()
         self._crop_mode = True
         self._hide_handles()
+        # crop 中は画像本体の移動を無効化する（暗転領域のドラッグで画像が
+        # crop 枠の下から動いてしまう誤操作を防ぐ）。
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
 
         orig_w, orig_h = self._source_size
         current_crop = getattr(self.obj, "crop", None)
@@ -176,6 +224,7 @@ class ImageItem(BoxItem):
             self._crop_overlay = CropOverlay(self)
         self._sync_overlay_from_px()
         self._crop_overlay.setVisible(True)
+        self._notify_scene_crop_mode(active=True)
 
     def set_crop_rect(self, x: float, y: float, w: float, h: float) -> None:
         """crop 矩形をプログラム/ドラッグから設定する（元画像ピクセル座標、境界クランプ）。"""
@@ -277,6 +326,7 @@ class ImageItem(BoxItem):
     def _end_crop_mode(self) -> None:
         self._crop_mode = False
         self._crop_overlay_px = None
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not self.obj.locked)
         if self._crop_overlay is not None:
             self._crop_overlay.setVisible(False)
         self._cache_key = None
@@ -284,6 +334,18 @@ class ImageItem(BoxItem):
         self.update()
         if self.isSelected():
             self._show_handles()
+        self._notify_scene_crop_mode(active=False)
+
+    def _notify_scene_crop_mode(self, *, active: bool) -> None:
+        """crop モードの開始/終了を scene に登録する（CanvasView/ToolManager の参照用）。
+
+        scene 未所属や CanvasScene 以外（テスト用の素の QGraphicsScene 等）でも
+        動くよう、ダックタイピングで判定する。
+        """
+        scene = self.scene()
+        set_active = getattr(scene, "set_active_crop_item", None)
+        if callable(set_active):
+            set_active(self if active else None)
 
     def _scale_to_local(self) -> tuple[float, float]:
         if self._source_size is None:
@@ -308,6 +370,7 @@ class ImageItem(BoxItem):
             return
         lx, ly, lw, lh = self._px_to_local(self._crop_overlay_px)
         self._crop_overlay.set_rect_local(lx, ly, lw, lh)
+        self.update()  # 暗転領域を crop 矩形に追従させる
 
 
 class CropOverlay(QGraphicsItem):
@@ -368,8 +431,13 @@ class CropOverlay(QGraphicsItem):
         return self.live_geometry()
 
     def set_live_rect(self, x: float, y: float, w: float, h: float) -> None:
-        self.set_rect_local(x, y, w, h)
-        self.image_item._crop_overlay_px = self.image_item._local_to_px((x, y, w, h))
+        # 境界クランプを `set_crop_rect` に一元化する。ここで直接
+        # `_crop_overlay_px` を書くと、境界外ドラッグで実画像より大きい crop が
+        # 確定され、出力が引き伸ばされて歪む（レビュー所見 major）。
+        # `set_crop_rect` はクランプ後に `_sync_overlay_from_px` で
+        # オーバーレイ矩形・暗転領域の再描画まで行う。
+        px = self.image_item._local_to_px((x, y, w, h))
+        self.image_item.set_crop_rect(*px)
 
     def set_live_rotation(self, rotation: float) -> None:
         return  # crop 矩形は回転をサポートしない

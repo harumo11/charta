@@ -29,6 +29,9 @@ class PropSpec:
     # 既定の丸めだと刻み幅が実質失われる項目（opacity/brightness/contrast/
     # smoothing の step=0.05 等）だけ、ここで明示的に上書きする。
     decimals: int | None = None
+    # オブジェクトの当該属性が truthy のときのみパネルに行を表示する
+    # （SAM3 選択的マスキング §9.5: mask_src が無い間は色/不透明度/有効行を隠す）。
+    requires: str | None = None
 
 
 COMMON_PROPS: list[PropSpec] = [
@@ -115,6 +118,19 @@ _IMAGE_PROPS: list[PropSpec] = [
         step=0.05,
         decimals=2,
     ),
+    # SAM3 選択的マスキング（§9.5）。mask_src が付与されているときのみ表示する。
+    PropSpec(key="mask_color", label="マスク覆い色", kind="color_opt", requires="mask_src"),
+    PropSpec(
+        key="mask_opacity",
+        label="マスク不透明度",
+        kind="number",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.05,
+        decimals=2,
+        requires="mask_src",
+    ),
+    PropSpec(key="mask_enabled", label="マスク有効", kind="bool", requires="mask_src"),
 ]
 
 _ALIGN_OPTIONS: tuple[str, ...] = ("left", "center", "right")

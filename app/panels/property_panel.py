@@ -70,6 +70,10 @@ class PropertyPanel(QWidget):
         # None は「フォーム未表示」（未選択/複数選択）を意味する。
         self._current_obj_id: int | None = None
         self._current_type: str | None = None
+        # PropSpec.requires を持つ行の表示可否状態のスナップショット
+        # （mask_src の付与/解除等で requires 対象が truthy/falsy を跨いだ
+        # 場合にフォームを再構築するための判定に使う）。
+        self._current_requires_state: tuple[bool, ...] | None = None
         # 各ウィジェット生成時に登録する「モデル値→ウィジェットへ反映する」updater。
         # undo/redo 等で対象が変わらないまま値だけ変わった場合、フォームを
         # 破棄せずこれらを呼ぶだけで再同期する（§M8クラッシュ修正、下記参照）。
@@ -134,6 +138,7 @@ class PropertyPanel(QWidget):
                 self._current_obj_id is not None
                 and obj.id == self._current_obj_id
                 and obj.type == self._current_type
+                and self._requires_state(obj) == self._current_requires_state
             ):
                 self._refresh_values()
                 return
@@ -150,6 +155,7 @@ class PropertyPanel(QWidget):
             obj = selected[0]
             self._current_obj_id = obj.id
             self._current_type = obj.type
+            self._current_requires_state = self._requires_state(obj)
             self._info_label.hide()
             self._form_widget.show()
             self._clear_form()
@@ -158,6 +164,7 @@ class PropertyPanel(QWidget):
 
         self._current_obj_id = None
         self._current_type = None
+        self._current_requires_state = None
         self._clear_form()
         if len(selected) == 0:
             self._info_label.setText("未選択")
@@ -179,6 +186,17 @@ class PropertyPanel(QWidget):
             return
         self.on_selection_changed()
 
+    @staticmethod
+    def _requires_state(obj: BaseObject) -> tuple[bool, ...]:
+        """`PropSpec.requires` を持つ行それぞれの現在の表示可否を並べたタプル。
+
+        これが変化した（例: mask_src の付与/解除）場合はフォームの行構成
+        自体が変わるため、`on_selection_changed` は in-place 更新ではなく
+        フォーム再構築を行う判定に使う。
+        """
+        specs = PROPERTIES.get(obj.type, [])
+        return tuple(bool(getattr(obj, s.requires, None)) for s in specs if s.requires is not None)
+
     def _refresh_values(self) -> None:
         """フォームを再構築せず、登録済み updater で現在値を再設定する。"""
         for updater in list(self._updaters):
@@ -194,6 +212,8 @@ class PropertyPanel(QWidget):
         try:
             specs = PROPERTIES.get(obj.type, [])
             for spec in specs:
+                if spec.requires is not None and not getattr(obj, spec.requires, None):
+                    continue
                 widget = self._make_widget(obj, spec)
                 self._form.addRow(spec.label, widget)
         finally:

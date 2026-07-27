@@ -137,6 +137,12 @@ class ImageObject(BaseObject):
     brightness: float = 0.0
     contrast: float = 0.0
     has_alpha: bool = False
+    # --- SAM3 選択的マスキング（§9.5）。マスクは crop 前の元画像座標・"L" PNG、
+    # 255=対象物（見せる）/0=対象外（覆う）。mask_color None = 透明 = 切り取り。 ---
+    mask_src: str | None = None
+    mask_color: str | None = "#FFFFFF"
+    mask_opacity: float = 0.8
+    mask_enabled: bool = True
 
     TYPE: ClassVar[str] = "image"
 

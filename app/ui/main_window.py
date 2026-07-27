@@ -37,6 +37,7 @@ from app.ui.controllers.edit_controller import EditController
 from app.ui.controllers.export_controller import ExportController
 from app.ui.controllers.image_import import ImageImportController
 from app.ui.controllers.project_io import ProjectIOController
+from app.ui.controllers.sam3_masking import Sam3MaskController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ class MainWindow(QMainWindow):
         self._image_import = ImageImportController(
             self, self.scene, self.undo_stack, self._on_images_imported
         )
+        self._sam3_masking = Sam3MaskController(self, self.scene, self.undo_stack)
 
         self.view: CanvasView = CanvasView(self.scene)
         self.setCentralWidget(self.view)
@@ -120,6 +122,9 @@ class MainWindow(QMainWindow):
         # あいまいなショートカットになるため、QShortcut のみに割り当てる。
         self._delete_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self)
         self._delete_shortcut.activated.connect(self.delete_selected)
+
+        # crop モード中の操作ヒントをステータスバーに出す（終了で消す。ダイアログは出さない）。
+        self.scene.crop_mode_changed.connect(self._on_crop_mode_changed)
 
         # undo/redo後にパネル(プロパティ/レイヤー)をモデルへ再同期する。
         # _on_undo_index_changed は都度 self.property_panel/self.layer_panel を
@@ -313,6 +318,9 @@ class MainWindow(QMainWindow):
         ungroup_action = object_menu.addAction("グループ解除", self.ungroup_selected)
         ungroup_action.setShortcut(QKeySequence("Ctrl+Shift+G"))
 
+        object_menu.addSeparator()
+        self._sam3_mask_action = self._sam3_masking.make_menu_action(object_menu)
+
         view_menu = menu_bar.addMenu("表示")
         view_menu.addAction("拡大", lambda: self.view.zoom_in())
         view_menu.addAction("縮小", lambda: self.view.zoom_out())
@@ -461,6 +469,15 @@ class MainWindow(QMainWindow):
 
     def delete_selected(self) -> None:
         self._edit.delete_selected()
+
+    def _on_crop_mode_changed(self, active: bool) -> None:
+        """crop モードの開始/終了に合わせてステータスバーの操作ヒントを出し入れする。"""
+        if active:
+            self.statusBar().showMessage(
+                "クロップ: ハンドルで調整 / Enter か外側クリックで確定 / Esc でキャンセル"
+            )
+        else:
+            self.statusBar().clearMessage()
 
     # ------------------------------------------------------------------
     # ドキュメント差し替え（open/new 時）

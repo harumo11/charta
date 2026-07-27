@@ -34,8 +34,12 @@
 - **PySide6**（Qt6 系公式 Python バインディング）。中核は `QGraphicsScene` / `QGraphicsView` / `QGraphicsItem` 群。
 - **依存管理: `uv`**（高速な仮想環境・依存解決）。`pyproject.toml` で管理。
 
-### AI 機能
-なし（**背景除去は 2026-07-23 に削除済み・スコープ外**。専用の外部ツールの方が高品質なため、本ソフトには持たない。「## 12」参照）。
+### AI 機能（任意・SAM3 選択的マスキングのみ）
+- **SAM3 選択的マスキング**（2026-07-27 に正式スコープ化。「## 9.5」参照）: transformers の `facebook/sam3`（`Sam3Model`+`Sam3Processor`）で対象物をセグメンテーションし、対象外領域を指定色+指定不透明度で覆う／透明化（切り取り）する。
+  - 依存はオプション dependency-group **`sam`**（torch cu128 / torchvision / transformers / accelerate）。導入は `uv sync --group sam`。**素の `uv sync` は sam グループを venv から削除する**ので注意。
+  - `app/ai/` は torch/transformers を**関数内遅延 import**し、未導入時は `is_available()` が False → メニューをグレーアウトして本体は従来どおり起動する。
+  - `facebook/sam3` は gated モデル（HF アカウントでのアクセス承認 + `hf auth login` が必要）。
+- 自動背景除去（rembg 等のワンクリック全自動系）は **2026-07-23 に削除済み・スコープ外のまま**。専用の外部ツールの方が高品質なため、本ソフトには持たない（「## 12」参照）。
 
 ### 数式（必須）
 - **matplotlib**: `mathtext` 機能で LaTeX 数式サブセットを描画。LaTeX 本体のインストール不要。SVG バックエンドで数式を SVG 化する。
@@ -129,7 +133,11 @@ myproject/
 | `src` | str | `assets/` 相対パス |
 | `crop` | [x,y,w,h] or null | クロップ矩形（元画像座標） |
 | `brightness`, `contrast` | float | 表示補正（-1.0–1.0、0が原画） |
-| `has_alpha` | bool | 背景除去済みか |
+| `has_alpha` | bool | アルファ付き画像か（メタデータ） |
+| `mask_src` | str or null | SAM3 マスク PNG の `assets/` 相対パス（mode "L"、**crop 前の元画像座標・同一寸法**。255=対象物（見せる）/0=対象外（覆う）。null=マスクなし） |
+| `mask_color` | str or null | 対象外領域の覆い色 `#RRGGBB`。**null=透明=切り取り**（対象外の alpha を落とす） |
+| `mask_opacity` | float | 覆い強度 0.0–1.0（切り取り時は透明化の強さ） |
+| `mask_enabled` | bool | マスクの一時 ON/OFF（`mask_src` を保持したまま無効化） |
 
 **rect / ellipse**（塗り+線を持つ図形）
 | フィールド | 型 | 説明 |
@@ -233,8 +241,17 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - ダブルクリックで LaTeX 再編集ダイアログ → SVG 再生成 → 差し替え（`latex` が真実源）。
 - 生成失敗（不正な LaTeX）時はエラー表示し、直前の有効表示を維持。
 
-### 9.5 背景除去 → 削除済み（スコープ外）
-かつて rembg（自動）＋ OpenCV GrabCut（手動補正）の2段構えで実装していたが、**専用の外部ツール（最先端の背景除去サービス等）の方が高品質・高使い勝手のため 2026-07-23 に全削除した**。背景を除去したい画像は外部で処理してから取り込む運用とする。`image.has_alpha` フィールドは「アルファ付き画像かどうか」のメタデータとしてモデルに残す。
+### 9.5 SAM3 選択的マスキング（旧: 背景除去の削除経緯）
+
+**経緯**: かつて rembg（自動）＋ OpenCV GrabCut（手動補正）の2段構えの背景除去を実装していたが、専用の外部ツールの方が高品質・高使い勝手のため **2026-07-23 に全削除**した（自動背景除去は今もスコープ外。「## 12」参照）。その後、**「対象物以外を覆う/切り取る」選択的マスキングは 2026-07-27 にユーザー指示で正式スコープ化**し、SAM3 で実装した。
+
+**仕様**（非破壊・SAM3 推論はマスク生成時の 1 回のみ）:
+- 起動: 画像を 1 つ選択 → オブジェクトメニュー「SAM3 マスク…」（`app/ui/controllers/sam3_masking.py` + `app/ui/sam3_mask_dialog.py`）。
+- プロンプト: **テキスト**（例 "cat"、概念一致の全インスタンス検出）と**正/負ボックス**（プレビュー上で左ドラッグ=正・右ドラッグ=負）の併用可。検出候補はプレビュー上のクリックで採否トグル。
+- 確定: 採用候補の論理和マスクを `assets/mask_NNN.png`（mode "L"、crop 前の元画像座標、255=対象物）として保存し、undo マクロ「SAM3 マスク」で `mask_src`/`mask_color`/`mask_opacity`/`mask_enabled` を `SetPropertyCommand` 群として push。キャンセル時はファイルを残さない。
+- 合成: `app/graphics/image_pipeline.py` の `apply_mask_overlay()`（crop → brightness/contrast → mask の順、`apply_mask_if_any()` で共有）。**覆い色 null = 透明 = 切り取り**（対象外 alpha を落とす）。キャンバス表示・SVG・PNG/PDF の全経路が同一関数を通るため出力が一致する。
+- 事後編集: プロパティパネル（`mask_color`=color_opt「透明」チェック、`mask_opacity`、`mask_enabled`。`PropSpec.requires="mask_src"` で mask 保有時のみ表示）。再推論なしで変更可能。マスク解除はダイアログの「マスクを解除」。
+- 推論層: `app/ai/sam3.py`（`Sam3Engine` シングルトン、`is_available()`、遅延 import、Qt 非依存）。ダイアログ側の `Sam3Worker`（QThread）でロード・推論を非同期実行。CLI 検証は `scripts/smoke_sam3.py`。
 
 ### 9.6 その他 Must 機能
 - Undo/Redo（`QUndoStack`）。ドラッグ移動は「離した時点」で 1 コマンドに集約（毎フレーム記録しない）。
@@ -263,6 +280,7 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 7. **コネクタ**: アンカー・追従・接続先削除時の固定化・orthogonal ルーティング。
 8. **仕上げ Must**: 整列/分布、グリッド、スナップ、グループ化、レイヤーパネル、自動保存、物理サイズプリセット。
 9. ~~背景除去（任意依存）~~ → 実装後、2026-07-23 に削除（スコープ外化。「## 12」参照）。
+10. **SAM3 選択的マスキング（任意依存 `sam` グループ）**: 2026-07-27 追加（「## 9.5」参照）。
 
 ---
 
@@ -270,13 +288,14 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - SVG 出力のフォント/画像/SVG アイテムの Qt 標準経路は不安定 → 自前シリアライザで回避する（本設計の前提）。
 - mathtext は LaTeX 完全互換ではない → 将来 `usetex=True` 切替を用意する余地を残す。
 - 将来拡張（v1 では実装しない）: サブ図ラベル自動採番 (a)(b)(c)、スタイルのコピー/ペースト、コネクタの自動経路回避、簡易レイヤーの高度化。
-- **明示的にスコープ外**: `.pptx` 取り込み/書き出し、スケールバー、**背景除去（AI 機能全般）**。背景除去は一度実装した（rembg + GrabCut）が、最先端の外部ツールに品質・使い勝手で劣るため 2026-07-23 に全削除した。再実装しないこと。
+- **明示的にスコープ外**: `.pptx` 取り込み/書き出し、スケールバー、**自動背景除去（rembg 等のワンクリック全自動系）**。自動背景除去は一度実装した（rembg + GrabCut）が、最先端の外部ツールに品質・使い勝手で劣るため 2026-07-23 に全削除した。再実装しないこと。ただし **SAM3 選択的マスキング（「## 9.5」）は 2026-07-27 に正式スコープ化済みで、この除外に含まない**。
 
 ---
 
 ## 13. コーディング規約・注意
 - モデル層（`model/`）に PySide6 を import しない（テスト容易性・分離のため）。
 - `app/graphics/`・`app/model/` は PySide6 を import しない（Qt 非依存の共有層。`app/graphics/` は model のみに依存可）。
+- `app/ai/` も PySide6 を import しない（model のみに依存可）。torch/transformers は**関数内遅延 import**とし、`import app.ai.sam3` 自体は sam グループ未導入環境でも成功し軽量であること（起動時に重い import を走らせない）。
 - モデルへの変更は必ず `QUndoCommand` 経由。ビューやパネルからモデルを直接変更しない。
 - 重い数値処理を Python の for ループで書かない（NumPy/QPainterPath に委譲）。
 - 型ヒントを付ける。`ruff` / `black` を CI 相当のローカルチェックに使う。

@@ -112,8 +112,23 @@ class ToolManager(QObject):
         self._clear_snap_guides()
         if self._tool == name:
             return
+        # crop の確定は「実際にツールが替わる」ときのみ行う（早期 return より
+        # 後に置く）。同一ツールボタンの再クリックで crop 中の編集が不意に
+        # 確定されないようにするため（レビュー所見 nit）。
+        self._commit_active_crop()
         self._tool = name
         self.tool_changed.emit(name)
+
+    def _commit_active_crop(self) -> None:
+        """crop モード中ならツール切替前に確定する（宙ぶらりんのモードを残さない）。
+
+        `active_crop_item` は `CanvasScene` 側の追加 API のため、未実装の
+        scene でも壊れないようダックタイピングで呼ぶ。
+        """
+        getter = getattr(self.scene, "active_crop_item", None)
+        crop_item = getter() if callable(getter) else None
+        if crop_item is not None:
+            crop_item.commit_crop()
 
     def _clear_snap_guides(self) -> None:
         """スナップガイドを消す(M7契約 §7)。

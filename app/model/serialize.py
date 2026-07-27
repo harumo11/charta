@@ -6,9 +6,14 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from PIL import Image
 
 from app.model.document import Document
+
+if TYPE_CHECKING:
+    import numpy as np
 
 PROJECT_JSON_NAME = "project.json"
 
@@ -110,4 +115,33 @@ def import_image(doc: Document, src_path: str) -> str:
 
     dest = assets_dir / name
     shutil.copy2(src_path, dest)
+    return f"assets/{name}"
+
+
+def save_mask_png(doc: Document, mask: np.ndarray) -> str:
+    """uint8 グレースケール配列 [H,W] を `assets/mask_NNN.png` に保存し相対パスを返す。
+
+    `doc.base_dir` が未設定（プロジェクト未保存）の場合は RuntimeError。
+    連番は `import_image` と同方式: `assets_dir.glob("mask_*")` の stem
+    "mask_NNN" から使用済み番号を集め、最小の未使用 n で `mask_{n:03d}.png` とする。
+    """
+    if doc.base_dir is None:
+        raise RuntimeError("doc.base_dir is not set; save the project before importing images")
+    assets_dir = Path(doc.base_dir) / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    used_numbers: set[int] = set()
+    for p in assets_dir.glob("mask_*"):
+        stem = p.stem
+        _, _, num_part = stem.partition("_")
+        if num_part.isdigit():
+            used_numbers.add(int(num_part))
+
+    n = 1
+    while n in used_numbers:
+        n += 1
+    name = f"mask_{n:03d}.png"
+
+    dest = assets_dir / name
+    Image.fromarray(mask, mode="L").save(dest)
     return f"assets/{name}"

@@ -319,3 +319,343 @@ def test_missing_src_gives_placeholder_and_paint_does_not_crash(
         item.paint(painter, None, None)  # クラッシュしないこと
     finally:
         painter.end()
+
+
+# --------------------------------------------------------------------------
+# 7. crop モードの UI 配線（Enter/Esc・外側クリック・ツール切替・scene 追跡）
+# --------------------------------------------------------------------------
+
+
+def _scene_with_image(
+    project_dir: Path,
+    tmp_path: Path,
+    x: float = 0.0,
+    y: float = 0.0,
+    width: float = 80.0,
+    height: float = 60.0,
+    rotation: float = 0.0,
+) -> tuple[CanvasScene, Any, Any, ImageItem]:
+    """80x60 px の画像 1 枚を指定ジオメトリで配置した (scene, undo_stack, obj, item) を作る。"""
+    from PySide6.QtGui import QUndoStack
+
+    doc = Document()
+    save_document(doc, project_dir)
+    src = tmp_path / "crop_ui_src.png"
+    _make_source_image(src, w=80, h=60)
+    rel = import_image(doc, str(src))
+
+    obj = ImageObject(
+        id=doc.new_id(), src=rel, x=x, y=y, width=width, height=height, rotation=rotation
+    )
+    scene = CanvasScene(doc)
+    stack = QUndoStack()
+    scene.set_undo_stack(stack)
+    stack.push(AddObjectCommand(scene.document, obj))
+    item = scene.item_for(obj)
+    assert isinstance(item, ImageItem)
+    return scene, stack, obj, item
+
+
+def _key_event(key: Any) -> Any:
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+
+    return QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier)
+
+
+def _press_event_at(view: Any, scene_x: float, scene_y: float) -> Any:
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    local = QPointF(view.mapFromScene(QPointF(scene_x, scene_y)))
+    return QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        local,
+        local,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
+def test_crop_enter_key_commits_via_view(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from app.scene.canvas_view import CanvasView
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    view = CanvasView(scene)
+
+    item.begin_crop()
+    assert scene.active_crop_item() is item
+    item.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    view.keyPressEvent(_key_event(Qt.Key.Key_Return))
+    assert obj.crop == [10.0, 5.0, 30.0, 20.0]
+    assert item._crop_mode is False
+    assert scene.active_crop_item() is None
+
+
+def test_crop_escape_key_cancels_via_view(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from app.scene.canvas_view import CanvasView
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    view = CanvasView(scene)
+    undo_count_before = stack.count()
+
+    item.begin_crop()
+    item.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    view.keyPressEvent(_key_event(Qt.Key.Key_Escape))
+    assert obj.crop is None
+    assert item._crop_mode is False
+    assert scene.active_crop_item() is None
+    assert stack.count() == undo_count_before, "キャンセルでは undo 履歴が増えないこと"
+
+
+def test_crop_outside_click_commits(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    from app.scene.canvas_view import CanvasView
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    view = CanvasView(scene)
+    view.resize(400, 300)
+
+    item.begin_crop()
+    item.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    view.mousePressEvent(_press_event_at(view, 500.0, 500.0))  # 画像（80x60）の外側
+    assert obj.crop == [10.0, 5.0, 30.0, 20.0]
+    assert item._crop_mode is False
+    assert scene.active_crop_item() is None
+
+
+def test_crop_press_inside_does_not_commit(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    from app.scene.canvas_view import CanvasView
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    view = CanvasView(scene)
+    view.resize(400, 300)
+
+    item.begin_crop()
+    item.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    view.mousePressEvent(_press_event_at(view, 20.0, 10.0))  # 画像内（オーバーレイ上）
+    assert item._crop_mode is True, "crop 対象上の押下ではモードを終了しないこと"
+    assert obj.crop is None
+
+
+def test_crop_tool_switch_commits(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    from app.tools.tool_manager import ToolManager
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    tm = ToolManager(scene)
+
+    item.begin_crop()
+    item.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    tm.set_tool("rect")
+    assert obj.crop == [10.0, 5.0, 30.0, 20.0]
+    assert item._crop_mode is False
+    assert scene.active_crop_item() is None
+
+
+def test_crop_handle_drag_stays_in_image_local_coords(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """原点以外に置いた画像の crop ハンドルをドラッグしても矩形が飛ばないこと。
+
+    リグレッション: `BoxHandleSet._drag_resize` が新矩形位置を scene 座標へ
+    写像していたため、ImageItem の子である CropOverlay（画像ローカル座標を
+    期待）では画像の scene 位置ぶんずれて「四角が飛ぶ」バグがあった。
+    """
+    from PySide6.QtCore import QPointF
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path, x=100.0, y=50.0)
+
+    item.begin_crop()
+    overlay = item._crop_overlay
+    assert overlay is not None and overlay._handles is not None
+    handles = overlay._handles
+
+    # 右下ハンドルを画像右下 scene(180,110) から scene(140,80) へドラッグ → crop 40x30
+    handles.begin_drag("br", QPointF(180.0, 110.0))
+    handles.drag_to("br", QPointF(140.0, 80.0))
+    handles.end_drag("br")
+    assert item._crop_overlay_px == [0.0, 0.0, 40.0, 30.0]
+    assert overlay.pos().x() == pytest.approx(0.0), "オーバーレイが画像ローカル座標に留まること"
+    assert overlay.pos().y() == pytest.approx(0.0)
+
+    # 左上ハンドルを scene(100,50) から scene(110,60) へドラッグ → crop [10,10,30,20]
+    handles.begin_drag("tl", QPointF(100.0, 50.0))
+    handles.drag_to("tl", QPointF(110.0, 60.0))
+    handles.end_drag("tl")
+    assert item._crop_overlay_px == [10.0, 10.0, 30.0, 20.0]
+    assert overlay.pos().x() == pytest.approx(10.0)
+    assert overlay.pos().y() == pytest.approx(10.0)
+
+    item.commit_crop()
+    assert obj.crop == [10.0, 10.0, 30.0, 20.0]
+
+
+def test_crop_handle_drag_out_of_bounds_is_clamped(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """ハンドルを画像境界の外までドラッグしても crop が元画像内にクランプされること。
+
+    リグレッション（レビュー所見 major）: `CropOverlay.set_live_rect` が
+    クランプせず `_crop_overlay_px` を直接書いていたため、境界外ドラッグで
+    実画像より大きい crop が確定され、出力が引き伸ばされて歪んだ。
+    """
+    from PySide6.QtCore import QPointF
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path, x=100.0, y=50.0)
+
+    item.begin_crop()
+    handles = item._crop_overlay._handles
+
+    # まず内側へ: tl を scene(100,50)→(110,60) で crop [10,10,70,50]
+    handles.begin_drag("tl", QPointF(100.0, 50.0))
+    handles.drag_to("tl", QPointF(110.0, 60.0))
+    handles.end_drag("tl")
+    assert item._crop_overlay_px == [10.0, 10.0, 70.0, 50.0]
+
+    # br を画像右下 scene(180,110) から大きく外側 scene(500,500) へ → クランプで不変
+    handles.begin_drag("br", QPointF(180.0, 110.0))
+    handles.drag_to("br", QPointF(500.0, 500.0))
+    handles.end_drag("br")
+    assert item._crop_overlay_px == [10.0, 10.0, 70.0, 50.0]
+
+    item.commit_crop()
+    assert obj.crop == [10.0, 10.0, 70.0, 50.0]
+    assert obj.width == pytest.approx(70.0)
+    assert obj.height == pytest.approx(50.0)
+
+
+def test_crop_handle_drag_on_scaled_image(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    """表示サイズが原画 px と異なる（x2, x1.5 スケール済み）画像でのハンドルドラッグ。
+
+    ローカル座標→原画 px の換算（`_local_to_px`）が軸ごとに正しいことを固定する。
+    """
+    from PySide6.QtCore import QPointF
+
+    scene, stack, obj, item = _scene_with_image(
+        project_dir, tmp_path, x=100.0, y=50.0, width=160.0, height=90.0
+    )
+
+    item.begin_crop()
+    handles = item._crop_overlay._handles
+
+    # br を画像右下 scene(260,140) から scene(180,110) へ → ローカル(80,60) = px(40,40)
+    handles.begin_drag("br", QPointF(260.0, 140.0))
+    handles.drag_to("br", QPointF(180.0, 110.0))
+    handles.end_drag("br")
+    assert item._crop_overlay_px == [0.0, 0.0, 40.0, 40.0]
+
+    item.commit_crop()
+    assert obj.crop == [0.0, 0.0, 40.0, 40.0]
+    # 軸ごとの表示スケール維持: width = 40*(160/80) = 80, height = 40*(90/60) = 60
+    assert obj.width == pytest.approx(80.0)
+    assert obj.height == pytest.approx(60.0)
+
+
+def test_crop_handle_drag_on_rotated_image(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    """180 度回転した画像でもハンドルドラッグが画像ローカル座標で正しく動くこと。"""
+    from PySide6.QtCore import QPointF
+
+    scene, stack, obj, item = _scene_with_image(
+        project_dir, tmp_path, x=100.0, y=50.0, rotation=180.0
+    )
+
+    item.begin_crop()
+    handles = item._crop_overlay._handles
+
+    # 180 度回転では scene = (180 - lx, 110 - ly)。br（ローカル(80,60)）は
+    # scene(100,50) にあり、scene(140,80)（画像中心）へ動かすとローカル(40,30)。
+    handles.begin_drag("br", QPointF(100.0, 50.0))
+    handles.drag_to("br", QPointF(140.0, 80.0))
+    handles.end_drag("br")
+    assert item._crop_overlay_px == [0.0, 0.0, 40.0, 30.0]
+
+    item.commit_crop()
+    assert obj.crop == [0.0, 0.0, 40.0, 30.0]
+
+
+def test_crop_disables_image_move_while_active(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """crop モード中は ItemIsMovable が外れ、終了で復元されること（レビュー所見 minor）。"""
+    from PySide6.QtWidgets import QGraphicsItem
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    movable = QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+
+    assert item.flags() & movable
+    item.begin_crop()
+    assert not (item.flags() & movable)
+
+    # crop 中のモデル変更（sync_from_model 経由）でも移動禁止が維持されること
+    scene.document.set_values(obj, {"opacity": 0.5})
+    assert not (item.flags() & movable)
+
+    item.cancel_crop()
+    assert item.flags() & movable
+
+
+def test_crop_same_tool_reselect_does_not_commit(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """既にアクティブなツールの再選択では crop を確定しないこと（レビュー所見 nit）。"""
+    from app.tools.tool_manager import ToolManager
+
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+    tm = ToolManager(scene)
+    assert tm.current_tool() == "select"
+
+    item.begin_crop()
+    item.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    tm.set_tool("select")  # 同一ツールの再選択 → 確定しない
+    assert item._crop_mode is True
+    assert obj.crop is None
+
+    tm.set_tool("rect")  # 実際のツール変更 → 確定する
+    assert obj.crop == [10.0, 5.0, 30.0, 20.0]
+    assert item._crop_mode is False
+
+
+def test_crop_second_image_begin_commits_first(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """crop モード中に別画像で crop を開始すると、先の画像は確定されて取り残されないこと。"""
+    scene, stack, obj_a, item_a = _scene_with_image(project_dir, tmp_path)
+    obj_b = ImageObject(
+        id=scene.document.new_id(), src=obj_a.src, x=200.0, y=0.0, width=80.0, height=60.0
+    )
+    stack.push(AddObjectCommand(scene.document, obj_b))
+    item_b = scene.item_for(obj_b)
+    assert isinstance(item_b, ImageItem)
+
+    item_a.begin_crop()
+    item_a.set_crop_rect(10.0, 5.0, 30.0, 20.0)
+
+    item_b.begin_crop()
+    assert item_a._crop_mode is False, "先行の crop が確定されてモード終了していること"
+    assert obj_a.crop == [10.0, 5.0, 30.0, 20.0]
+    assert scene.active_crop_item() is item_b
+
+    item_b.cancel_crop()
+    assert scene.active_crop_item() is None
+
+
+def test_crop_tracking_cleared_on_object_removal(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    scene, stack, obj, item = _scene_with_image(project_dir, tmp_path)
+
+    item.begin_crop()
+    assert scene.active_crop_item() is item
+
+    scene.document.remove_object(obj)  # crop モード中の削除で stale 参照を残さない
+    assert scene.active_crop_item() is None

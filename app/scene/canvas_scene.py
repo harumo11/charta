@@ -10,7 +10,7 @@ import math
 import sys
 import warnings
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QUndoStack
 from PySide6.QtWidgets import QGraphicsScene
 
@@ -28,6 +28,9 @@ _GUIDE_COLOR = QColor(255, 0, 170, 200)
 
 class CanvasScene(QGraphicsScene):
     """Document を描画・編集する QGraphicsScene。"""
+
+    #: crop モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
+    crop_mode_changed = Signal(bool)
 
     def __init__(self, document: Document) -> None:
         super().__init__()
@@ -47,6 +50,9 @@ class CanvasScene(QGraphicsScene):
 
         # グループ選択拡張の再入防止ガード（selectionChanged フィードバックループ回避）。
         self._expanding_selection: bool = False
+
+        # crop モード中の ImageItem（ビュー状態。CanvasView/ToolManager が参照する）。
+        self._active_crop_item: BaseItem | None = None
 
         self.setSceneRect(
             0,
@@ -99,6 +105,7 @@ class CanvasScene(QGraphicsScene):
         設定してリスナー登録し直し、初期構築と同じ経路で item を再構築する。
         """
         self.document.remove_listener(self)
+        self.set_active_crop_item(None)
         for item in list(self._items.values()):
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
@@ -112,6 +119,20 @@ class CanvasScene(QGraphicsScene):
         self.rebind_connectors()
         self.apply_artboard_change()
         self.clearSelection()
+
+    # ------------------------------------------------------------------
+    # crop モード追跡
+    # ------------------------------------------------------------------
+    def set_active_crop_item(self, item: BaseItem | None) -> None:
+        """crop モード中の item を登録する（None で解除）。ImageItem が begin/end で呼ぶ。"""
+        if item is self._active_crop_item:
+            return
+        self._active_crop_item = item
+        self.crop_mode_changed.emit(item is not None)
+
+    def active_crop_item(self) -> BaseItem | None:
+        """crop モード中の item を返す（無ければ None）。"""
+        return self._active_crop_item
 
     # ------------------------------------------------------------------
     # グリッド（M7契約 §5）
@@ -270,6 +291,9 @@ class CanvasScene(QGraphicsScene):
         """
         item = self._items.pop(obj.id, None)
         if item is not None:
+            if item is self._active_crop_item:
+                # crop モード中に対象が削除された場合、破棄済み item への stale 参照を残さない。
+                self.set_active_crop_item(None)
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
                 destroy_bindings()
@@ -288,6 +312,7 @@ class CanvasScene(QGraphicsScene):
 
     def rebuild(self) -> None:
         """全 item を破棄し、document.objects から再生成する（load 後に使用）。"""
+        self.set_active_crop_item(None)
         for item in list(self._items.values()):
             self.removeItem(item)
         self._items.clear()

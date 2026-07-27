@@ -168,6 +168,8 @@ class CanvasView(QGraphicsView):
         self.setDragMode(self._pre_pan_drag_mode)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._handle_crop_key(event):
+            return
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             if not self._space_panning:
                 self._space_panning = True
@@ -185,6 +187,46 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+    # -- crop モード（Enter=確定 / Esc=キャンセル / 外側クリック=確定） ----------
+
+    def _active_crop_item(self):  # noqa: ANN202 - ImageItem への import 循環を避ける
+        scene = self.scene()
+        getter = getattr(scene, "active_crop_item", None)
+        return getter() if callable(getter) else None
+
+    def _handle_crop_key(self, event: QKeyEvent) -> bool:
+        """crop モード中の Enter/Esc を処理する（処理したら True）。"""
+        crop_item = self._active_crop_item()
+        if crop_item is None:
+            return False
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            crop_item.commit_crop()
+            event.accept()
+            return True
+        if event.key() == Qt.Key.Key_Escape:
+            crop_item.cancel_crop()
+            event.accept()
+            return True
+        return False
+
+    def _commit_crop_on_outside_press(self, event: QMouseEvent) -> bool:
+        """crop 対象の外側を左クリックしたら crop を確定し、そのクリックは消費する。
+
+        画像自身・オーバーレイ・ハンドル（子孫アイテム）上の押下は通常処理へ通す。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        crop_item = self._active_crop_item()
+        if crop_item is None:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        hit = self.scene().itemAt(scene_pos, self.transform())
+        if hit is not None and (hit is crop_item or crop_item.isAncestorOf(hit)):
+            return False
+        crop_item.commit_crop()
+        event.accept()
+        return True
 
     # -- 画像ファイルのドラッグ＆ドロップ -------------------------------------
 
@@ -256,6 +298,9 @@ class CanvasView(QGraphicsView):
             )
             super().mousePressEvent(fake)
             event.accept()
+            return
+
+        if self._commit_crop_on_outside_press(event):
             return
 
         if self.tool_manager is not None:

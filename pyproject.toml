@@ -18,10 +18,31 @@ dev = [
     "pytest>=8.0",
 ]
 
+# SAM3 選択的マスキング（§9.5、任意・GPU 前提）。`uv sync --group sam` で導入。
+# 未導入でも本体は起動し、当該メニューが無効化されるだけ（app/ai/sam3.py の
+# is_available() 判定・遅延 import）。
+sam = [
+    "torch>=2.7",
+    "torchvision>=0.22",
+    "transformers>=5.0",
+    "accelerate>=1.0",
+]
+
 # パッケージ配布はしない（§1: dev 実行のみ）。プロジェクト自身はビルド/インストールせず、
 # 依存だけを管理する仮想プロジェクトとして扱う。
 [tool.uv]
 package = false
+
+# RTX 5080 (Blackwell sm_120) は CUDA 12.8 ビルドの torch が必須。sam グループの
+# ときだけ PyTorch 公式 index から解決する（explicit=true で他パッケージは流れない）。
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", group = "sam" }]
+torchvision = [{ index = "pytorch-cu128", group = "sam" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.black]
 line-length = 100
