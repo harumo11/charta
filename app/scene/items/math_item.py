@@ -13,7 +13,7 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QByteArray, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QFontInfo, QPen
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QDialog,
@@ -56,6 +56,24 @@ def _build_renderer(latex: str, font_size: float, color: str) -> tuple[QSvgRende
     if not renderer.isValid():
         raise MathRenderError("QSvgRenderer failed to parse generated SVG")
     return renderer, svg
+
+
+def natural_math_size(
+    latex: str, font_size: float, color: str, minimum: float = _MIN_MATH_SIZE
+) -> tuple[float, float]:
+    """`latex` を実レンダリングし `QSvgRenderer.defaultSize()` の px 寸法を返す。
+
+    数式オブジェクトを新規作成するときの既定寸法。レンダリングに失敗しても
+    ヘッドレスで落ちないよう `MathRenderError` は `(minimum, minimum)` に吸収する
+    （§9.4 と同じ方針）。math ツールとエージェント API が共有する唯一の採寸経路。
+    """
+    try:
+        renderer, _svg = _build_renderer(latex, font_size, color)
+    except MathRenderError as exc:
+        warnings.warn(f"math: default size render failed: {exc}", stacklevel=2)
+        return (minimum, minimum)
+    size = renderer.defaultSize()
+    return (max(float(size.width()), minimum), max(float(size.height()), minimum))
 
 
 @register_item("math")
@@ -145,6 +163,12 @@ class MathItem(BoxItem):
         painter.setPen(pen)
         painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         painter.drawRect(rect)
+        # フォントはピクセル実寸に固定する。painter 既定のポイントサイズのままだと
+        # 描画デバイスの DPI で解決され、PDF（1200dpi）では 12.5 倍になって
+        # ページ外へ飛ぶ（`text_item._font_for` の docstring 参照）。
+        font = QFont(painter.font())
+        font.setPixelSize(max(QFontInfo(font).pixelSize(), 1))
+        painter.setFont(font)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "invalid math")
 
     def _natural_fit_rect(self, rect: QRectF) -> QRectF:

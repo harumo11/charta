@@ -1,6 +1,6 @@
 """ImageImportController: 画像取り込み（メニュー経路・D&D、M2契約 §4）。
 
-MainWindow の `import_image_action`/`_import_dropped_images`/`_import_image_file`/
+MainWindow の `import_image_action`/`_import_dropped_images`/`import_image_file`/
 `_ensure_base_dir_for_import` および補助関数 `_clamp_span`/`_object_rect` を移設した
 もの（Phase 4契約 Stage 4）。ロジックは `app/ui/main_window.py`（移設前）と同一で、
 `self.xxx` の参照付け替えのみ行った。ウィンドウフィット
@@ -82,7 +82,7 @@ class ImageImportController:
             document.base_dir = self._window._temp_autosave_path()
         return True
 
-    def _import_image_file(
+    def import_image_file(
         self,
         path: str,
         center: tuple[float, float] | None = None,
@@ -94,6 +94,10 @@ class ImageImportController:
         `center` はアートボード座標での配置中心（None ならアートボード中央）。
         アートボード外はスクロール到達不能になるため、画像が収まる位置へクランプする。
         `errors` を渡すと失敗をダイアログではなくそこへ蓄積する（複数取り込みの集約用）。
+
+        ダイアログを開かないヘッドレス安全な取り込み経路。外部（エージェント制御
+        サーバ `app/agent/`）はこれを `errors=[]` 付きで呼ぶ。事前に
+        `_ensure_base_dir_for_import()` を済ませておくこと。
         """
         document = self._scene.document
 
@@ -150,7 +154,7 @@ class ImageImportController:
         )
         if not path:
             return
-        obj = self._import_image_file(path)
+        obj = self.import_image_file(path)
         if obj is not None:
             # 取り込んだ画像がそのまま作業対象になるよう、ウィンドウを画像サイズへ
             # 合わせてからビューを画像へフィットさせる。
@@ -184,7 +188,7 @@ class ImageImportController:
             offset = 0.0
             for path in valid:
                 # 複数ドロップは重なり切らないよう斜めにずらして配置する。
-                obj = self._import_image_file(
+                obj = self.import_image_file(
                     path,
                     (scene_pos.x() + offset, scene_pos.y() + offset),
                     errors=errors,

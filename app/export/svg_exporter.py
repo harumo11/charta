@@ -21,7 +21,7 @@ from collections.abc import Callable
 from xml.sax.saxutils import escape, quoteattr
 
 from PySide6.QtCore import QRectF
-from PySide6.QtGui import QFont, QFontMetricsF, QPainterPath
+from PySide6.QtGui import QFont, QFontInfo, QFontMetricsF, QPainterPath
 
 from app.export.text_outline import text_to_path
 from app.graphics.arrows import (
@@ -33,16 +33,13 @@ from app.graphics.arrows import (
 )
 from app.graphics.image_pipeline import processed_png_base64
 from app.graphics.routing import (
-    Box,
-    Point,
-    anchors_for,
     build_routing,
-    compute_endpoints,
+    connector_endpoints_from_model,
     endpoint_direction,
 )
 from app.math.mathtext_render import MathRenderError, get_math_svg
 from app.model.document import Document
-from app.model.objects import BaseObject, geometry_kind
+from app.model.objects import BaseObject
 
 _SVG_NS = "http://www.w3.org/2000/svg"
 _XLINK_NS = "http://www.w3.org/1999/xlink"
@@ -295,35 +292,14 @@ def _render_line(obj: BaseObject) -> str:
 _CONNECTOR_ARROW_SIZE = 12.0
 
 
-def _connector_anchor_set(document: Document, oid: int | None) -> dict[str, Point] | None:
-    """接続先オブジェクトの種類別アンカー集合（箱型9点/直線3点、§9・型別アンカー契約 §5）。
-
-    箱型はモデルの生の x/y/width/height に加え rotation を反映する
-    （line/arrow は p1/p2 が絶対座標のため回転は無関係）。
-    未接続(oid=None)/オブジェクト消失時は None。
-    """
-    if oid is None:
-        return None
-    obj = document.object_by_id(oid)
-    if obj is None:
-        return None
-    if geometry_kind(obj.type) == "endpoints":
-        p1: Point = (float(obj.p1[0]), float(obj.p1[1]))
-        p2: Point = (float(obj.p2[0]), float(obj.p2[1]))
-        return anchors_for(obj.type, None, p1, p2)
-    box: Box = (float(obj.x), float(obj.y), float(obj.width), float(obj.height))
-    return anchors_for(obj.type, box, None, None, float(obj.rotation))
-
-
 def _render_connector(document: Document, obj: BaseObject) -> str:
-    """connector を `app.graphics.routing` でモデルから端点/ルーティングを解いて描画する。"""
-    src_set = _connector_anchor_set(document, obj.source_id)
-    tgt_set = _connector_anchor_set(document, obj.target_id)
-    src_point: Point = (float(obj.source_point[0]), float(obj.source_point[1]))
-    tgt_point: Point = (float(obj.target_point[0]), float(obj.target_point[1]))
-    src_pt, tgt_pt = compute_endpoints(
-        src_set, src_point, obj.source_anchor, tgt_set, tgt_point, obj.target_anchor
-    )
+    """connector を `app.graphics.routing` でモデルから端点/ルーティングを解いて描画する。
+
+    端点解決は `connector_endpoints_from_model`（Qt 非依存の共有経路）に委譲する。
+    エージェント向けレンダリングの注釈オーバーレイも同じ関数を使うので、
+    SVG と画面注釈で座標がずれない。
+    """
+    src_pt, tgt_pt = connector_endpoints_from_model(document, obj)
     points = build_routing(src_pt, tgt_pt, obj.routing)
 
     line_points = list(points)
@@ -356,10 +332,16 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
 
 
 def _build_text_font(obj: BaseObject) -> QFont:
+    """SVG 出力用の `QFont`（`text_item._font_for` と同じくピクセル実寸に固定する）。
+
+    ポイントサイズのままだと描画デバイスの DPI で解決されてしまうため、
+    デバイス非依存の解決結果を焼き込む（理由は `text_item._font_for` の docstring）。
+    """
     font = QFont(obj.font_family)
     font.setPointSizeF(max(float(obj.font_size), 1.0))
     font.setBold(bool(obj.bold))
     font.setItalic(bool(obj.italic))
+    font.setPixelSize(QFontInfo(font).pixelSize())
     return font
 
 
@@ -379,7 +361,11 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
     # モデルの point-size をそのまま SVG の user-unit(px) に流用していた旧実装の
     # ずれ（outline/画面/PDF の見た目と不一致）を解消する。
     metrics = QFontMetricsF(font)
-    font_size_px = metrics.ascent() + metrics.descent()
+    # SVG の font-size は **em サイズ**（= 解決後のピクセルサイズ）。
+    # `ascent + descent` は行ボックスの高さであって em ではない（Noto Sans CJK では
+    # 約 1.45em）。ここを取り違えると `<text>` だけ 1.45 倍で描かれ、
+    # outline 版・画面・PDF と食い違う。
+    font_size_px = float(QFontInfo(font).pixelSize())
     line_spacing = metrics.lineSpacing()
     baseline = metrics.ascent()
 

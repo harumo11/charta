@@ -74,11 +74,31 @@ def _object_anchor_set(
     return anchors_for(obj.type, box, None, None, float(obj.rotation))
 
 
+#: z順操作の識別子 -> (新インデックス計算, 処理順を降順にするか)。
+#: 複数選択の相対順序を保つため op ごとに処理順が違う。
+_REORDER_OPS: dict[str, tuple[Callable[[int, int], int], bool]] = {
+    "front": (lambda old, n: n - 1, False),
+    "back": (lambda old, n: 0, True),
+    "forward": (lambda old, n: min(old + 1, n - 1), True),
+    "backward": (lambda old, n: max(old - 1, 0), False),
+}
+
+
 class EditController:
     """コピー/貼付/複製・z順・整列/分布・グループ化・削除・グリッド/スナップ。
 
     `scene`（`document`/選択の参照元）と `undo_stack` を保持する。内部クリップ
     ボード状態（`_clipboard`）はこのコントローラの属性として持つ。
+
+    各操作は 2 段構えになっている:
+
+    * `*_objects(objs, ...)` — 対象を明示的に受け取る中核 API。
+      外部（エージェント制御サーバ `app/agent/`）はこちらを使う。
+    * `*_selected(...)` — `scene.selected_objects()` を読んで中核 API に渡すだけの
+      薄いラッパ。メニュー/ショートカットはこちらを使う。
+
+    中核 API はいずれも undo マクロの粒度を自分で決めるので、呼び出し側で
+    `beginMacro` を重ねる必要はない。
     """
 
     def __init__(self, scene: CanvasScene, undo_stack: QUndoStack) -> None:
@@ -105,12 +125,22 @@ class EditController:
 
     def duplicate_selection(self) -> None:
         """選択中オブジェクトをその場で複製する（クリップボードは変更しない）。"""
-        objs = self._scene.selected_objects()
-        if not objs:
-            return
-        self._clone_and_add([obj.to_dict() for obj in objs], text="複製")
+        self.duplicate_objects(self._scene.selected_objects())
 
-    def _clone_and_add(self, dicts: list[dict[str, Any]], text: str) -> None:
+    def duplicate_objects(
+        self, objs: list[BaseObject], text: str = "複製", select: bool = True
+    ) -> list[BaseObject]:
+        """`objs` をその場で複製する。生成した新オブジェクトを返す。
+
+        `select=False` にすると人間の選択状態を奪わない（エージェント経路の既定）。
+        """
+        if not objs:
+            return []
+        return self._clone_and_add([obj.to_dict() for obj in objs], text=text, select=select)
+
+    def _clone_and_add(
+        self, dicts: list[dict[str, Any]], text: str, select: bool = True
+    ) -> list[BaseObject]:
         """`arrange.clone_object_dicts` で複製し、AddObjectCommand マクロで追加・新規選択する。
 
         `group_remap` は `clone_object_dicts` 自身は生成しない（存在しないキーは
@@ -133,64 +163,77 @@ class EditController:
         new_dicts = arrange.clone_object_dicts(dicts, _id_gen(), group_remap, offset=_CLONE_OFFSET)
         new_objs = [BaseObject.from_dict(d) for d in new_dicts]
         if not new_objs:
-            return
+            return []
 
         self._undo_stack.beginMacro(text)
         for obj in new_objs:
             self._undo_stack.push(AddObjectCommand(self._scene.document, obj))
         self._undo_stack.endMacro()
 
-        self._scene.clearSelection()
-        for obj in new_objs:
-            item = self._scene.item_for(obj)
-            if item is not None:
-                item.setSelected(True)
+        if select:
+            self._scene.clearSelection()
+            for obj in new_objs:
+                item = self._scene.item_for(obj)
+                if item is not None:
+                    item.setSelected(True)
+        return new_objs
 
     # ------------------------------------------------------------------
     # オブジェクト: z順操作（前面/背面/一つ前/一つ後ろ、M7契約 §2・§9）
     # ------------------------------------------------------------------
 
     def bring_to_front(self) -> None:
-        self._reorder_selected(lambda old, n: n - 1, sort_reverse=False)
+        self.reorder_objects(self._scene.selected_objects(), "front")
 
     def send_to_back(self) -> None:
-        self._reorder_selected(lambda old, n: 0, sort_reverse=True)
+        self.reorder_objects(self._scene.selected_objects(), "back")
 
     def bring_forward(self) -> None:
-        self._reorder_selected(lambda old, n: min(old + 1, n - 1), sort_reverse=True)
+        self.reorder_objects(self._scene.selected_objects(), "forward")
 
     def send_backward(self) -> None:
-        self._reorder_selected(lambda old, n: max(old - 1, 0), sort_reverse=False)
+        self.reorder_objects(self._scene.selected_objects(), "backward")
 
-    def _reorder_selected(
-        self, compute_new_index: Callable[[int, int], int], sort_reverse: bool
-    ) -> None:
-        """選択中オブジェクトの z順を変更する。
+    def reorder_objects(
+        self,
+        objs: list[BaseObject],
+        op: str,
+        text: str = "z順変更",
+        force: bool = False,
+    ) -> list[BaseObject]:
+        """`objs` の z順を変更する。実際に移動したオブジェクトを返す。
 
-        複数選択の相対順序を保つため、`sort_reverse` で処理順を選ぶ（前面へ/一つ後ろは
-        昇順、背面へ/一つ前へは降順で処理する）。各 push は `undo_stack.push()` が
-        即座に `redo()` を実行するため、後続の `document.index_of()` は前の移動を
-        反映した最新値になる。
+        `op` は "front" | "back" | "forward" | "backward"。未知の op は `ValueError`。
+        複数対象の相対順序を保つため op ごとに処理順（昇順/降順）を変える。各 push は
+        `undo_stack.push()` が即座に `redo()` を実行するため、後続の
+        `document.index_of()` は前の移動を反映した最新値になる。
         """
-        scene = self._scene
-        document = scene.document
-        objs = [o for o in scene.selected_objects() if not o.locked]
-        if not objs:
-            return
-        objs.sort(key=document.index_of, reverse=sort_reverse)
+        entry = _REORDER_OPS.get(op)
+        if entry is None:
+            raise ValueError(f"未知の z順操作: {op!r}（{sorted(_REORDER_OPS)} のいずれか）")
+        compute_new_index, sort_reverse = entry
 
+        document = self._scene.document
+        targets = [o for o in objs if force or not o.locked]
+        if not targets:
+            return []
+        targets.sort(key=document.index_of, reverse=sort_reverse)
+
+        moved: list[BaseObject] = []
         macro_open = False
-        for obj in objs:
+        for obj in targets:
             old_index = document.index_of(obj)
             new_index = compute_new_index(old_index, len(document.objects))
             if new_index == old_index:
                 continue
             if not macro_open:
-                self._undo_stack.beginMacro("z順変更")
+                self._undo_stack.beginMacro(text)
                 macro_open = True
             self._undo_stack.push(ReorderCommand(document, obj, new_index, old_index))
+            moved.append(obj)
         if macro_open:
             self._undo_stack.endMacro()
+        return moved
 
     # ------------------------------------------------------------------
     # オブジェクト: 整列/分布（arrange.align_positions/distribute_positions、M7契約 §3・§9）
@@ -202,7 +245,7 @@ class EditController:
         boxes: dict[int, Box],
         new_xy: dict[int, tuple[float, float]],
         text: str,
-    ) -> None:
+    ) -> list[BaseObject]:
         changes: list[tuple[BaseObject, dict[str, Any], dict[str, Any]]] = []
         for obj in objs:
             if obj.id not in new_xy:
@@ -215,67 +258,107 @@ class EditController:
             old_geom, new_geom = translate_geom(obj, dx, dy)
             changes.append((obj, new_geom, old_geom))
         if not changes:
-            return
+            return []
         self._undo_stack.beginMacro(text)
         for obj, new_geom, old_geom in changes:
             self._undo_stack.push(SetGeometryCommand(self._scene.document, obj, new_geom, old_geom))
         self._undo_stack.endMacro()
+        return [obj for obj, _, _ in changes]
+
+    def _arrangeable(self, objs: list[BaseObject], force: bool) -> list[BaseObject]:
+        """整列/分布の対象を絞る。コネクタは独立した位置を持たないので常に除外する。"""
+        return [o for o in objs if (force or not o.locked) and o.type != "connector"]
 
     def align_selected(self, mode: str) -> None:
         """選択中オブジェクトを `mode` に整列する（コネクタは対象外）。"""
-        objs = [o for o in self._scene.selected_objects() if not o.locked and o.type != "connector"]
-        if len(objs) < 2:
-            return
-        boxes = {o.id: bounding_box(o) for o in objs}
+        self.align_objects(self._scene.selected_objects(), mode)
+
+    def align_objects(
+        self, objs: list[BaseObject], mode: str, text: str = "整列", force: bool = False
+    ) -> list[BaseObject]:
+        """`objs` を `mode` に整列する。実際に動いたオブジェクトを返す。
+
+        `mode` は left|right|top|bottom|center_h|center_v。対象は 2 個以上必要
+        （コネクタとロック済みを除いた後で判定する）。
+        """
+        targets = self._arrangeable(objs, force)
+        if len(targets) < 2:
+            return []
+        boxes = {o.id: bounding_box(o) for o in targets}
         new_xy = arrange.align_positions(boxes, mode)
-        self._apply_box_moves(objs, boxes, new_xy, text="整列")
+        return self._apply_box_moves(targets, boxes, new_xy, text=text)
 
     def distribute_selected(self, axis: str) -> None:
         """選択中オブジェクトを `axis` 方向に等間隔分布する（コネクタは対象外）。"""
-        objs = [o for o in self._scene.selected_objects() if not o.locked and o.type != "connector"]
-        if len(objs) < 3:
-            return
-        boxes = {o.id: bounding_box(o) for o in objs}
+        self.distribute_objects(self._scene.selected_objects(), axis)
+
+    def distribute_objects(
+        self, objs: list[BaseObject], axis: str, text: str = "分布", force: bool = False
+    ) -> list[BaseObject]:
+        """`objs` を `axis`（h|v）方向に等間隔分布する。実際に動いたオブジェクトを返す。
+
+        対象は 3 個以上必要（コネクタとロック済みを除いた後で判定する）。
+        """
+        targets = self._arrangeable(objs, force)
+        if len(targets) < 3:
+            return []
+        boxes = {o.id: bounding_box(o) for o in targets}
         new_xy = arrange.distribute_positions(boxes, axis)
-        self._apply_box_moves(objs, boxes, new_xy, text="分布")
+        return self._apply_box_moves(targets, boxes, new_xy, text=text)
 
     # ------------------------------------------------------------------
     # オブジェクト: グループ化/解除（M7契約 §2・§9）
     # ------------------------------------------------------------------
 
     def group_selected(self) -> None:
-        objs = [o for o in self._scene.selected_objects() if not o.locked]
-        if len(objs) < 2:
-            return
+        self.group_objects(self._scene.selected_objects())
+
+    def group_objects(self, objs: list[BaseObject], force: bool = False) -> int | None:
+        """`objs` を 1 グループにまとめる。採番した group_id を返す（2 個未満なら None）。"""
+        targets = [o for o in objs if force or not o.locked]
+        if len(targets) < 2:
+            return None
         group_id = self._scene.document.new_id()
-        self._undo_stack.push(GroupCommand(self._scene.document, objs, group_id))
+        self._undo_stack.push(GroupCommand(self._scene.document, targets, group_id))
+        return group_id
 
     def ungroup_selected(self) -> None:
-        objs = [o for o in self._scene.selected_objects() if o.group_id is not None]
-        if not objs:
-            return
-        self._undo_stack.push(UngroupCommand(self._scene.document, objs))
+        self.ungroup_objects(self._scene.selected_objects())
+
+    def ungroup_objects(self, objs: list[BaseObject]) -> list[BaseObject]:
+        """`objs` のうちグループに属するもののグループを解除する。解除したものを返す。"""
+        targets = [o for o in objs if o.group_id is not None]
+        if not targets:
+            return []
+        self._undo_stack.push(UngroupCommand(self._scene.document, targets))
+        return targets
 
     # ------------------------------------------------------------------
     # Edit: 削除（Delete キー / M6契約 §7、§9.3 の接続先固定化）
     # ------------------------------------------------------------------
 
     def delete_selected(self) -> None:
-        """選択中のオブジェクトを削除する。
+        """選択中のオブジェクトを削除する。"""
+        self.delete_objects(self._scene.selected_objects())
 
-        削除対象を接続先に持つ非選択コネクタは、削除前（接続先がまだ存在する
+    def delete_objects(self, objs: list[BaseObject], text: str = "削除") -> list[int]:
+        """`objs` を削除する。削除した id のリストを返す。
+
+        削除対象を接続先に持つ非対象コネクタは、削除前（接続先がまだ存在する
         時点）に現在のアンカー座標を計算して端点を固定化してから
         `RemoveObjectCommand` を積む。すべて 1 つの undo マクロにまとめるため、
         1 回の undo で全て復元される（§9.3: 孤立させない）。
+
+        ロック済みでも削除する（従来の Delete キーの挙動と同じ）。ロックを尊重したい
+        呼び出し側は事前に絞り込むこと。
         """
         scene = self._scene
         document = scene.document
-        objs = scene.selected_objects()
         if not objs:
-            return
+            return []
         ids = {o.id for o in objs}
 
-        self._undo_stack.beginMacro("削除")
+        self._undo_stack.beginMacro(text)
         try:
             for conn in list(document.objects):
                 if conn.type != "connector" or conn.id in ids:
@@ -287,6 +370,7 @@ class EditController:
                 self._undo_stack.push(RemoveObjectCommand(document, obj))
         finally:
             self._undo_stack.endMacro()
+        return sorted(ids)
 
     def _fix_connector_endpoints(
         self, scene: CanvasScene, conn: BaseObject, deleted_ids: set[int]

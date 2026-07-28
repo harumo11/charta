@@ -21,6 +21,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QDialog,
     QDockWidget,
+    QLabel,
     QMainWindow,
     QToolBar,
     QVBoxLayout,
@@ -45,6 +46,8 @@ from app.ui.mask_edit_panel import MaskEditPanel
 _LOGGER = logging.getLogger(__name__)
 
 _AUTOSAVE_INTERVAL_MS = 30_000
+# エージェント操作をステータスバーに残す時間（§15: UI は最小限）。
+_AGENT_MESSAGE_MS = 4_000
 # 画像取り込み時のウィンドウ自動リサイズの最小サイズ。
 _MIN_WINDOW_W = 800
 _MIN_WINDOW_H = 600
@@ -151,6 +154,18 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setInterval(_AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._autosave)
         self._autosave_timer.start()
+
+        # エージェント制御サーバ（§15）。`start_agent_server()` を呼ぶまで listen しない
+        # （テストや `--no-agent-server` 起動でソケットを作らないようにするため）。
+        self.agent_host: Any = None
+        self._agent_exec_enabled: bool = True
+        self._agent_indicator = QLabel("")
+        self._agent_indicator.setToolTip("エージェント制御サーバ")
+        self.statusBar().addPermanentWidget(self._agent_indicator)
+        self._agent_message_timer = QTimer(self)
+        self._agent_message_timer.setSingleShot(True)
+        self._agent_message_timer.setInterval(_AGENT_MESSAGE_MS)
+        self._agent_message_timer.timeout.connect(self._clear_agent_message)
 
     # ------------------------------------------------------------------
     # ProjectIOController の状態への委譲プロパティ（テスト互換: `window._project_dir`
@@ -417,9 +432,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def open_artboard_settings(self) -> None:
-        old_artboard = self.scene.document.artboard
-        dialog = ArtboardDialog(old_artboard, self)
+        dialog = ArtboardDialog(self.scene.document.artboard, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            # 旧値は accept 時点で取り直す。モーダルダイアログはネストしたイベントループを
+            # 回すため、表示中にも外部（エージェント経路）からアートボードが変わりうる。
+            # 表示前の値を undo に焼き込むと「存在しなかった状態」に戻ってしまう。
+            old_artboard = self.scene.document.artboard
             new_artboard = dialog.result_artboard()
             self.undo_stack.push(
                 SetArtboardCommand(self.scene.document, new_artboard, old_artboard)
@@ -444,8 +462,71 @@ class MainWindow(QMainWindow):
         self._project_io.autosave()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt override)
+        # 先にサーバを止める。終了処理の途中（Qt が半分壊れた状態）で外部からの
+        # リクエストが走らないようにするため。
+        self.stop_agent_server()
         self._autosave()
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # エージェント制御サーバ（§15）
+    # ------------------------------------------------------------------
+
+    def start_agent_server(self, socket_path: str | None = None, exec_enabled: bool = True) -> bool:
+        """Unix ドメインソケットで待ち受けを開始する。成功で True。
+
+        `main.py` から起動時に呼ぶ。テストや `--no-agent-server` では呼ばれない
+        ので、`MainWindow()` を作っただけではソケットを一切作らない。
+        """
+        from app.agent.host import AgentHost
+
+        if self.agent_host is not None and self.agent_host.is_listening():
+            return True
+        self._agent_exec_enabled = exec_enabled
+        host = AgentHost(self, socket_path=socket_path, exec_enabled=exec_enabled)
+        if not host.start():
+            _LOGGER.warning("エージェント制御サーバを開始できませんでした: %s", host.last_error())
+            self._agent_indicator.setText("agent: ✕")
+            self._agent_indicator.setToolTip(f"エージェント制御サーバ: {host.last_error()}")
+            return False
+        host.activity.connect(self._on_agent_activity)
+        host.clients_changed.connect(self._on_agent_clients_changed)
+        self.agent_host = host
+        self._on_agent_clients_changed(0)
+        _LOGGER.info("エージェント制御サーバ: %s", host.socket_path)
+        return True
+
+    def stop_agent_server(self) -> None:
+        if self.agent_host is not None:
+            self.agent_host.stop()
+            self.agent_host = None
+            self._agent_indicator.setText("")
+
+    def _on_agent_clients_changed(self, count: int) -> None:
+        """接続状態インジケータ（メニュー項目は増やさない、§15 の UI 方針）。"""
+        host = self.agent_host
+        if host is None:
+            self._agent_indicator.setText("")
+            return
+        self._agent_indicator.setText("agent ●" if count else "agent ○")
+        self._agent_indicator.setToolTip(
+            f"エージェント制御サーバ: {host.socket_path}\n接続中のクライアント: {count}"
+        )
+
+    def _on_agent_activity(self, text: str) -> None:
+        """直近のエージェント操作を数秒だけ表示する（人間が仕業を目で追えるように）。"""
+        # crop / mask モードのヒントを上書きしない。
+        if (
+            self.scene.active_crop_item() is not None
+            or self.scene.active_mask_session() is not None
+        ):
+            return
+        self.statusBar().showMessage(text)
+        self._agent_message_timer.start()
+
+    def _clear_agent_message(self) -> None:
+        if self.scene.active_crop_item() is None and self.scene.active_mask_session() is None:
+            self.statusBar().clearMessage()
 
     # ------------------------------------------------------------------
     # File: new / open / save / save as（ProjectIOController に委譲）

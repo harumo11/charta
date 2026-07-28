@@ -12,6 +12,7 @@ Qt 非依存の純 Python 関数群。表示（`connector_item.py`）と SVG エ
 from __future__ import annotations
 
 import math
+from typing import Any
 
 from app.model.objects import geometry_kind
 
@@ -84,6 +85,60 @@ def anchors_for(
             points = {name: _rotate_point(pt, center, rotation) for name, pt in points.items()}
         return points
     return {}
+
+
+def anchor_set_for_object(obj: Any | None) -> dict[str, Point] | None:
+    """モデルの生の値だけから種類別アンカー集合を作る（シーン不要・Qt 非依存）。
+
+    `obj` が None なら None（未接続）。箱型は `x`/`y`/`width`/`height` と
+    `rotation`、直線/矢印は `p1`/`p2` を使う。
+
+    ライブのドラッグ中座標は反映しない。画面上の「今まさに動いている位置」が要る
+    場面（削除直前の端点固定化）では `EditController` 側の item 参照版を使うこと。
+    """
+    if obj is None:
+        return None
+    if geometry_kind(obj.type) == "endpoints":
+        p1: Point = (float(obj.p1[0]), float(obj.p1[1]))
+        p2: Point = (float(obj.p2[0]), float(obj.p2[1]))
+        return anchors_for(obj.type, None, p1, p2)
+    box: Box = (float(obj.x), float(obj.y), float(obj.width), float(obj.height))
+    return anchors_for(obj.type, box, None, None, float(obj.rotation))
+
+
+def connector_endpoints_from_model(document: Any, conn: Any) -> tuple[Point, Point]:
+    """コネクタの実際の始点・終点をモデルだけから解く（シーン不要・Qt 非依存）。
+
+    `conn.source_point`/`target_point` は接続中は更新が遅れることがあるため、
+    接続先が生きている側はアンカーから解き直す。SVG 書き出しとエージェント向け
+    レンダリングが同じ座標を返すことを保証する共有経路。
+    """
+    src_set = anchor_set_for_object(
+        document.object_by_id(conn.source_id) if conn.source_id is not None else None
+    )
+    tgt_set = anchor_set_for_object(
+        document.object_by_id(conn.target_id) if conn.target_id is not None else None
+    )
+    src_point: Point = (float(conn.source_point[0]), float(conn.source_point[1]))
+    tgt_point: Point = (float(conn.target_point[0]), float(conn.target_point[1]))
+    return compute_endpoints(
+        src_set, src_point, conn.source_anchor, tgt_set, tgt_point, conn.target_anchor
+    )
+
+
+def resolved_bounding_box(document: Any, obj: Any) -> Box:
+    """`bounding_box` と同じだが、コネクタはアンカーから端点を解き直す。
+
+    `conn.source_point` / `target_point` は接続中は表示側でしか更新されないため、
+    モデルの生の値で bbox を作ると接続先を動かしても変わらないように見える。
+    外部（エージェント）へ返す bbox はこちらを使うこと。
+    """
+    from app.model.geometry import bounding_box
+
+    if getattr(obj, "GEOMETRY", "box") != "connector":
+        return bounding_box(obj)
+    (x1, y1), (x2, y2) = connector_endpoints_from_model(document, obj)
+    return (min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
 
 
 def nearest_anchor_name(anchor_set: dict[str, Point], toward: Point) -> str | None:

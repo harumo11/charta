@@ -29,26 +29,28 @@ def render_artboard_image(document: Document, transparent: bool = False) -> QIma
     """
     width_px, height_px = artboard_pixel_size(document)
 
-    scene = CanvasScene(document)
-    if transparent:
-        scene.set_background_visible(False)
+    # 使い捨てシーンは必ず閉じる（`CanvasScene.close`: 閉じないと document のリスナーに残り続け、
+    # 以後のすべてのモデル変更がその影シーンにもファンアウトする）。
+    with CanvasScene(document) as scene:
+        if transparent:
+            scene.set_background_visible(False)
 
-    image = QImage(width_px, height_px, QImage.Format.Format_ARGB32)
-    if transparent:
-        image.fill(Qt.GlobalColor.transparent)
-    else:
-        image.fill(QColor(document.artboard.background))
+        image = QImage(width_px, height_px, QImage.Format.Format_ARGB32)
+        if transparent:
+            image.fill(Qt.GlobalColor.transparent)
+        else:
+            image.fill(QColor(document.artboard.background))
 
-    painter = QPainter(image)
-    if not painter.isActive():
-        raise OSError("アートボード描画用の QPainter を初期化できませんでした")
-    try:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        target = QRectF(0.0, 0.0, float(width_px), float(height_px))
-        scene.render(painter, target, scene.sceneRect())
-    finally:
-        painter.end()
+        painter = QPainter(image)
+        if not painter.isActive():
+            raise OSError("アートボード描画用の QPainter を初期化できませんでした")
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            target = QRectF(0.0, 0.0, float(width_px), float(height_px))
+            scene.render(painter, target, scene.sceneRect())
+        finally:
+            painter.end()
     return image
 
 

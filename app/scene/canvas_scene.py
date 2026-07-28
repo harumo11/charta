@@ -83,8 +83,13 @@ class CanvasScene(QGraphicsScene):
     # DocumentListener 実装（Stage B: モデル→ビュー同期の唯一の経路）
     # ------------------------------------------------------------------
     def on_object_added(self, obj: BaseObject, index: int) -> None:
-        """`document.add_object` の通知。item を生成する（resync_z は呼ばない）。"""
-        self.add_item_for(obj)
+        """`document.add_object` の通知。item を生成する（resync_z は呼ばない）。
+
+        未知 type でも例外を投げない（`_try_add_item_for`）。ここで例外が飛ぶと
+        document には入ったが scene には無いという恒久的な desync が残り、
+        後続のリスナー（LayerPanel 等）にも通知が届かなくなる。
+        """
+        self._try_add_item_for(obj)
 
     def on_object_removed(self, obj: BaseObject) -> None:
         """`document.remove_object` の通知。対応 item を除去する。"""
@@ -102,12 +107,11 @@ class CanvasScene(QGraphicsScene):
         """`document.set_artboard` の通知。sceneRect/背景を更新する。"""
         self.apply_artboard_change()
 
-    def set_document(self, document: Document) -> None:
-        """`document` を差し替え、全 item を再構築する（プロジェクト読込/新規作成用）。
+    def _detach(self) -> None:
+        """document のリスナー登録を解除し、モード状態と全 item を破棄する。
 
-        旧 document のリスナー登録を解除してから全 item を除去し（コネクタの
-        `destroy_bindings` 等、既存の削除経路の後始末を踏襲）、新 document を
-        設定してリスナー登録し直し、初期構築と同じ経路で item を再構築する。
+        `set_document`（差し替え）と `close`（破棄）の共通の後始末。コネクタの
+        `destroy_bindings` 等、既存の削除経路の作法を踏襲する。
         """
         self.document.remove_listener(self)
         self.set_active_crop_item(None)
@@ -118,6 +122,33 @@ class CanvasScene(QGraphicsScene):
                 destroy_bindings()
             self.removeItem(item)
         self._items.clear()
+
+    def close(self) -> None:
+        """使い捨てシーンの後始末（`document` のリスナー登録を解除する）。
+
+        `__init__` が `document.add_listener(self)` する一方、`Document._listeners` は
+        強参照なので、解除しないとシーンと全 item（`ImageItem` は元画像を全解像度の
+        numpy 配列で保持する）が永久に生き残り、以後のすべてのモデル変更がその影シーンにも
+        ファンアウトする。エクスポート／レンダリング用の使い捨てシーンは必ず閉じること。
+
+        冪等。`with CanvasScene(document) as scene:` の形で使うのが望ましい。
+        `__del__` は使わない（Qt オブジェクトの終了時破棄順は不定で危険なため）。
+        """
+        self._detach()
+
+    def __enter__(self) -> CanvasScene:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def set_document(self, document: Document) -> None:
+        """`document` を差し替え、全 item を再構築する（プロジェクト読込/新規作成用）。
+
+        旧 document から切り離し（`_detach`）、新 document を設定してリスナー登録し直し、
+        初期構築と同じ経路で item を再構築する。
+        """
+        self._detach()
         self.document = document
         self.document.add_listener(self)
         for obj in list(self.document.objects):

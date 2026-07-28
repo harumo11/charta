@@ -36,7 +36,7 @@
 
 ### AI 機能（任意・SAM3 選択的マスキングのみ）
 - **SAM3 選択的マスキング**（2026-07-27 に正式スコープ化。「## 9.5」参照）: transformers の `facebook/sam3`（`Sam3Model`+`Sam3Processor`）で対象物をセグメンテーションし、対象外領域を指定色+指定不透明度で覆う／透明化（切り取り）する。
-  - 依存はオプション dependency-group **`sam`**（torch cu128 / torchvision / transformers / accelerate）。導入は `uv sync --group sam`。**素の `uv sync` は sam グループを venv から削除する**ので注意。
+  - 依存はオプション dependency-group **`sam`**（torch cu128 / torchvision / transformers / accelerate）。導入は `uv sync --group sam`。**素の `uv sync`（および `--group` を並べ忘れた sync）は sam / agent グループを venv から削除する**ので注意。両方要るなら `uv sync --group dev --group sam --group agent`。
   - `app/ai/` は torch/transformers を**関数内遅延 import**し、未導入時は `is_available()` が False → メニューをグレーアウトして本体は従来どおり起動する。
   - `facebook/sam3` は gated モデル（HF アカウントでのアクセス承認 + `hf auth login` が必要）。
 - 自動背景除去（rembg 等のワンクリック全自動系）は **2026-07-23 に削除済み・スコープ外のまま**。専用の外部ツールの方が高品質なため、本ソフトには持たない（「## 12」参照）。
@@ -309,3 +309,61 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 ## 14. 新オブジェクト型追加手順書
 
 新しいオブジェクト型の追加は各レイヤへの **加法的登録のみ** で完結する（すべて追記のみ・既存分岐の編集不要）。具体的な 5 ステップの手順はスキル `add-object-type`（`.claude/skills/add-object-type/SKILL.md`）を参照 — 型追加の作業時に自動ロードされる。
+
+---
+
+## 15. エージェント制御サーバ（MCP、2026-07-28 追加）
+
+外部の AI エージェント（Claude Code 等）が **動作中の charta を操作し、キャンバスを画像として読める**ようにする層。設計判断の詳細は `.claude/working/architecture/agent.md`。
+
+### 構成: MCP は本体に埋め込まず、別プロセスの stdio ブリッジにする
+
+```
+Claude Code  --stdio(MCP)-->  tools/charta_mcp.py   ← ここだけが mcp SDK に依存
+                                    |  JSON-RPC 2.0 / 改行区切り
+                                    |  Unix ソケット $XDG_RUNTIME_DIR/charta/<pid>.sock (0600)
+                              charta 本体（app/agent/host.py → api.py → commands/）
+```
+
+**なぜ分離するか**（実装時の判断根拠。安易に「1 プロセスに寄せる」リファクタをしないこと）:
+- Blender / Krita / Unity / Godot MCP はすべてこの形（本体は素の IPC、MCP は外のプロセス）。埋め込みは Figma だけ。
+- **本体の依存が 1 個も増えない**。`QLocalServer` は導入済みの QtNetwork。`mcp` は starlette / uvicorn / cryptography など 13 個を引き連れてくるが、それは `[dependency-groups] agent` に隔離される（`sam` と同じ流儀）。
+- HTTP トランスポートは Claude Code 側にリクエスト単位 60 秒の上限があり、人間がモーダルダイアログを開くと落ちる。stdio には無い。
+- ローカル HTTP ポートは DNS リバインディングの CVE 対象（CVE-2025-66416, mcp SDK）。**0600 の Unix ソケットならブラウザから到達できず、この脆弱性カテゴリが構造的に消える。**
+- MCP 仕様と SDK が移行期。ブリッジ 1 ファイルに隔離しておけば `app/` は無傷。
+
+### 不変条件（破ると壊れる）
+
+1. **`QLocalServer` は GUI スレッド上で動かす。** `readyRead` は Qt のイベントループから来るので、ワーカースレッドもフューチャも要らない。`Document` / `QUndoStack` / `QGraphicsItem` への同時アクセスがそもそも起きない。長時間処理（SAM3）だけを `app/agent/jobs.py` でジョブ化する。
+2. **1 RPC = 1 undo マクロ**（ラベル `AI: …`）。空マクロを作らない（`_LazyMacro` は最初の push で開く）。`begin_undo_group` / `end_undo_group` のような跨ぎ API は提供しない（閉じ忘れで人間の Ctrl+Z が恒久的に死ぬ）。
+3. **検証が全件通るまで 1 つも適用しない**（`app/agent/validate.py` は純粋関数）。エラーには `allowed` / `suggestion` / `corrected_call` を付ける。
+4. **`render_canvas` はファイルパスを返す。** MCP のインライン base64 画像はクライアント側でテキスト扱いになり数万トークン消費し、出力上限にも掛かる。
+5. **busy ゲート。** モーダルダイアログはネストしたイベントループを回すのでキューされたイベントは配送され続ける。「ダイアログ中は自然に止まる」は成り立たないため、変更系 RPC はモーダル / ドラッグ中 / crop / マスク編集を明示的に弾く（読み取り系は通す）。
+6. **サーバ側は int の id しか持ち越さない。** `_replace_document` 後は同じ id が別オブジェクトを指す（`Document.uid` / `revision` で検知できる）。
+7. `app/agent/schema.py` は `OBJECT_REGISTRY` + `PROPERTIES` + dataclass フィールドから**拒否リスト方式**でスキーマを生成する。「## 14」の手順で型を足せば、サーバに手を入れずにエージェントが新型を操作できる。
+
+### 起動と登録
+
+```bash
+uv run python main.py                              # 既定で自動 listen（UI はステータスバーの表示のみ）
+uv run python main.py --no-agent-server            # 無効化
+uv run python main.py --no-agent-exec              # charta_exec だけ無効化
+QT_QPA_PLATFORM=offscreen uv run python main.py    # ヘッドレスのエージェント常駐サービス
+
+uv sync --group agent
+claude mcp add charta -- uv run --group agent python tools/charta_mcp.py
+```
+
+手打ちデバッグ:
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"describe_state","params":{}}\n' \
+  | nc -U $XDG_RUNTIME_DIR/charta/<pid>.sock
+```
+
+### 検証
+
+```bash
+uv run pytest                                  # test_agent_{schema,render,api,host}.py
+QT_QPA_PLATFORM=offscreen uv run --group agent python scripts/smoke_agent.py   # 実 MCP で E2E
+uv run python scripts/gen_arch_index.py --check                                 # 索引の陳腐化
+```
