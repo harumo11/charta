@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -83,6 +84,14 @@ class Document:
         self.artboard: Artboard = artboard if artboard is not None else Artboard()
         self.objects: list[BaseObject] = []
         self.next_id: int = 1
+        # このインスタンスの一意 ID。プロジェクトを開き直すと別値になる。
+        # 外部クライアント（エージェント）が「別ドキュメントに差し替わった」を検知するために使う。
+        # シリアライズしない。
+        self.uid: str = uuid.uuid4().hex
+        # 変更のたびに +1 する単調増加カウンタ。外部クライアントの陳腐化検知・
+        # 楽観的同時実行制御（expect_revision）に使う。シリアライズしない。
+        # ※ `version` は project.json のスキーマ版であり別物。
+        self.revision: int = 0
         # プロジェクトディレクトリの絶対パス（画像 src の相対パス解決の基点）。
         # シリアライズしない（to_dict/from_dict に含めない）。
         self.base_dir: str | None = None
@@ -97,6 +106,16 @@ class Document:
         """変更通知リスナーの登録を解除する。未登録でもエラーにしない。"""
         if listener in self._listeners:
             self._listeners.remove(listener)
+
+    def _begin_change(self) -> list[DocumentListener]:
+        """変更を 1 件記録し、通知先リスナーのスナップショットを返す。
+
+        `revision` をインクリメントし、`_listeners` のコピーを返す。コピーを返すのは
+        通知中にリスナーが登録解除される（`CanvasScene.close` 等）ケースで
+        走査が壊れないようにするため。
+        """
+        self.revision += 1
+        return list(self._listeners)
 
     def new_id(self) -> int:
         """未使用の id を払い出す。"""
@@ -113,14 +132,14 @@ class Document:
             self.objects.insert(index, obj)
             inserted_index = index
         self.normalize_z()
-        for listener in self._listeners:
+        for listener in self._begin_change():
             listener.on_object_added(obj, inserted_index)
 
     def remove_object(self, obj: BaseObject) -> None:
         """オブジェクトを削除する。"""
         self.objects.remove(obj)
         self.normalize_z()
-        for listener in self._listeners:
+        for listener in self._begin_change():
             listener.on_object_removed(obj)
 
     def object_by_id(self, oid: int) -> BaseObject | None:
@@ -139,7 +158,7 @@ class Document:
         self.objects.remove(obj)
         self.objects.insert(index, obj)
         self.normalize_z()
-        for listener in self._listeners:
+        for listener in self._begin_change():
             listener.on_order_changed()
 
     def set_values(self, obj: BaseObject, values: dict[str, Any]) -> dict[str, Any]:
@@ -150,14 +169,14 @@ class Document:
         old_values: dict[str, Any] = {key: getattr(obj, key) for key in values}
         for key, value in values.items():
             setattr(obj, key, value)
-        for listener in self._listeners:
+        for listener in self._begin_change():
             listener.on_object_changed(obj, tuple(values.keys()))
         return old_values
 
     def set_artboard(self, artboard: Artboard) -> None:
         """アートボードを差し替える（deepcopy はしない。呼び出し側の責務）。"""
         self.artboard = artboard
-        for listener in self._listeners:
+        for listener in self._begin_change():
             listener.on_artboard_changed()
 
     def normalize_z(self) -> None:

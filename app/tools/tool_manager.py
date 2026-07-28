@@ -81,6 +81,9 @@ class ToolManager(QObject):
         self._math_start: QPointF | None = None
         # connector ツール: press 時に掴んだ source 候補オブジェクト（無ければ固定点）
         self._connector_source_obj: BaseObject | None = None
+        # press〜release の間 True（`is_interacting`）。ツール別の状態だけでは
+        # 「押したが何も掴めなかった」ラバーバンド選択等を取りこぼすため別に持つ。
+        self._press_active: bool = False
         # ツール名 → press/move/release ハンドラのディスパッチテーブル。
         # rect/ellipse/line/arrow(_DRAW_TOOLS)は同一の _draw_* 三つ組を共有する。
         self._handlers: dict[str, _ToolHandlers] = {
@@ -109,6 +112,7 @@ class ToolManager(QObject):
         self._text_start = None
         self._math_start = None
         self._connector_source_obj = None
+        self._press_active = False
         self._clear_snap_guides()
         if self._tool == name:
             return
@@ -151,10 +155,31 @@ class ToolManager(QObject):
     def current_tool(self) -> str:
         return self._tool
 
+    def is_interacting(self) -> bool:
+        """人間がキャンバス上で操作の途中か（press 済み・release 前）。
+
+        外部（エージェント制御サーバ）がモデルを書き換えてよいかの判定に使う。
+        ドラッグ移動は press 時に旧幾何を撮って release 時に 1 コマンドとして
+        push するため、その間にモデルを書き換えると `old_geom` が陳腐化し、
+        undo でオブジェクトがワープする。
+
+        ハンドルのドラッグは `ToolManager` を経由せず item のイベントで進むので、
+        ここでは追えない。呼び出し側は `QApplication.mouseButtons()` も併せて見ること。
+        """
+        return (
+            self._press_active
+            or self._select_press_pos is not None
+            or self._draw_start is not None
+            or self._freehand_points is not None
+            or self._text_start is not None
+            or self._math_start is not None
+        )
+
     def handle_mouse_press(self, event: Any, scene_pos: QPointF) -> bool:
         handlers = self._handlers.get(self._tool)
         if handlers is None:
             return False
+        self._press_active = True
         return handlers.press(event, scene_pos)
 
     def handle_mouse_move(self, event: Any, scene_pos: QPointF) -> bool:
@@ -165,6 +190,7 @@ class ToolManager(QObject):
 
     def handle_mouse_release(self, event: Any, scene_pos: QPointF) -> bool:
         handlers = self._handlers.get(self._tool)
+        self._press_active = False
         if handlers is None:
             return False
         return handlers.release(event, scene_pos)
@@ -614,30 +640,13 @@ class ToolManager(QObject):
         return self._finish_creation(obj)
 
     def _math_default_size(self) -> tuple[float, float]:
-        """既定 latex を実レンダリングし、`QSvgRenderer.defaultSize()` から px 寸法を得る。
-
-        matplotlib/QSvgRenderer が例外を投げてもヘッドレスでクラッシュしない
-        よう `MathRenderError` はフォールバック寸法で吸収する(§9.4 と同じ方針)。
-        """
-        import warnings
-
-        from PySide6.QtCore import QByteArray
-        from PySide6.QtSvg import QSvgRenderer
-
-        from app.math.mathtext_render import MathRenderError, render_latex_to_svg
+        """既定 latex の自然寸法（採寸ロジックは `math_item.natural_math_size` に一本化）。"""
+        from app.scene.items.math_item import natural_math_size
 
         defaults = MathObject(id=0)
-        try:
-            svg = render_latex_to_svg(_MATH_DEFAULT_LATEX, defaults.font_size, defaults.color)
-            renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-            if renderer.isValid():
-                size = renderer.defaultSize()
-                width = max(float(size.width()), _MATH_MIN_SIZE)
-                height = max(float(size.height()), _MATH_MIN_SIZE)
-                return (width, height)
-        except MathRenderError as exc:
-            warnings.warn(f"math tool: default latex render failed: {exc}", stacklevel=2)
-        return (_MATH_MIN_SIZE, _MATH_MIN_SIZE)
+        return natural_math_size(
+            _MATH_DEFAULT_LATEX, defaults.font_size, defaults.color, minimum=_MATH_MIN_SIZE
+        )
 
     # ------------------------------------------------------------------
     # connector: press で直下の BaseItem(.obj 持ち, connector 以外)を source

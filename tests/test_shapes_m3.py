@@ -473,3 +473,91 @@ def test_save_load_roundtrip_arrow_freehand_text() -> None:
     assert loaded_text.bold is True
     assert loaded_text.width == pytest.approx(90.0)
     assert loaded_text.height == pytest.approx(30.0)
+
+
+# --------------------------------------------------------------------------
+# テキストのディセンダがボックス下端で切れないこと（画面と書き出しの一致）
+# --------------------------------------------------------------------------
+
+
+def _ink_row_span(image: Any) -> tuple[int | None, int | None, int]:
+    """暗いピクセルが存在する行の範囲と総数を返す。"""
+    import numpy as np
+
+    w, h = image.width(), image.height()
+    arr = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(h, image.bytesPerLine() // 4, 4)[
+        :, :w, :
+    ]
+    dark = arr[:, :, :3].astype(int).sum(axis=2) < 3 * 200
+    rows = np.where(dark.any(axis=1))[0]
+    if not len(rows):
+        return (None, None, 0)
+    return (int(rows.min()), int(rows.max()), int(dark.sum()))
+
+
+def _text_doc(height: float) -> Any:
+    """ディセンダ（`_` と `y`）を含むテキスト 1 個だけの Document。"""
+    from app.model.document import Artboard, Document, Physical
+
+    doc = Document(
+        artboard=Artboard(
+            width_px=600, height_px=200, physical=Physical(width_mm=100.0, target_dpi=300)
+        )
+    )
+    doc.add_object(
+        TextObject(
+            id=doc.new_id(),
+            text="charta_mcp.py",
+            x=20,
+            y=40,
+            width=520,
+            height=height,
+            font_size=30,
+        )
+    )
+    return doc
+
+
+def test_text_descender_is_not_clipped_by_a_short_box(qapp: Any) -> None:
+    """行高より低いボックスでも `_` や `y` の下が切れない。
+
+    `drawText` は既定で矩形クリップするため、外部（プロパティパネルでの
+    font_size 変更・ハンドル縮小・エージェント API の任意 geometry）から
+    行高未満の height が入ると文字が欠ける。アウトライン経路（SVG/PDF）は
+    元からクリップしないので、放置すると**画面と書き出しで見た目が食い違う**。
+    """
+    from app.agent.render import render_document
+    from app.scene.items.text_item import _font_for, default_text_size
+
+    font = _font_for(TextObject(id=0, text="charta_mcp.py", font_size=30))
+    natural_height = default_text_size("charta_mcp.py", font)[1]
+    short = 48.0
+    assert short < natural_height, "前提: 箱は自然な行高より低い"
+
+    short_img, _ = render_document(_text_doc(short), max_edge=600)
+    tall_img, _ = render_document(_text_doc(natural_height + 20.0), max_edge=600)
+    assert _ink_row_span(short_img) == _ink_row_span(
+        tall_img
+    ), "低い箱でも十分高い箱と同じピクセルが描かれること"
+
+
+def test_png_export_matches_screen_for_a_short_text_box(qapp: Any, tmp_path: Path) -> None:
+    """PNG 書き出しでも同じ（`export_png` は同じ `TextItem.paint` を通る）。"""
+    from app.export.png_exporter import render_artboard_image
+
+    short = _ink_row_span(render_artboard_image(_text_doc(48.0)))
+    tall = _ink_row_span(render_artboard_image(_text_doc(86.0)))
+    assert short == tall
+
+
+def test_text_bounding_rect_covers_overflowing_ink(qapp: Any) -> None:
+    """箱からあふれた分も `boundingRect` に含める（部分再描画で残像を残さない）。"""
+    from app.model.document import Document
+    from app.scene.canvas_scene import CanvasScene
+
+    doc = Document()
+    obj = TextObject(id=doc.new_id(), x=0, y=0, text="gy_,（）", font_size=60, width=200, height=30)
+    doc.add_object(obj)
+    with CanvasScene(doc) as scene:
+        item = scene.item_for(obj)
+        assert item.boundingRect().contains(item._text_layout_rect())

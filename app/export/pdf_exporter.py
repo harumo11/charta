@@ -30,19 +30,21 @@ def export_pdf(document: Document, path: str, outline_text: bool = True) -> None
     printer.setPageSize(QPageSize(QSizeF(width_mm, height_mm), QPageSize.Unit.Millimeter))
     printer.setPageMargins(QMarginsF(0.0, 0.0, 0.0, 0.0), QPageLayout.Unit.Millimeter)
 
-    scene = CanvasScene(document)
-    if outline_text:
-        for obj in document.objects:
-            item = scene.item_for(obj)
-            if isinstance(item, TextItem):
-                item.set_export_outline(True)
+    # 使い捨てシーンは必ず閉じる（`CanvasScene.close`）。
+    # 閉じないと document のリスナー配列に残り続ける。
+    with CanvasScene(document) as scene:
+        if outline_text:
+            for obj in document.objects:
+                item = scene.item_for(obj)
+                if isinstance(item, TextItem):
+                    item.set_export_outline(True)
 
-    painter = QPainter(printer)
-    if not painter.isActive():
-        raise OSError(f"PDF 描画用の QPainter を初期化できませんでした: {path}")
-    try:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        target = printer.pageRect(QPrinter.Unit.DevicePixel)
-        scene.render(painter, target, scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-    finally:
-        painter.end()
+        painter = QPainter(printer)
+        if not painter.isActive():
+            raise OSError(f"PDF 描画用の QPainter を初期化できませんでした: {path}")
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            target = printer.pageRect(QPrinter.Unit.DevicePixel)
+            scene.render(painter, target, scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        finally:
+            painter.end()

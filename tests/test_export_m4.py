@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import pytest
 from PIL import Image
-from PySide6.QtGui import QFontMetricsF
+from PySide6.QtGui import QFontInfo, QFontMetricsF
 
 from app.export.pdf_exporter import export_pdf
 from app.export.png_exporter import artboard_pixel_size, export_png
@@ -341,22 +341,30 @@ def test_export_svg_writes_file(qapp: Any, project_dir: Path, tmp_path: Path) ->
 def test_svg_non_outline_text_font_size_matches_metrics_px(
     qapp: Any, project_dir: Path, tmp_path: Path
 ) -> None:
-    """非アウトライン<text>のfont-size/行送りが、outline側と同じQFontから導出した
-    QFontMetricsF由来のpx値であること（旧実装: モデルのpoint-size値をそのまま
-    SVG user-unit(px)として使っていたためoutline/画面表示とずれていた）。"""
+    """非アウトライン<text>の font-size が **em サイズ**、行送りが lineSpacing であること。
+
+    2 段階の修正を経ている:
+    1. 旧々実装はモデルの point-size 値をそのまま SVG user-unit(px) にしていた（DPI 換算漏れ）。
+    2. その修正で `ascent + descent` を使ったが、これは**行ボックスの高さであって em ではない**。
+       Noto Sans CJK では約 1.45em あるため `<text>` だけ 1.45 倍で描かれ、
+       outline 版・画面・PDF と食い違っていた。
+    正解は解決後のピクセルサイズ（`QFontInfo(font).pixelSize()`）。
+    """
     doc = _build_document(project_dir, tmp_path)
     text_obj = next(obj for obj in doc.objects if obj.type == "text")
     text_obj.text = "Hello 図\nWorld"  # 複数行にして行送り(lineSpacing)も検証する
 
     font = _build_text_font(text_obj)
     metrics = QFontMetricsF(font)
-    expected_font_size_px = metrics.ascent() + metrics.descent()
+    expected_font_size_px = float(QFontInfo(font).pixelSize())
     expected_line_spacing = metrics.lineSpacing()
     expected_baseline = metrics.ascent()
 
     # モデルのpoint-size値をそのままpxとして使う旧実装では、この程度のフォント
     # サイズではmetrics由来のpx値と大きく異なるはず（回帰防止の非退化チェック）。
     assert abs(expected_font_size_px - text_obj.font_size) > 0.5
+    # 行ボックス高（旧実装の値）とも明確に違うこと。
+    assert abs(expected_font_size_px - (metrics.ascent() + metrics.descent())) > 0.5
 
     svg = document_to_svg(doc, outline_text=False)
     root = ET.fromstring(svg)
@@ -404,3 +412,172 @@ def test_svg_color_with_embedded_quote_stays_well_formed_xml(
     # 属性値が injection されず、元の文字列どおりに往復すること。
     assert obj_rect.get("stroke") == malicious_stroke
     assert obj_rect.get("fill") == "none"
+
+
+# --------------------------------------------------------------------------
+# 使い捨て CanvasScene のリスナーリーク回帰（Phase 0-2）
+# --------------------------------------------------------------------------
+
+
+def test_render_and_export_do_not_leak_document_listeners(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """レンダリング/書き出しが document のリスナーを増やさない。
+
+    `CanvasScene.__init__` は `document.add_listener(self)` する。解除を忘れると
+    影シーンが永久に残り、以後のすべてのモデル変更がそこにもファンアウトする
+    （エージェントの「操作→撮影」ループで線形に劣化する）。
+    """
+    from app.export.png_exporter import render_artboard_image
+
+    doc = _build_document(project_dir, tmp_path)
+    before = len(doc._listeners)
+
+    for _ in range(3):
+        render_artboard_image(doc)
+    export_png(doc, str(tmp_path / "leak.png"))
+    export_pdf(doc, str(tmp_path / "leak.pdf"))
+    export_svg(doc, str(tmp_path / "leak.svg"))
+
+    assert len(doc._listeners) == before
+
+
+def test_canvas_scene_close_is_idempotent_and_context_manager_works(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    from app.scene.canvas_scene import CanvasScene
+
+    doc = _build_document(project_dir, tmp_path)
+    before = len(doc._listeners)
+
+    with CanvasScene(doc) as scene:
+        assert len(doc._listeners) == before + 1
+        assert scene.item_for(doc.objects[0]) is not None
+    assert len(doc._listeners) == before
+
+    scene2 = CanvasScene(doc)
+    scene2.close()
+    scene2.close()  # 冪等
+    assert len(doc._listeners) == before
+
+
+def test_unknown_object_type_does_not_desync_scene_from_document(qapp: Any, tmp_path: Path) -> None:
+    """未知 type の追加でも例外を投げず、後続リスナーへの通知を止めない。"""
+    from app.scene.canvas_scene import CanvasScene
+
+    doc = Document()
+    with CanvasScene(doc) as scene:
+        seen: list[int] = []
+
+        class _Tail:
+            def on_object_added(self, obj: Any, index: int) -> None:
+                seen.append(obj.id)
+
+            def on_object_removed(self, obj: Any) -> None: ...
+            def on_object_changed(self, obj: Any, keys: tuple[str, ...]) -> None: ...
+            def on_order_changed(self) -> None: ...
+            def on_artboard_changed(self) -> None: ...
+
+        doc.add_listener(_Tail())
+        alien = RectObject(id=doc.new_id())
+        alien.type = "no_such_type"
+        doc.add_object(alien)  # 例外を投げないこと
+
+        assert seen == [alien.id]
+        assert doc.objects[-1] is alien
+        assert scene.item_for(alien) is None
+
+
+# --------------------------------------------------------------------------
+# フォントサイズがデバイス DPI に依存しないこと（PDF テキスト消失の回帰防止）
+# --------------------------------------------------------------------------
+
+
+def _text_only_doc(**kwargs: Any) -> Document:
+    artboard = Artboard(
+        width_px=600, height_px=200, physical=Physical(width_mm=100.0, target_dpi=300)
+    )
+    doc = Document(artboard=artboard)
+    doc.add_object(TextObject(id=doc.new_id(), x=20.0, y=40.0, width=520.0, height=100.0, **kwargs))
+    return doc
+
+
+def _ink_bbox_normalized(image: Any) -> tuple[float, float, float, float] | None:
+    """白背景に合成したうえでインクの外接矩形を [0,1] 正規化して返す。
+
+    PDF のラスタライズ結果は背景が透明（RGB=0）なので、合成せずに暗さだけを見ると
+    ページ全体をインクと誤認する。
+    """
+    w, h = image.width(), image.height()
+    arr = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(h, image.bytesPerLine() // 4, 4)[
+        :, :w, :
+    ]
+    alpha = arr[:, :, 3:4].astype(float) / 255.0
+    rgb = arr[:, :, 2::-1].astype(float) * alpha + 255.0 * (1.0 - alpha)
+    ys, xs = np.where(rgb.sum(axis=2) < 3 * 200)
+    if not len(xs):
+        return None
+    return (xs.min() / w, ys.min() / h, xs.max() / w, ys.max() / h)
+
+
+def _pdf_ink_bbox(doc: Document, path: Path, outline_text: bool) -> Any:
+    from PySide6.QtCore import QSize
+    from PySide6.QtGui import QImage
+    from PySide6.QtPdf import QPdfDocument
+
+    export_pdf(doc, str(path), outline_text=outline_text)
+    pdf = QPdfDocument()
+    pdf.load(str(path))
+    image = pdf.render(0, QSize(1200, 400)).convertToFormat(QImage.Format.Format_ARGB32)
+    return _ink_bbox_normalized(image)
+
+
+@pytest.mark.parametrize("outline_text", [True, False])
+def test_pdf_text_position_matches_png(qapp: Any, tmp_path: Path, outline_text: bool) -> None:
+    """PDF のテキストが PNG と同じ位置・大きさで出ること。
+
+    `QFont.setPointSizeF` はポイントを**描画デバイスの DPI** で px 解決する。
+    `QPrinter(HighResolution)` は 1200dpi なので、画面/PNG（96dpi）の 12.5 倍になり、
+    `outline_text=False` ではテキストがページ外へ飛んで **PDF が真っ白**になっていた。
+    `_font_for` / `_build_text_font` が `setPixelSize` で実寸を焼き込むことで防ぐ。
+    """
+    from app.export.png_exporter import render_artboard_image
+
+    png = _ink_bbox_normalized(
+        render_artboard_image(_text_only_doc(text="Hello charta", font_size=30.0))
+    )
+    pdf = _pdf_ink_bbox(
+        _text_only_doc(text="Hello charta", font_size=30.0),
+        tmp_path / f"t_{outline_text}.pdf",
+        outline_text,
+    )
+    assert png is not None
+    assert pdf is not None, "PDF にテキストが 1 ピクセルも描かれていない"
+    # 600px 幅のアートボード換算で 3px 以内（残差は PDF ページサイズの整数 pt 丸め由来）。
+    deviation = max(abs(a - b) for a, b in zip(png, pdf, strict=True)) * 600
+    assert deviation < 3.0, f"PNG と PDF のずれが大きい: {deviation:.2f}px"
+
+
+def test_font_pixel_size_is_device_independent(qapp: Any) -> None:
+    """`_font_for` が返すフォントは、どの描画デバイスでも同じピクセルサイズになる。"""
+    from PySide6.QtGui import QFont, QImage, QPainter
+    from PySide6.QtPrintSupport import QPrinter
+
+    from app.scene.items.text_item import _font_for
+
+    font = _font_for(TextObject(id=0, text="x", font_size=30.0))
+
+    image = QImage(60, 20, QImage.Format.Format_ARGB32)
+    image_painter = QPainter(image)
+    on_image = QFontInfo(QFont(font, image_painter.device())).pixelSize()
+    image_painter.end()
+
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    printer.setOutputFileName("/dev/null")
+    printer_painter = QPainter(printer)
+    assert printer.logicalDpiY() != image.logicalDpiY(), "前提: 2 つのデバイスの DPI は違う"
+    on_printer = QFontInfo(QFont(font, printer_painter.device())).pixelSize()
+    printer_painter.end()
+
+    assert on_image == on_printer == QFontInfo(font).pixelSize()

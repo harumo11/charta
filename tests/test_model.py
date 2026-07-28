@@ -506,3 +506,88 @@ def test_translate_geom_connector_type() -> None:
     assert old_geom == {"source_point": [0.0, 0.0], "target_point": [10.0, 5.0]}
     assert new_geom == {"source_point": [2.0, 3.0], "target_point": [12.0, 8.0]}
     assert obj.source_point == [0.0, 0.0] and obj.target_point == [10.0, 5.0]
+
+
+# --------------------------------------------------------------------------
+# Document.uid / Document.revision（外部クライアントの陳腐化検知）
+# --------------------------------------------------------------------------
+
+
+def test_uid_is_unique_per_instance_and_not_serialized() -> None:
+    a = Document()
+    b = Document()
+    assert a.uid and b.uid and a.uid != b.uid
+    assert "uid" not in a.to_dict()
+    # from_dict は新しい Document なので uid も別値になる（＝差し替え検知が効く）。
+    assert Document.from_dict(a.to_dict()).uid != a.uid
+
+
+def test_revision_starts_at_zero_and_is_not_serialized() -> None:
+    doc = Document()
+    assert doc.revision == 0
+    assert "revision" not in doc.to_dict()
+
+
+def test_revision_increments_on_every_notifying_mutation() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id())
+    r2 = RectObject(id=doc.new_id())
+
+    doc.add_object(r1)
+    assert doc.revision == 1
+    doc.add_object(r2)
+    assert doc.revision == 2
+    doc.set_values(r1, {"x": 5.0})
+    assert doc.revision == 3
+    doc.move_to_index(r1, 1)
+    assert doc.revision == 4
+    doc.set_artboard(Artboard(width_px=800, height_px=600))
+    assert doc.revision == 5
+    doc.remove_object(r1)
+    assert doc.revision == 6
+
+
+def test_revision_does_not_change_on_read_only_operations() -> None:
+    doc = Document()
+    r1 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+    before = doc.revision
+
+    doc.object_by_id(r1.id)
+    doc.index_of(r1)
+    doc.normalize_z()
+    doc.to_dict()
+
+    assert doc.revision == before
+
+
+class _SelfRemovingListener:
+    """最初の通知で自分自身を登録解除するリスナー（走査中の登録変更の再現）。"""
+
+    def __init__(self, doc: Document) -> None:
+        self.doc = doc
+        self.count = 0
+
+    def on_object_added(self, obj: BaseObject, index: int) -> None:
+        self.count += 1
+        self.doc.remove_listener(self)
+
+    def on_object_removed(self, obj: BaseObject) -> None: ...
+    def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None: ...
+    def on_order_changed(self) -> None: ...
+    def on_artboard_changed(self) -> None: ...
+
+
+def test_listener_fanout_survives_removal_during_notification() -> None:
+    """通知中にリスナーが自分を外しても、後続のリスナーが飛ばされない。"""
+    doc = Document()
+    self_removing = _SelfRemovingListener(doc)
+    tail = RecordingListener()
+    doc.add_listener(self_removing)
+    doc.add_listener(tail)
+
+    r1 = RectObject(id=doc.new_id())
+    doc.add_object(r1)
+
+    assert self_removing.count == 1
+    assert tail.calls == [("added", r1, 0)]

@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QFontInfo, QFontMetricsF, QPen
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -40,11 +40,25 @@ _TEXT_MARGIN = 8.0
 
 
 def _font_for(obj: BaseObject) -> QFont:
+    """モデルの font_size から `QFont` を組み立てる（**描画デバイスの DPI に依存しない**）。
+
+    最後に `setPixelSize` でピクセル実寸に固定するのが要点。ポイントサイズのままだと
+    **描画デバイスの DPI で px 解決される**ため、`QPrinter(HighResolution)`（1200dpi）へ
+    描くと画面（96dpi）の 12.5 倍になり、PDF 上でテキストがページ外へ飛ぶ
+    （`export_pdf(outline_text=False)` が真っ白になっていた原因）。
+
+    一方 `boundingRect` / `text_to_path` / SVG は `QFontMetricsF` や
+    `QPainterPath.addText` を通るためデバイス非依存に解決される。**そちら側の
+    解決結果（`QFontInfo(font).pixelSize()`）をそのまま焼き込む**ことで、
+    画面・PNG・SVG・PDF が構造的に一致する。DPI の比を計算したり画面 DPI を
+    参照したりするより仮定が少なく壊れにくい。
+    """
     font = QFont(obj.font_family)
     font.setPointSizeF(max(float(obj.font_size), 1.0))
     font.setBold(bool(obj.bold))
     font.setItalic(bool(obj.italic))
     font.setUnderline(bool(obj.underline))
+    font.setPixelSize(QFontInfo(font).pixelSize())
     return font
 
 
@@ -66,14 +80,54 @@ class TextItem(BoxItem):
     def __init__(self, obj: BaseObject, document: Document | None = None) -> None:
         super().__init__(obj, document)
         self._export_outline: bool = False
+        self._layout_rect_cache: tuple[tuple[Any, ...], QRectF] | None = None
 
     def set_export_outline(self, enabled: bool) -> None:
         """エクスポート用のアウトライン描画モードを切り替える（既定 False = 通常表示）。"""
         self._export_outline = enabled
         self.update()
 
+    def _text_layout_rect(self) -> QRectF:
+        """現在のモデル値でのテキストの実レイアウト矩形（ローカル座標・箱からはみ出しうる）。
+
+        `boundingRect` は Qt から高頻度で呼ばれるため、入力が変わらない限り
+        `QFontMetricsF` の計算をキャッシュする。キーは描画に効く全要素を含むので、
+        `prepareGeometryChange`（`BoxItem.sync_from_model` / `set_live_rect`）と
+        ずれることはない。
+        """
+        obj = self.obj
+        key = (
+            obj.text,
+            obj.font_family,
+            float(obj.font_size),
+            bool(obj.bold),
+            bool(obj.italic),
+            bool(obj.underline),
+            obj.align,
+            float(self._w),
+        )
+        cached = self._layout_rect_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        metrics = QFontMetricsF(_font_for(obj))
+        align = _ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft)
+        flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
+        rect = metrics.boundingRect(
+            QRectF(0.0, 0.0, max(self._w, 1.0), 1_000_000.0), flags, obj.text
+        )
+        self._layout_rect_cache = (key, rect)
+        return rect
+
     def boundingRect(self) -> QRectF:
-        return QRectF(0.0, 0.0, self._w, self._h).adjusted(-1.0, -1.0, 1.0, 1.0)
+        """箱に加え、箱からあふれたテキストの実描画領域も含める。
+
+        `paint` が `TextDontClip` であふれ分も描くため、`boundingRect` を箱のままに
+        すると部分再描画（Qt は boundingRect 単位で更新する）であふれ分が残像になる。
+        """
+        rect = QRectF(0.0, 0.0, self._w, self._h)
+        if self.obj.text:
+            rect = rect.united(self._text_layout_rect())
+        return rect.adjusted(-1.0, -1.0, 1.0, 1.0)
 
     def paint(self, painter: Any, option: Any, widget: Any = None) -> None:
         rect = QRectF(0.0, 0.0, self._w, self._h)
@@ -95,7 +149,16 @@ class TextItem(BoxItem):
         painter.setFont(_font_for(self.obj))
         painter.setPen(QPen(color))
         align = _ALIGN_MAP.get(self.obj.align, Qt.AlignmentFlag.AlignLeft)
-        flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
+        # TextDontClip: 箱が行高より低いときにディセンダ（`_` や `y` の下）が
+        # ピクセル単位で切れるのを防ぐ。アウトライン経路（`text_to_path`、SVG/PDF）は
+        # 元からクリップしないので、これを付けないと**画面・PNG と SVG/PDF で
+        # 見た目が食い違う**（出力品質最優先の設計上これは許容できない）。
+        flags = (
+            int(align)
+            | int(Qt.AlignmentFlag.AlignTop)
+            | int(Qt.TextFlag.TextWordWrap)
+            | int(Qt.TextFlag.TextDontClip)
+        )
         painter.drawText(rect, flags, text)
 
     # ------------------------------------------------------------------
