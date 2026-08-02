@@ -1,7 +1,8 @@
-"""レイヤーパネル（最小・§9.2）。
+"""レイヤーパネル（P2契約 §4）。
 
 `scene.document.objects` を z 降順（前面が上）で `QListWidget` に表示し、
-名前・可視/ロックのトグルを提供する。リスト選択と scene 選択を双方向に同期する。
+型アイコン・名前・可視/ロックのトグルを提供する。リスト選択と scene 選択を
+双方向に同期する。
 """
 
 from __future__ import annotations
@@ -9,25 +10,32 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import shiboken6
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QAbstractItemView,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QSizePolicy,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from app.commands.commands import SetPropertyCommand
 from app.model.objects import BaseObject
+from app.ui.theme import icons
 
 if TYPE_CHECKING:
     from app.scene.canvas_scene import CanvasScene
 
 _ID_ROLE = Qt.ItemDataRole.UserRole
+
+# 型アイコン(QLabel pixmap)・表示/ロックボタンの寸法(P2契約 §4)。
+_TYPE_ICON_SIZE = 16
+_TOGGLE_BUTTON_SIZE = 22
+_TOGGLE_ICON_SIZE = 14
 
 
 class LayerPanel(QWidget):
@@ -42,6 +50,11 @@ class LayerPanel(QWidget):
         self._current_signature: tuple[int, ...] = ()
 
         self._list = QListWidget()
+        # scene 側の複数選択（multi モード）をリストにも複数行で映せるようにする。
+        # 既定の SingleSelection のままだと _sync_selection_from_scene の
+        # setSelected(True) が 1 行ごとに前の選択を打ち消し、最後の 1 行しか
+        # ハイライトされない（P2 の複数選択編集導入で顕在化）。
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._list)
@@ -60,11 +73,11 @@ class LayerPanel(QWidget):
 
         `undo_stack.indexChanged` はレイヤーパネル自身が push した編集
         （表示/ロックのトグル）の redo でも発火するため、この slot は
-        「チェックボックスの toggled シグナルを発火中に自分自身を呼び出す」
+        「トグルボタンの toggled シグナルを発火中に自分自身を呼び出す」
         再入を起こし得る。表示中の行構造（id の並び順）が前回と同じであれば
-        `self._list.clear()` によるウィジェット破棄（トグル中のチェックボックス
-        自身を破棄し use-after-free でクラッシュする — 実際に発生していた
-        バグ）を避け、各行を in-place 更新するだけにする。オブジェクトの
+        `self._list.clear()` によるウィジェット破棄（トグル中のボタン自身を
+        破棄し use-after-free でクラッシュする — 実際に発生していたバグ）を
+        避け、各行を in-place 更新するだけにする。オブジェクトの
         追加/削除/z順変更で構造が変わったときだけ、従来どおり再構築する。
         """
         if not shiboken6.isValid(self) or not shiboken6.isValid(self.scene):
@@ -107,7 +120,11 @@ class LayerPanel(QWidget):
 
     @staticmethod
     def _update_row_widget(row_widget: QWidget, obj: BaseObject) -> None:
-        """行ウィジェット内の name/表示/ロック を signals ブロックしつつ再設定する。"""
+        """行ウィジェット内の name/表示/ロック を signals ブロックしつつ再設定する。
+
+        型アイコンは同一 id の行では type が変わらない（型変更 UI が無い）ため
+        ここでは再設定しない。
+        """
         name_label = getattr(row_widget, "_name_label", None)
         visible_cb = getattr(row_widget, "_visible_cb", None)
         locked_cb = getattr(row_widget, "_locked_cb", None)
@@ -134,15 +151,37 @@ class LayerPanel(QWidget):
         hlayout = QHBoxLayout(widget)
         hlayout.setContentsMargins(4, 2, 4, 2)
 
-        name_label = QLabel(obj.name or f"{obj.type}#{obj.id}")
-        name_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        type_icon_label = QLabel()
+        type_icon_label.setPixmap(
+            icons.icon(icons.OBJECT_ICONS.get(obj.type, obj.type)).pixmap(
+                _TYPE_ICON_SIZE, _TYPE_ICON_SIZE
+            )
+        )
 
-        visible_cb = QCheckBox("表示")
+        name_label = QLabel(obj.name or f"{obj.type}#{obj.id}")
+        name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+        # 表示/ロックともに checkable QToolButton。属性名 _visible_cb/_locked_cb は
+        # チェックボックス時代からの互換名として維持する（テストが setChecked/
+        # isChecked のみを触るため型を変えても影響しない）。
+        visible_cb = QToolButton()
+        visible_cb.setCheckable(True)
+        visible_cb.setAutoRaise(True)
+        visible_cb.setFixedSize(_TOGGLE_BUTTON_SIZE, _TOGGLE_BUTTON_SIZE)
+        visible_cb.setIconSize(QSize(_TOGGLE_ICON_SIZE, _TOGGLE_ICON_SIZE))
+        visible_cb.setIcon(icons.icon_pair("mdi6.eye-outline", "mdi6.eye-off-outline"))
+        visible_cb.setToolTip("表示")
         visible_cb.blockSignals(True)
         visible_cb.setChecked(obj.visible)
         visible_cb.blockSignals(False)
 
-        locked_cb = QCheckBox("ロック")
+        locked_cb = QToolButton()
+        locked_cb.setCheckable(True)
+        locked_cb.setAutoRaise(True)
+        locked_cb.setFixedSize(_TOGGLE_BUTTON_SIZE, _TOGGLE_BUTTON_SIZE)
+        locked_cb.setIconSize(QSize(_TOGGLE_ICON_SIZE, _TOGGLE_ICON_SIZE))
+        locked_cb.setIcon(icons.icon_pair("mdi6.lock-outline", "mdi6.lock-open-variant-outline"))
+        locked_cb.setToolTip("ロック")
         locked_cb.blockSignals(True)
         locked_cb.setChecked(obj.locked)
         locked_cb.blockSignals(False)
@@ -162,7 +201,9 @@ class LayerPanel(QWidget):
         visible_cb.toggled.connect(on_visible_toggled)
         locked_cb.toggled.connect(on_locked_toggled)
 
+        hlayout.addWidget(type_icon_label)
         hlayout.addWidget(name_label)
+        hlayout.addStretch(1)
         hlayout.addWidget(visible_cb)
         hlayout.addWidget(locked_cb)
 

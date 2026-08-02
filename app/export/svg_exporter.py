@@ -529,8 +529,12 @@ def _render_object(document: Document, obj: BaseObject, outline_text: bool) -> s
 # --------------------------------------------------------------------------
 
 
-def document_to_svg(document: Document, outline_text: bool = True) -> str:
-    """`Document` を自前シリアライズして SVG 文字列を返す（`scene.render()` は使わない）。"""
+def document_to_svg(document: Document, outline_text: bool = False) -> str:
+    """`Document` を自前シリアライズして SVG 文字列を返す（`scene.render()` は使わない）。
+
+    `outline_text` の既定は False（編集可能な `<text>` のまま出力。投稿規定対応、
+    CLAUDE.md §8。2026-08-02 に ON→OFF へ反転）。
+    """
     artboard = document.artboard
     width_px = artboard.width_px
     height_px = artboard.height_px
@@ -556,7 +560,7 @@ def document_to_svg(document: Document, outline_text: bool = True) -> str:
     return "\n".join(lines)
 
 
-def export_svg(document: Document, path: str, outline_text: bool = True) -> None:
+def export_svg(document: Document, path: str, outline_text: bool = False) -> None:
     """SVG をファイルに書き出す（UTF-8）。書込失敗は例外を投げる（握りつぶさない）。"""
     svg = document_to_svg(document, outline_text=outline_text)
     directory = os.path.dirname(path)

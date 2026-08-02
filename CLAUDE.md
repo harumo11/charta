@@ -201,17 +201,17 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - `QPrinter(QPrinter.HighResolution)` + `setOutputFormat(PdfFormat)`、`QPainter(printer)` に対し `scene.render(painter)`。
 - 用紙サイズは `artboard.physical`（mm）から設定。`QPainter.Antialiasing` を有効化。
 - 数式（`QGraphicsSvgItem`）もこの経路でベクター保持される（検証済み）。
-- テキストはこの経路でベクター（フォント埋め込み or アウトライン）で出る。既定は**アウトライン化ON**（環境非依存を優先）、設定でOFF可。
+- テキストはこの経路でベクター（フォント埋め込み or アウトライン）で出る。既定は**アウトライン化OFF**（テキストを編集可能なまま出力。Nature 等の投稿規定が "Text must remain editable—no outlining permitted" と編集可能テキストを要求するため、2026-08-02 ユーザー決定で ON→OFF に反転）。アウトライン化はフォント埋め込みを受け付けない入稿先向けのオプションとして残す。
 
 ### SVG（自前シリアライザ・`scene.render` は使わない）
 `export/svg_exporter.py` で `Document` を走査し、オブジェクトごとに SVG 要素を生成する。理由は Qt の `QSvgGenerator` が SVG アイテム・画像・フォントで劣化/欠落を起こすため（検証済み）。
 - rect/ellipse/line/arrow/freehand → ネイティブ SVG 要素（`<rect>`,`<ellipse>`,`<path>` 等）。矢じりは `<marker>` 定義。
-- text → 既定でアウトライン化（`QPainterPath.addText` → パスの `d` 属性）。OFF 時は `<text>`（フォント依存の警告を出す）。
+- text → 既定は `<text>`（編集可能なまま。フォント依存の警告を出す）。アウトライン化 ON 時は `QPainterPath.addText` → パスの `d` 属性（2026-08-02 に既定を反転。上記 PDF 節の経緯参照）。
 - image → `<image>` に Base64 埋め込み。クロップ・補正を反映した最終ビットマップを埋める。
 - math → matplotlib が生成した数式 SVG を `<g transform=...>` として**そのまま入れ子挿入**（ベクター保持）。
 - z順は要素の出力順で表現。回転・不透明度は `transform` / `opacity` 属性。
 
-> 注釈（批判的観点・トレードオフ）: テキストのアウトライン化は「他環境・入稿で確実に再現」できる反面、出力後にテキスト編集できず SVG が重くなる。自分だけで再編集し続けるなら OFF が便利。既定は安全側の ON とするが、ユーザー設定で切替可能にすること。
+> 注釈（批判的観点・トレードオフ）: テキストのアウトライン化は「他環境・入稿で確実に再現」できる反面、出力後にテキスト編集できず SVG が重くなり、**投稿規定（Nature: "no outlining permitted"）に抵触する**。このため既定は OFF（編集可能なテキスト）とし、フォント埋め込みを受け付けない入稿先向けに ON を選べるようにする（2026-08-02 反転）。
 
 ### PNG（高DPIラスター）
 - `QImage(w_px, h_px, Format_ARGB32)` を作り `scene.render()`。`w_px = physical.width_mm/25.4 × target_dpi`。

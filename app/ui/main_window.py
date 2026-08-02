@@ -1,7 +1,8 @@
 """メインウィンドウ（契約 §10）。
 
 `Document`/`QUndoStack`/`CanvasScene`/`CanvasView`/`ToolManager`/`PropertyPanel`/`LayerPanel`
-を配線し、File/Edit/View メニューとツールツールバー（select/rect/ellipse/line 排他）を構築する。
+を配線し、File/Edit/View メニューと統合ヘッダーバー（`HeaderBar`。ツールは
+select/rect/ellipse/line/arrow/freehand/text/math/connector の9択排他）を構築する。
 """
 
 from __future__ import annotations
@@ -9,8 +10,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
+    QAction,
     QActionGroup,
     QCloseEvent,
     QGuiApplication,
@@ -19,29 +21,32 @@ from PySide6.QtGui import (
     QUndoStack,
 )
 from PySide6.QtWidgets import (
-    QDialog,
     QDockWidget,
     QLabel,
     QMainWindow,
-    QToolBar,
+    QMenu,
+    QMenuBar,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from app.commands.commands import SetArtboardCommand
 from app.model.document import Artboard, Document, Physical
+from app.model.objects import BaseObject
 from app.panels.layer_panel import LayerPanel
 from app.panels.property_panel import PropertyPanel
 from app.scene.canvas_scene import CanvasScene
 from app.scene.canvas_view import CanvasView
 from app.tools.tool_manager import ToolManager
-from app.ui.artboard_dialog import ArtboardDialog
 from app.ui.controllers.edit_controller import EditController
 from app.ui.controllers.export_controller import ExportController
 from app.ui.controllers.image_import import ImageImportController
 from app.ui.controllers.project_io import ProjectIOController
 from app.ui.controllers.sam3_masking import Sam3MaskController
+from app.ui.header_bar import HeaderBar
 from app.ui.mask_edit_panel import MaskEditPanel
+from app.ui.overlays import ZoomPill
+from app.ui.theme import icons
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,6 +68,20 @@ _TOOL_LABELS: list[tuple[str, str]] = [
     ("math", "数式"),
     ("connector", "コネクタ"),
 ]
+
+# ツール切り替えの1文字ショートカット（ヘッダーバー統合契約）。テキスト編集中に奪われない
+# よう、CanvasView.event() の ShortcutOverride 処理と対で運用する。
+_TOOL_SHORTCUTS: dict[str, str] = {
+    "select": "V",
+    "rect": "R",
+    "ellipse": "O",
+    "line": "L",
+    "arrow": "A",
+    "freehand": "P",
+    "text": "T",
+    "math": "M",
+    "connector": "C",
+}
 
 
 def _default_document() -> Document:
@@ -91,13 +110,20 @@ class MainWindow(QMainWindow):
         self.scene.set_undo_stack(self.undo_stack)
 
         self._project_io = ProjectIOController(self, self.scene, _default_document)
-        self._export = ExportController(self, self.scene, lambda: self._project_dir)
+        self._export = ExportController(
+            self,
+            self.scene,
+            lambda: self._project_dir,
+            # 成功通知はステータスバーのみ（成功ダイアログは出さない方針）。
+            notify=lambda msg: self.statusBar().showMessage(msg, 4000),
+        )
         self._edit = EditController(self.scene, self.undo_stack)
         self._image_import = ImageImportController(
             self, self.scene, self.undo_stack, self._on_images_imported
         )
         self.view: CanvasView = CanvasView(self.scene)
         self.setCentralWidget(self.view)
+        self._zoom_pill = ZoomPill(self.view)
 
         self.tool_manager: ToolManager = ToolManager(self.scene)
         self.view.set_tool_manager(self.tool_manager)
@@ -107,29 +133,43 @@ class MainWindow(QMainWindow):
         self.view.images_dropped.connect(
             self._import_dropped_images, Qt.ConnectionType.QueuedConnection
         )
+        # キャンバス右クリックメニュー（P3契約 §3.3）。
+        self.view.context_menu_requested.connect(self._show_canvas_context_menu)
 
         self.mask_edit_panel = MaskEditPanel()
         self._sam3_masking = Sam3MaskController(
             self, self.scene, self.undo_stack, self.mask_edit_panel
         )
-        self.property_panel: PropertyPanel = PropertyPanel(self.scene)
+        self.property_panel: PropertyPanel = PropertyPanel(self.scene, self._edit)
         self.layer_panel: LayerPanel = LayerPanel(self.scene)
 
-        self._property_dock = QDockWidget("プロパティ", self)
+        # 右サイドはドック1枚に一本化する（P2契約 §5）。タイトルバー無し・
+        # フロート/クローズ不可の固定ドックとし、中身は QSplitter(垂直)で
+        # 上=(mask_edit_panel+property_panel)/下=layer_panel を積む
+        # （UI 部品最小化・レイヤーパネルの高さをユーザーが調整できるようにする）。
+        self._property_dock = QDockWidget("", self)
+        self._property_dock.setTitleBarWidget(QWidget())
+        self._property_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+
         dock_body = QWidget()
         dock_layout = QVBoxLayout(dock_body)
         dock_layout.setContentsMargins(0, 0, 0, 0)
         dock_layout.addWidget(self.mask_edit_panel)
         dock_layout.addWidget(self.property_panel)
-        self._property_dock.setWidget(dock_body)
+
+        right_splitter = QSplitter(Qt.Orientation.Vertical)
+        right_splitter.addWidget(dock_body)
+        right_splitter.addWidget(self.layer_panel)
+        right_splitter.setStretchFactor(0, 3)
+        right_splitter.setStretchFactor(1, 1)
+        right_splitter.setCollapsible(0, False)
+        right_splitter.setCollapsible(1, False)
+
+        self._property_dock.setWidget(right_splitter)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._property_dock)
 
-        self._layer_dock = QDockWidget("レイヤー", self)
-        self._layer_dock.setWidget(self.layer_panel)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._layer_dock)
-
-        self._build_menus()
-        self._build_tool_toolbar()
+        self._menu_bar = self._build_menus()
+        self._build_header_bar()
 
         # Delete キー(§9.3): メニュー項目のショートカットと二重登録すると
         # あいまいなショートカットになるため、QShortcut のみに割り当てる。
@@ -154,6 +194,17 @@ class MainWindow(QMainWindow):
         self._autosave_timer.setInterval(_AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._autosave)
         self._autosave_timer.start()
+
+        # ステータスバー恒常ウィジェット: カーソル座標 / アートボード寸法（P3契約 §3.2）。
+        # 左から順に カーソル座標 → アートボード寸法 → エージェントインジケータ（最後尾）。
+        self._cursor_label = QLabel("")
+        self._cursor_label.setMinimumWidth(130)  # ジッタ防止
+        self.statusBar().addPermanentWidget(self._cursor_label)
+        self._artboard_label = QLabel("")
+        self.statusBar().addPermanentWidget(self._artboard_label)
+        self.view.cursor_moved.connect(self._on_cursor_moved)
+        self.scene.sceneRectChanged.connect(self._update_artboard_label)
+        self._update_artboard_label()
 
         # エージェント制御サーバ（§15）。`start_agent_server()` を呼ぶまで listen しない
         # （テストや `--no-agent-server` 起動でソケットを作らないようにするため）。
@@ -224,7 +275,7 @@ class MainWindow(QMainWindow):
         画面利用可能領域の 85% とビューの MAX_ZOOM に収まるまで縮小する
         （クランプは縮小側を最終適用＝画面からのはみ出し防止を最小より優先）。
         ウィンドウ全体のサイズは現在の「ウィンドウ − ビューポート」差分
-        （ドック/メニュー/ツールバー分）を足して見積もる。縦横比を維持して
+        （ドック/ヘッダーバー分）を足して見積もる。縦横比を維持して
         ウィンドウを決めるため、直後の `fit_to_rect(margin_ratio=0)` で画像が
         ビューポートを丁度満たし、余白はユーザーが後からウィンドウを広げた
         ときに初めて現れる。最大化/フルスクリーン中はユーザーのウィンドウ状態を
@@ -274,41 +325,78 @@ class MainWindow(QMainWindow):
         self.layer_panel.refresh()
 
     # ------------------------------------------------------------------
+    # ステータスバー: カーソル座標 / アートボード寸法（P3契約 §3.2）
+    # ------------------------------------------------------------------
+
+    def _on_cursor_moved(self, pos: QPointF) -> None:
+        self._cursor_label.setText(f"x {round(pos.x())}  y {round(pos.y())}")
+
+    def _update_artboard_label(self, *_args: object) -> None:
+        """`scene.sceneRectChanged`(値変化時)・`_replace_document()`(差し替え時)から呼ばれる。"""
+        artboard = self.scene.document.artboard
+        physical = artboard.physical
+        self._artboard_label.setText(
+            f"{artboard.width_px}×{artboard.height_px} px"
+            f" · {physical.width_mm:.1f} mm @ {physical.target_dpi} dpi"
+        )
+
+    # ------------------------------------------------------------------
     # メニュー構築
     # ------------------------------------------------------------------
 
-    def _build_menus(self) -> None:
-        menu_bar = self.menuBar()
+    def _build_menus(self) -> QMenuBar:
+        """メニューバーを構築して返す（ヘッダーバー統合のため `self.menuBar()` は使わない）。
+
+        undo/redo/画像取り込みの QAction はヘッダーバーのツールボタンからも同じものを
+        使い回す（`self._undo_action` 等に保持。重複バインドによる曖昧ショートカットを
+        避けるため）。アイコンはここでは付けず `_build_header_bar()` でまとめて設定する。
+        """
+        menu_bar = QMenuBar(self)
+        # appmenu 環境（Unity/一部の Linux デスクトップ）ではネイティブメニューバーへ
+        # 吸い上げられ、`setMenuWidget(HeaderBar)` に埋め込んだこの QMenuBar 自体が
+        # 非表示になり得るため明示的に無効化する（ヘッダーバー統合の前提が壊れる）。
+        menu_bar.setNativeMenuBar(False)
 
         file_menu = menu_bar.addMenu("ファイル")
-        file_menu.addAction("新規", self.new_project)
-        file_menu.addAction("開く", self.open_project)
-        file_menu.addAction("保存", self.save_project)
-        file_menu.addAction("名前を付けて保存", self.save_project_as)
+        new_action = file_menu.addAction("新規", self.new_project)
+        new_action.setShortcut(QKeySequence("Ctrl+N"))
+        open_action = file_menu.addAction("開く", self.open_project)
+        open_action.setShortcut(QKeySequence("Ctrl+O"))
+        save_action = file_menu.addAction("保存", self.save_project)
+        save_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_as_action = file_menu.addAction("名前を付けて保存", self.save_project_as)
+        save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         file_menu.addSeparator()
-        file_menu.addAction("画像を取り込み", self.import_image_action)
+        self._import_action = file_menu.addAction("画像を取り込み", self.import_image_action)
+        self._import_action.setShortcut(QKeySequence("Ctrl+I"))
         file_menu.addSeparator()
         export_menu = file_menu.addMenu("エクスポート")
         export_menu.addAction("PNG…", lambda: self._export.export_action("png"))
         export_menu.addAction("PDF…", lambda: self._export.export_action("pdf"))
         export_menu.addAction("SVG…", lambda: self._export.export_action("svg"))
+        export_menu.addSeparator()
+        re_export_action = export_menu.addAction(
+            "前回設定で再書き出し", self._export.re_export_last
+        )
+        re_export_action.setShortcut(QKeySequence("Ctrl+E"))
         file_menu.addSeparator()
         file_menu.addAction("アートボード設定…", self.open_artboard_settings)
 
         edit_menu = menu_bar.addMenu("編集")
-        undo_action = self.undo_stack.createUndoAction(self, "元に戻す")
-        undo_action.setShortcut("Ctrl+Z")
-        redo_action = self.undo_stack.createRedoAction(self, "やり直し")
-        redo_action.setShortcut("Ctrl+Shift+Z")
-        edit_menu.addAction(undo_action)
-        edit_menu.addAction(redo_action)
+        self._undo_action = self.undo_stack.createUndoAction(self, "元に戻す")
+        self._undo_action.setShortcut("Ctrl+Z")
+        self._redo_action = self.undo_stack.createRedoAction(self, "やり直し")
+        self._redo_action.setShortcut("Ctrl+Shift+Z")
+        edit_menu.addAction(self._undo_action)
+        edit_menu.addAction(self._redo_action)
         edit_menu.addSeparator()
         copy_action = edit_menu.addAction("コピー", self.copy_selection)
         copy_action.setShortcut(QKeySequence("Ctrl+C"))
-        copy_image_action = edit_menu.addAction(
+        # ヘッダーバーの専用ボタンからも同じ QAction を使い回す（undo/redo と同じ流儀）。
+        self._copy_image_action = edit_menu.addAction(
             "画面を画像としてコピー", self._export.copy_canvas_to_clipboard
         )
-        copy_image_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        self._copy_image_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
         paste_action = edit_menu.addAction("貼付", self.paste_clipboard)
         paste_action.setShortcut(QKeySequence("Ctrl+V"))
         duplicate_action = edit_menu.addAction("複製", self.duplicate_selection)
@@ -349,9 +437,12 @@ class MainWindow(QMainWindow):
         self._sam3_mask_action = self._sam3_masking.make_menu_action(object_menu)
 
         view_menu = menu_bar.addMenu("表示")
-        view_menu.addAction("拡大", lambda: self.view.zoom_in())
-        view_menu.addAction("縮小", lambda: self.view.zoom_out())
-        view_menu.addAction("全体表示", lambda: self.view.fit_to_artboard())
+        zoom_in_action = view_menu.addAction("拡大", lambda: self.view.zoom_in())
+        zoom_in_action.setShortcut(QKeySequence(QKeySequence.StandardKey.ZoomIn))
+        zoom_out_action = view_menu.addAction("縮小", lambda: self.view.zoom_out())
+        zoom_out_action.setShortcut(QKeySequence(QKeySequence.StandardKey.ZoomOut))
+        fit_action = view_menu.addAction("全体表示", lambda: self.view.fit_to_artboard())
+        fit_action.setShortcut(QKeySequence("Ctrl+0"))
         view_menu.addSeparator()
         self._grid_action = view_menu.addAction("グリッド表示")
         self._grid_action.setCheckable(True)
@@ -362,28 +453,67 @@ class MainWindow(QMainWindow):
         self._snap_action.setChecked(True)
         self._snap_action.toggled.connect(self._edit.toggle_snap)
 
-    def _build_tool_toolbar(self) -> None:
-        toolbar = QToolBar("ツール", self)
-        self.addToolBar(toolbar)
+        return menu_bar
+
+    def _build_header_bar(self) -> None:
+        """メニュー + ツール + 主要アクションを統合した `HeaderBar` を構築する（旧ツールバー廃止）。
+
+        ツール QAction はどの `QMenu`/`QToolBar` にも属さないため、`HeaderBar` の中に
+        置くだけでは Qt のショートカット機構に乗らない。`self.addAction()` で MainWindow
+        自身にも登録することでウィンドウ内ショートカットとして有効化する。
+        """
         group = QActionGroup(self)
         group.setExclusive(True)
 
-        self._tool_actions: dict[str, Any] = {}
+        self._tool_actions: dict[str, QAction] = {}
+        tool_actions: list[QAction] = []
         for name, label in _TOOL_LABELS:
-            action = toolbar.addAction(label)
+            key = _TOOL_SHORTCUTS[name]
+            action = QAction(self)
+            action.setIcon(icons.icon_checkable(icons.TOOL_ICONS[name]))
             action.setCheckable(True)
             action.setChecked(name == "select")
+            action.setShortcut(QKeySequence(key))
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            action.setToolTip(f"{label} ({key})")
             action.triggered.connect(lambda _checked=False, n=name: self.tool_manager.set_tool(n))
             group.addAction(action)
+            self.addAction(action)
             self._tool_actions[name] = action
+            tool_actions.append(action)
 
-        toolbar.addSeparator()
-        toolbar.addAction("画像を取り込み", self.import_image_action)
+        self._import_action.setIcon(icons.icon("mdi6.image-plus-outline"))
+        self._import_action.setToolTip("画像を取り込み (Ctrl+I)")
+        self._undo_action.setIcon(icons.icon("mdi6.undo"))
+        self._redo_action.setIcon(icons.icon("mdi6.redo"))
+        self._copy_image_action.setIcon(icons.icon("mdi6.monitor-screenshot"))
+        self._copy_image_action.setToolTip("画面を画像としてコピー (Ctrl+Shift+C)")
+
+        export_action = QAction(icons.icon("mdi6.tray-arrow-up"), "書き出し", self)
+        export_action.setToolTip("前回の設定で書き出し (Ctrl+E) / 初回はダイアログ")
+        export_action.triggered.connect(self._export.re_export_last)
+        export_menu = QMenu(self)
+        export_menu.addAction("PNG…", lambda: self._export.export_action("png"))
+        export_menu.addAction("PDF…", lambda: self._export.export_action("pdf"))
+        export_menu.addAction("SVG…", lambda: self._export.export_action("svg"))
+        export_action.setMenu(export_menu)
+
+        header_bar = HeaderBar(
+            self._menu_bar,
+            tool_actions,
+            self._import_action,
+            self._undo_action,
+            self._redo_action,
+            self._copy_image_action,
+            export_action,
+            self,
+        )
+        self.setMenuWidget(header_bar)
 
         self._connect_tool_changed()
 
     def _connect_tool_changed(self) -> None:
-        """`tool_manager.tool_changed`(§8) をツールバーのチェック状態に反映する。
+        """`tool_manager.tool_changed`(§8) をヘッダーバーのツールボタンのチェック状態に反映する。
 
         プログラム的な `setChecked` は `toggled` のみを emit し、`set_tool` を
         呼ぶ `triggered` は emit しないためループしない。
@@ -428,20 +558,101 @@ class MainWindow(QMainWindow):
         self._edit.ungroup_selected()
 
     # ------------------------------------------------------------------
-    # アートボード設定ダイアログ（M7契約 §9・物理サイズプリセット）
+    # キャンバス右クリックメニュー（P3契約 §3.3）
+    # ------------------------------------------------------------------
+
+    def _topmost_object_at(self, scene_pos: QPointF) -> BaseObject | None:
+        """`scene_pos` の最上位アイテムから、`obj` を持つ祖先まで遡って返す（無ければ None）。
+
+        `ToolManager._topmost_item_at` と同じ経路（`scene.items(...)` の先頭）で解決した
+        うえで、ハンドルやオーバーレイ等 `.obj` を持たない子アイテムだった場合に備えて
+        親を遡る（`ToolManager` 側は現状これを行わないため、ここでは明示的に対応する）。
+        """
+        transform = self.view.transform()
+        items = self.scene.items(
+            scene_pos,
+            Qt.ItemSelectionMode.IntersectsItemShape,
+            Qt.SortOrder.DescendingOrder,
+            transform,
+        )
+        item = items[0] if items else None
+        while item is not None:
+            obj = getattr(item, "obj", None)
+            if obj is not None:
+                return obj
+            item = item.parentItem()
+        return None
+
+    def _build_canvas_context_menu(self) -> QMenu:
+        """右クリックメニューを exec 直前まで組み立てて返す（ヘッドレス検証のため分離）。"""
+        selected = self.scene.selected_objects()
+        n = len(selected)
+        has_group = any(obj.group_id is not None for obj in selected)
+        has_clipboard = bool(self._clipboard)
+
+        menu = QMenu(self)
+        menu.addAction("コピー", self.copy_selection).setEnabled(n >= 1)
+        menu.addAction("貼付", self.paste_clipboard).setEnabled(has_clipboard)
+        menu.addAction("複製", self.duplicate_selection).setEnabled(n >= 1)
+        menu.addAction("削除", self.delete_selected).setEnabled(n >= 1)
+        menu.addSeparator()
+        menu.addAction("前面へ", self.bring_to_front).setEnabled(n >= 1)
+        menu.addAction("一つ前へ", self._edit.bring_forward).setEnabled(n >= 1)
+        menu.addAction("一つ後ろへ", self._edit.send_backward).setEnabled(n >= 1)
+        menu.addAction("背面へ", self.send_to_back).setEnabled(n >= 1)
+        menu.addSeparator()
+
+        align_menu = menu.addMenu("整列")
+        align_menu.menuAction().setEnabled(n >= 2)
+        align_menu.addAction("左揃え", lambda: self.align_selected("left"))
+        align_menu.addAction("右揃え", lambda: self.align_selected("right"))
+        align_menu.addAction("上揃え", lambda: self.align_selected("top"))
+        align_menu.addAction("下揃え", lambda: self.align_selected("bottom"))
+        align_menu.addAction("水平方向中央揃え", lambda: self.align_selected("center_h"))
+        align_menu.addAction("垂直方向中央揃え", lambda: self.align_selected("center_v"))
+
+        distribute_menu = menu.addMenu("分布")
+        distribute_menu.menuAction().setEnabled(n >= 3)
+        distribute_menu.addAction("水平方向に分布", lambda: self.distribute_selected("h"))
+        distribute_menu.addAction("垂直方向に分布", lambda: self.distribute_selected("v"))
+
+        menu.addSeparator()
+        menu.addAction("グループ化", self.group_selected).setEnabled(n >= 2)
+        menu.addAction("グループ解除", self.ungroup_selected).setEnabled(has_group)
+
+        menu.addSeparator()
+        menu.addAction("全体表示", lambda: self.view.fit_to_artboard())
+        return menu
+
+    def _show_canvas_context_menu(self, scene_pos: QPointF, global_pos: QPoint) -> None:
+        """キャンバス右クリックメニューを表示する。
+
+        右クリック位置の最上位オブジェクトが未選択なら、それだけを選択してから
+        メニューを出す（標準挙動）。既に選択済み（複数選択の一部を含む）ならそのまま。
+        """
+        obj = self._topmost_object_at(scene_pos)
+        if obj is not None:
+            currently_selected = self.scene.selected_objects()
+            if obj not in currently_selected:
+                item = self.scene.item_for(obj)
+                self.scene.clearSelection()
+                if item is not None:
+                    item.setSelected(True)
+        self._build_canvas_context_menu().exec(global_pos)
+
+    # ------------------------------------------------------------------
+    # アートボード設定（P2契約 §5・M7契約 §9物理サイズプリセット）
     # ------------------------------------------------------------------
 
     def open_artboard_settings(self) -> None:
-        dialog = ArtboardDialog(self.scene.document.artboard, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            # 旧値は accept 時点で取り直す。モーダルダイアログはネストしたイベントループを
-            # 回すため、表示中にも外部（エージェント経路）からアートボードが変わりうる。
-            # 表示前の値を undo に焼き込むと「存在しなかった状態」に戻ってしまう。
-            old_artboard = self.scene.document.artboard
-            new_artboard = dialog.result_artboard()
-            self.undo_stack.push(
-                SetArtboardCommand(self.scene.document, new_artboard, old_artboard)
-            )
+        """選択を解除して `PropertyPanel` を artboard モードへ切り替える。
+
+        旧実装はモーダルダイアログ（`ArtboardDialog`）を開いていたが、P2 で
+        プロパティパネルが「未選択時はアートボード設定フォーム」を表示する
+        artboard モードを持つようになったため、ここでは選択解除だけ行えばよい
+        （メソッド名はメニュー項目/テスト互換のため維持する）。
+        """
+        self.scene.clearSelection()
 
     # ------------------------------------------------------------------
     # 自動保存（§9.6・M7契約 §9）
@@ -600,13 +811,14 @@ class MainWindow(QMainWindow):
         """
         self.undo_stack.clear()
         self.scene.set_document(document)
+        self._update_artboard_label()
 
         self.layer_panel.refresh()
         self.property_panel.on_selection_changed()
 
         # tool_manager が保持し得る描画途中のプレビュー/フリーハンド軌跡等を破棄し、
-        # select ツールへ戻す（set_tool の実装がキャンセル処理を兼ねる）。ツール
-        # バーのチェック状態は、他ツールから select への遷移では
+        # select ツールへ戻す（set_tool の実装がキャンセル処理を兼ねる）。ヘッダー
+        # バーのツールボタンのチェック状態は、他ツールから select への遷移では
         # tool_changed → _on_tool_changed（QActionGroup の排他制御で他ボタンも
         # 自動的に外れる）で追従するが、既に select だった場合は signal が
         # 発火しない（`tool_changed` は変化時のみ emit）ため、明示的に再同期する。
