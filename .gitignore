@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 venv/
 .python-version
+.envrc
 
 # Testing / linting caches
 .pytest_cache/
@@ -26,3 +27,6 @@ exports/
 
 # AI モデルキャッシュ（rembg 等）
 .u2net/
+
+# Claude
+.claude
