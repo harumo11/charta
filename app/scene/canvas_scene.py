@@ -33,6 +33,9 @@ class CanvasScene(QGraphicsScene):
     crop_mode_changed = Signal(bool)
     #: SAM3 マスク編集モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
     mask_mode_changed = Signal(bool)
+    #: `set_document()` で document が差し替わった（P3契約 §4.1）。`ToolManager` 等が
+    #: 新 document へリスナー登録し直すために購読する。
+    document_replaced = Signal()
 
     def __init__(self, document: Document) -> None:
         super().__init__()
@@ -156,6 +159,7 @@ class CanvasScene(QGraphicsScene):
         self.rebind_connectors()
         self.apply_artboard_change()
         self.clearSelection()
+        self.document_replaced.emit()
 
     # ------------------------------------------------------------------
     # crop モード追跡

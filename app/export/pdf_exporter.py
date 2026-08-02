@@ -15,10 +15,13 @@ from app.scene.canvas_scene import CanvasScene
 from app.scene.items.text_item import TextItem
 
 
-def export_pdf(document: Document, path: str, outline_text: bool = True) -> None:
+def export_pdf(document: Document, path: str, outline_text: bool = False) -> None:
     """document を PDF としてベクター出力する。
 
-    `outline_text` 既定 True でテキストをアウトライン化する。
+    `outline_text` の既定は False（テキストを編集可能なまま出力する）。Nature 等の
+    投稿規定が編集可能テキストを要求するため、2026-08-02 に既定を ON→OFF に反転した
+    （CLAUDE.md §8）。アウトライン化はフォント埋め込みを受け付けない入稿先向けの
+    オプションとして残す。
     """
     artboard = document.artboard
     width_mm = artboard.physical.width_mm

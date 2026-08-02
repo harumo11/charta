@@ -7,20 +7,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QMimeData, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QContextMenuEvent,
     QDragEnterEvent,
     QDragMoveEvent,
     QDropEvent,
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPen,
     QTransform,
     QWheelEvent,
 )
 from PySide6.QtWidgets import QGraphicsView
 
 from app.scene.canvas_scene import CanvasScene
+
+# 純データ（tokens）にのみ依存する。`app.ui.theme`（QApplication 依存の `apply_theme` を
+# 含むパッケージ）を経由すると app/scene → app/ui への逆依存が不要に重くなるため。
+from app.ui.theme.tokens import current_theme
 
 if TYPE_CHECKING:
     from app.tools.tool_manager import ToolManager
@@ -37,6 +45,12 @@ class CanvasView(QGraphicsView):
 
     #: 画像ファイルがドロップされた（ローカルパスのリスト, ドロップ位置の scene 座標）
     images_dropped = Signal(list, QPointF)
+    #: ズーム倍率が変わった（1.0 = 100%）。`_apply_zoom_factor()`/`fit_to_rect()` で emit。
+    zoom_changed = Signal(float)
+    #: マウス移動時の scene 座標（ステータスバーの座標表示用、スロットリングなし）。
+    cursor_moved = Signal(QPointF)
+    #: キャンバス右クリック（scene座標, globalPos）。crop/マスク編集中・操作中は emit しない。
+    context_menu_requested = Signal(QPointF, QPoint)
 
     def __init__(self, scene: CanvasScene) -> None:
         super().__init__(scene)
@@ -60,6 +74,79 @@ class CanvasView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+
+    # -- 背景描画（紙の装飾） -------------------------------------------------
+
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
+        """viewport 色 → 紙の影 → 紙の枠 → シーン側の背景（アートボード塗り/グリッド）の順に描く。
+
+        `setBackgroundBrush` は使わない。設定すると Qt がこの後 scene.drawBackground を
+        呼ばなくなるため（アートボード塗り・グリッドが消える）、常にこのオーバーライドから
+        明示的に呼び出す。scene 側の実装（`CanvasScene.drawBackground`）はエクスポートの
+        `scene.render()` 経由でも使われるため変更しない。
+        """
+        theme = current_theme()
+        painter.fillRect(rect, QColor(theme.viewport))
+
+        scene = self.scene()
+        if scene is None:
+            return
+        artboard_rect = scene.sceneRect()
+
+        # 紙の影: ぼかしは高コストなため使わず、オフセット違いの半透明矩形を 2 枚重ねて
+        # 安価にソフトシャドウ風の見た目を作る（外側の淡い層を先に、内側の濃い層を後に）。
+        # オフセット(1.5px/3.0px)は「画面上で見える px 数」の意図であり、painter は
+        # scene 座標系で描画されるためズーム倍率で割ってデバイス px に正規化する
+        # （正規化しないと fit 表示の低倍率で影が事実上見えず、拡大表示では逆に
+        # 影が倍率に比例して分厚くなってしまう）。
+        scale = self.transform().m11() or 1.0
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(30, 40, 60, 10)))
+        painter.drawRect(artboard_rect.translated(0.0, 3.0 / scale))
+        painter.setBrush(QBrush(QColor(30, 40, 60, 26)))
+        painter.drawRect(artboard_rect.translated(0.0, 1.5 / scale))
+        painter.restore()
+
+        # 紙の枠: cosmetic pen でズームによらず常に 1 デバイスピクセル幅にする。
+        painter.save()
+        pen = QPen(QColor(theme.artboard_border))
+        pen.setCosmetic(True)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(artboard_rect.adjusted(-0.5, -0.5, 0.5, 0.5))
+        painter.restore()
+
+        scene.drawBackground(painter, rect)
+
+    # -- ShortcutOverride ガード ----------------------------------------------
+
+    def event(self, event: QEvent) -> bool:
+        """キャンバス上でテキスト編集中は 1 文字ツールショートカット（V/R/O/…）を奪わない。
+
+        Qt はショートカットの発火可否を `ShortcutOverride` イベントで先に問い合わせる。
+        ここで `accept()` しておかないと、テキストアイテム編集中に "r" と打っただけで
+        矩形ツールへ切り替わってしまう（QAction のショートカットが横取りする）。
+
+        現状 text/math オブジェクトの編集はダイアログ方式のため、`scene.focusItem()`
+        が非 None になってこのガードが実際に発火する経路はまだ無い（デッドコード）。
+        将来キャンバス上インライン編集（text の直接編集等）を追加したときのための
+        保険として残す。なお、プロパティパネルの入力欄（QLineEdit 等）は Qt 標準の
+        フォーカスウィジェットに対する ShortcutOverride 処理で既に保護されており、
+        このガードとは独立して安全。
+        """
+        if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
+            scene = self.scene()
+            if (
+                scene is not None
+                and scene.focusItem() is not None
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and Qt.Key.Key_A <= event.key() <= Qt.Key.Key_Z
+            ):
+                event.accept()
+                return True
+        return super().event(event)
 
     def set_tool_manager(self, tm: ToolManager) -> None:
         """MainWindow が生成した ToolManager を後から注入する。"""
@@ -98,6 +185,7 @@ class CanvasView(QGraphicsView):
         self._zoom = new_zoom
         self.scale(actual_factor, actual_factor)
         self._refresh_selected_handles()
+        self.zoom_changed.emit(self._zoom)
 
     def _refresh_selected_handles(self) -> None:
         """ズーム後、選択中アイテムのハンドル（回転ハンドル等）を再配置する。
@@ -149,6 +237,7 @@ class CanvasView(QGraphicsView):
         self.centerOn(target.center())
         self._zoom = zoom
         self._refresh_selected_handles()
+        self.zoom_changed.emit(self._zoom)
 
     def zoom_in(self) -> None:
         self._apply_zoom_factor(1.25)
@@ -273,6 +362,22 @@ class CanvasView(QGraphicsView):
         event.accept()
         return True
 
+    # -- 右クリックメニュー起点(P3契約 §1) ------------------------------------
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        """crop/マスク編集中・操作中は無視し、それ以外は `context_menu_requested` を emit する。
+
+        マスク編集は右ドラッグ=負例ボックスに使うため、右クリックメニューを出さない。
+        """
+        if self._active_crop_item() is not None or self._active_mask_session() is not None:
+            event.ignore()
+            return
+        if self.tool_manager is not None and self.tool_manager.is_interacting():
+            event.ignore()
+            return
+        self.context_menu_requested.emit(self.mapToScene(event.pos()), event.globalPos())
+        event.accept()
+
     # -- 画像ファイルのドラッグ＆ドロップ -------------------------------------
 
     def _image_paths_from_mime(self, mime: QMimeData | None) -> list[str]:
@@ -359,6 +464,9 @@ class CanvasView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        # ステータスバーの座標表示用（軽量な QLabel 更新のみが受け手のためスロットリングしない）。
+        self.cursor_moved.emit(self.mapToScene(event.pos()))
+
         if self._middle_panning:
             fake = QMouseEvent(
                 QEvent.Type.MouseMove,

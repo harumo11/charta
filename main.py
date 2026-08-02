@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.model.serialize import load_document
 from app.ui.main_window import MainWindow
+from app.ui.theme import apply_theme
 
 
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -41,6 +42,7 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 def main() -> None:
     args, qt_args = _parse_args(sys.argv)
     app = QApplication([sys.argv[0], *qt_args])
+    apply_theme(app)
     # デスクトップ統合: charta.desktop / アイコンとウィンドウを紐づける
     app.setApplicationName("charta")
     app.setDesktopFileName("charta")

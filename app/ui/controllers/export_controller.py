@@ -49,10 +49,15 @@ class ExportController:
         window: QWidget,
         scene: CanvasScene,
         default_dir: Callable[[], str | None],
+        notify: Callable[[str], None] | None = None,
     ) -> None:
         self._window = window
         self._scene = scene
         self._default_dir = default_dir
+        # 成功通知（ステータスバー等）。成功ダイアログは出さない方針（UI 最小主義）。
+        self._notify = notify
+        # 直近に成功したエクスポートの (kind, path, kwargs)。Ctrl+E での再書き出しに使う。
+        self._last_export: tuple[ExportKind, str, dict[str, Any]] | None = None
 
     def _export_default_path(self, filename: str) -> str:
         """既定の書き出し先パスを返す（project_dir/exports/ があればそこ）。"""
@@ -64,15 +69,16 @@ class ExportController:
         return filename
 
     def _ask_outline_text(self) -> bool:
-        """テキストのアウトライン化確認（既定 ON、§8）。"""
+        """テキストのアウトライン化確認（既定 OFF、§8。2026-08-02 に反転）。"""
         return (
             QMessageBox.question(
                 self._window,
                 "テキストのアウトライン化",
                 "テキストをアウトライン化しますか？\n"
-                "（ON: 環境非依存で見た目が確実に再現されますが、後から編集できなくなります）",
+                "（既定: しない — Nature 等の投稿規定は編集可能なテキストを要求します。\n"
+                "アウトライン化は、提出先がフォント埋め込みを受け付けない場合のみ推奨）",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.No,
             )
             == QMessageBox.StandardButton.Yes
         )
@@ -127,6 +133,28 @@ class ExportController:
         except Exception as exc:  # noqa: BLE001 - ユーザーへのエラー表示のため捕捉
             QMessageBox.critical(self._window, "エクスポートに失敗しました", str(exc))
             return
-        QMessageBox.information(
-            self._window, "エクスポート完了", f"{spec.label}を書き出しました:\n{path}"
-        )
+        # 成功はサイレント（ステータスバー通知のみ・ダイアログは出さない）。設定を記憶して
+        # `re_export_last()`（Ctrl+E）で無確認の再書き出しに使う。
+        self._last_export = (kind, path, kwargs)
+        if self._notify is not None:
+            self._notify(f"{spec.label} を書き出しました: {path}")
+
+    def re_export_last(self) -> None:
+        """前回のエクスポート設定（形式・パス・オプション）で無確認の上書き書き出しをする。
+
+        まだ一度も書き出していなければ通常のダイアログ経路（SVG）へフォールバックする。
+        図を差し替えながら何度も再書き出しする研究図ワークフローの反復コストを
+        「Ctrl+E 一発」に短縮するのが目的（P4契約 §1.3）。
+        """
+        if self._last_export is None:
+            self.export_action("svg")
+            return
+        kind, path, kwargs = self._last_export
+        spec = _EXPORT_SPECS[kind]
+        try:
+            spec.export_fn(self._scene.document, path, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - ユーザーへのエラー表示のため捕捉
+            QMessageBox.critical(self._window, "エクスポートに失敗しました", str(exc))
+            return
+        if self._notify is not None:
+            self._notify(f"{spec.label} を再書き出ししました: {path}")

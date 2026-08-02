@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
@@ -46,6 +47,29 @@ _MATH_DEFAULT_LATEX = "E = mc^2"
 _MATH_MIN_SIZE = 20.0
 
 _MouseHandler = Callable[[Any, QPointF], bool]
+
+#: sticky defaults(P3契約 §4.2)で記憶する「スタイル」フィールド名。ジオメトリ・
+#: レイヤー状態(x/y/rotation/locked/visible 等)は対象外。
+_STYLE_KEYS: frozenset[str] = frozenset(
+    {
+        "fill",
+        "stroke",
+        "stroke_width",
+        "dash",
+        "corner_radius",
+        "arrow_start",
+        "arrow_end",
+        "arrow_size",
+        "smoothing",
+        "font_family",
+        "font_size",
+        "bold",
+        "italic",
+        "underline",
+        "color",
+        "align",
+    }
+)
 
 
 class _ToolHandlers(NamedTuple):
@@ -101,6 +125,50 @@ class ToolManager(QObject):
             self._handlers[_draw_tool] = _ToolHandlers(
                 self._draw_press, self._draw_move, self._draw_release
             )
+
+        # sticky defaults(P3契約 §4.2): type → {style_key: value}。「1個作って色を変えたら
+        # 次に作る同種オブジェクトはその色」(Figma/Excalidraw流)。Document のリスナーとして
+        # 自身を登録し、document 差し替え時(`scene.document_replaced`)にも再登録する。
+        self._style_memory: dict[str, dict[str, Any]] = {}
+        scene.document.add_listener(self)
+        scene.document_replaced.connect(self._on_document_replaced)
+
+    def _on_document_replaced(self) -> None:
+        """`scene.document_replaced`(P3契約 §4.1): 新 document へリスナー登録し直す。"""
+        self.scene.document.add_listener(self)
+
+    # ------------------------------------------------------------------
+    # DocumentListener 実装（sticky defaults 専用。他のコールバックは no-op）
+    # ------------------------------------------------------------------
+    def on_object_added(self, obj: BaseObject, index: int) -> None:  # noqa: ARG002
+        self._remember_style(obj)
+
+    def on_object_removed(self, obj: BaseObject) -> None:  # noqa: ARG002
+        pass
+
+    def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None:
+        if _STYLE_KEYS.intersection(keys):
+            self._remember_style(obj)
+
+    def on_order_changed(self) -> None:
+        pass
+
+    def on_artboard_changed(self) -> None:
+        pass
+
+    def _remember_style(self, obj: BaseObject) -> None:
+        """obj の dataclass fields ∩ `_STYLE_KEYS` の現在値を type 別に記憶する。"""
+        style: dict[str, Any] = {
+            f.name: getattr(obj, f.name) for f in dataclass_fields(obj) if f.name in _STYLE_KEYS
+        }
+        if style:
+            self._style_memory[obj.type] = style
+
+    def _apply_style_memory(self, obj: Any) -> None:
+        """直近に記憶した同種オブジェクトのスタイルを新規オブジェクトへ適用する。"""
+        for key, value in self._style_memory.get(obj.type, {}).items():
+            if hasattr(obj, key):
+                setattr(obj, key, value)
 
     def set_tool(self, name: str) -> None:
         if name not in _TOOLS:
@@ -454,18 +522,7 @@ class ToolManager(QObject):
                 height=rect.height(),
             )
 
-        undo_stack = self.scene.undo_stack
-        if undo_stack is None:
-            # undo_stack 未設定時はモデルを直接変更しない(§13)。select と挙動を揃える。
-            return True
-        undo_stack.push(AddObjectCommand(document, obj))
-
-        self.set_tool("select")
-        new_item = self.scene.item_for(obj)
-        if new_item is not None:
-            self.scene.clearSelection()
-            new_item.setSelected(True)
-        return True
+        return self._finish_creation(obj)
 
     def _cancel_preview(self) -> None:
         if self._preview_item is not None:
@@ -478,11 +535,14 @@ class ToolManager(QObject):
     def _finish_creation(self, obj: Any) -> bool:
         """AddObjectCommand を push し select ツールへ戻して新規オブジェクトを選択する。
 
-        undo_stack 未設定時はモデルを変更しない(§13 と同じ方針)。
+        undo_stack 未設定時はモデルを変更しない(§13 と同じ方針)。push 前に sticky defaults
+        (P3契約 §4.2)を適用する。text/math のダイアログ既定値には介入しない
+        （このメソッドを通る、生成された obj への適用のみ）。
         """
         undo_stack = self.scene.undo_stack
         if undo_stack is None:
             return True
+        self._apply_style_memory(obj)
         undo_stack.push(AddObjectCommand(self.scene.document, obj))
         self.set_tool("select")
         new_item = self.scene.item_for(obj)
