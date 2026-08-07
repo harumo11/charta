@@ -550,6 +550,43 @@ def test_critique_small_text_fix_reaches_the_threshold(api: AgentAPI) -> None:
     assert api.critique(checks=["small_text"])["findings"] == []
 
 
+def test_the_critique_fix_loop_converges(api: AgentAPI) -> None:
+    """「点検 → 修正案を送り返す」を繰り返すと必ず所見ゼロに収束する。
+
+    1 つ直すと別の所見が出ることがある（フォントを大きくすると箱に収まらなく
+    なる等）。それ自体は正しい挙動だが、**振動して終わらない**なら
+    エージェントは無限に往復する。この機能群の実用性そのものなので固定する。
+    """
+    oid = api.create_objects(
+        [
+            {
+                "type": "text",
+                "x": 50,
+                "y": 50,
+                "text": "読みにくいラベル",
+                "color": "#e8e8e8",
+                "font_size": 6,
+            }
+        ]
+    )["created"][0]["id"]
+    assert len(api.critique(ids=[oid])["findings"]) >= 2
+
+    seen: list[list[str]] = []
+    for _ in range(6):
+        findings = api.critique(ids=[oid])["findings"]
+        if not findings:
+            break
+        seen.append(sorted(f["code"] for f in findings))
+        for finding in findings:
+            call = finding.get("corrected_call")
+            if call is not None:
+                getattr(api, call["tool"])(**call["arguments"])
+    else:
+        pytest.fail(f"収束しない（巡ごとの所見: {seen}）")
+    assert api.critique(ids=[oid])["findings"] == []
+    assert len(seen) <= 3, f"収束が遅すぎる: {seen}"
+
+
 def test_critique_can_omit_suggestions(api: AgentAPI) -> None:
     api.create_objects([{"type": "text", "x": 50, "y": 50, "text": "小", "font_size": 6}])
     result = api.critique(checks=["small_text"], include_suggestions=False)

@@ -212,6 +212,25 @@ def test_text_in_front_does_not_occlude() -> None:
     assert dx.analyze(snap, ("occluded",)) == []
 
 
+def test_exactly_stacked_objects_are_reported_as_occluded() -> None:
+    """座標を指定せずに N 個作ると全部同じ場所に積まれる — エージェントが実際にやる失敗。
+
+    完全一致は「部分的な重なり」ではないので `overlap` には出ない（内包は
+    ラベル配置として正常なため免除している）。代わりに `occluded` が
+    「見えていない」と正確に報告する。この 2 コードの分担が崩れると、
+    最も起きやすい失敗が丸ごと無警告になる。
+    """
+    stacked = _snapshot(
+        _obj(1, "rect", box=(100.0, 100.0, 260.0, 140.0), fill="#eef2ff", z_index=0),
+        _obj(2, "rect", box=(100.0, 100.0, 260.0, 140.0), fill="#eef2ff", z_index=1),
+        _obj(3, "rect", box=(100.0, 100.0, 260.0, 140.0), fill="#eef2ff", z_index=2),
+    )
+    assert dx.analyze(stacked, ("overlap",)) == [], "完全一致は overlap ではない"
+    occluded = dx.analyze(stacked, ("occluded",))
+    assert len(occluded) == 3, "3 ペアすべてが覆い隠しとして報告される"
+    assert {f["id"] for f in occluded} == {1, 2}, "手前の 3 は隠れていない"
+
+
 def test_ellipse_does_not_occlude_a_box_poking_into_its_corner() -> None:
     snap = _snapshot(
         _obj(1, "rect", box=(4.0, 4.0, 16.0, 16.0), fill="#ff0000", z_index=0),
