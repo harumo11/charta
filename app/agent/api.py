@@ -1516,7 +1516,7 @@ class AgentAPI:
         )
 
     def _resolve_style_bundle(
-        self, style: Any, from_id: int | None, keys: list[str] | None
+        self, ids: list[int], style: Any, from_id: int | None, keys: list[str] | None
     ) -> dict[str, Any]:
         """`style`（dict か登録名）か `from_id` から見た目キーの束を作る。"""
         document = self._document
@@ -1529,9 +1529,16 @@ class AgentAPI:
             raise AgentError(
                 "ambiguous_argument" if len(sources) > 1 else "missing_argument",
                 ("style と from_id は同時に指定できません。" if len(sources) > 1 else "") + forms,
+                # そのまま送れば**通る**形にする。呼び出し側が渡した ids をそのまま
+                # 使い、空なら「定義だけ」の形として save_as を補う。
+                # 修正案を送り返したらまた別のエラーになる、が潰したかった失敗そのもの。
                 corrected_call={
                     "tool": "apply_style",
-                    "arguments": {"ids": [], "style": {"stroke": "#333333"}},
+                    "arguments": (
+                        {"ids": list(ids), "style": {"stroke": "#333333"}}
+                        if ids
+                        else {"ids": [], "style": {"stroke": "#333333"}, "save_as": "my-style"}
+                    ),
                     "note": "その場限りの束を配る形。登録名なら style='名前'、"
                     "既存オブジェクトからのコピーなら from_id=対象の id",
                 },
@@ -1567,7 +1574,7 @@ class AgentAPI:
             raise AgentError("type_mismatch", "スタイルが空です（見た目キーが 1 つも要りません）")
         return bundle
 
-    def _check_style_vocabulary(self, bundle: dict[str, Any]) -> None:
+    def _check_style_vocabulary(self, ids: list[int], bundle: dict[str, Any]) -> None:
         """束のキーが「見た目キー」であることを確かめる（3 段の判定）。
 
         どの型のスタイルキーでもないものは、単なる打ち間違いか、そもそも
@@ -1586,10 +1593,16 @@ class AgentAPI:
                         "update_objects で変更してください",
                         key=key,
                         extra={
+                            # 呼び出し側が渡した ids をそのまま使うので、
+                            # そのまま送り返せば通る（プレースホルダの id を返さない）。
                             "corrected_call": {
                                 "tool": "update_objects",
-                                "arguments": {"items": [{"id": 0, key: bundle[key]}]},
-                                "note": "id を対象のものに差し替えて送ってください",
+                                "arguments": {
+                                    "items": [{"id": oid, key: bundle[key]} for oid in ids]
+                                    or [{"id": 0, key: bundle[key]}]
+                                },
+                                "note": "見た目でないキーは update_objects で変更します"
+                                + ("" if ids else "（id を対象のものに差し替えてください）"),
                             }
                         },
                     )
@@ -1640,13 +1653,20 @@ class AgentAPI:
         self._require_revision(expect_revision)
         if not isinstance(ids, list | tuple):
             raise AgentError("type_mismatch", "ids は配列です（定義だけなら ids=[]）")
+        # 束の解決を先にやる。「束の指定が無い」ほうが「ids が空」より根本的な
+        # 誤りなので、そちらを先に報告しないと修正案が 2 段階になる。
+        bundle = self._resolve_style_bundle(list(ids), style, from_id, keys)
+        self._check_style_vocabulary(list(ids), bundle)
         if not ids and save_as is None:
             raise AgentError(
                 "type_mismatch",
                 "ids が空です。配らずに登録だけしたい場合は save_as を指定してください",
+                corrected_call={
+                    "tool": "apply_style",
+                    "arguments": {"ids": [], "style": bundle, "save_as": "my-style"},
+                    "note": "この束を名前付きで登録します（配る場合は ids に対象を入れてください）",
+                },
             )
-        bundle = self._resolve_style_bundle(style, from_id, keys)
-        self._check_style_vocabulary(bundle)
 
         document = self._document
         errors: list[FieldError] = []

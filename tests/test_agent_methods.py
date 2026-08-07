@@ -225,10 +225,25 @@ def test_corrected_calls_bind_to_the_real_signature(api: AgentAPI) -> None:
         api.layout_objects(ids=[oid], mode="grid")
     corrected_calls.append(excinfo.value.to_dict()["corrected_call"])
 
-    # 7) critique が返す修正案（診断コードごとに 1 種類）
+    # 7) apply_style: 束の指定が無い／両方ある
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid])
+    corrected_calls.append(excinfo.value.to_dict()["corrected_call"])
+
+    # 8) apply_style: 見た目でないキーを渡した
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid], style={"x": 10})
+    corrected_calls.append(excinfo.value.to_dict()["errors"][0]["corrected_call"])
+
+    # 9) apply_style: ids が空なのに save_as が無い
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[], style={"fill": "#ffffff"})
+    corrected_calls.append(excinfo.value.to_dict()["corrected_call"])
+
+    # 10) critique が返す修正案（診断コードごとに 1 種類）
     corrected_calls.extend(_critique_corrected_calls())
 
-    assert len(corrected_calls) == 16
+    assert len(corrected_calls) == 19
     for corrected in corrected_calls:
         _assert_corrected_call_is_valid(corrected)
 

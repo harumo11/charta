@@ -264,26 +264,46 @@ def test_unknown_named_style_lists_what_exists(api: AgentAPI) -> None:
     assert payload["suggestion"] == "node"
 
 
-def test_specifying_both_or_neither_source_offers_a_sendable_form(api: AgentAPI) -> None:
+def test_specifying_both_or_neither_source_offers_a_sendable_form(
+    api: AgentAPI, window: Any
+) -> None:
     oid = _make_rects(api, 1)[0]
     with pytest.raises(AgentError) as excinfo:
         api.apply_style(ids=[oid], style={"fill": "#000000"}, from_id=oid)
     assert excinfo.value.code == "ambiguous_argument"
-    assert excinfo.value.to_dict()["corrected_call"]["tool"] == "apply_style"
 
     with pytest.raises(AgentError) as excinfo:
         api.apply_style(ids=[oid])
-    assert excinfo.value.code == "missing_argument"
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "missing_argument"
+    # **そのまま送り返せば通る**こと（別のエラーに化けない）。
+    corrected = payload["corrected_call"]
+    assert corrected["tool"] == "apply_style"
+    api.apply_style(**corrected["arguments"])
+    assert window.scene.document.object_by_id(oid).stroke == "#333333"
 
 
-def test_geometry_keys_are_refused_and_point_at_update_objects(api: AgentAPI) -> None:
+def test_the_no_source_fix_is_sendable_even_with_empty_ids(api: AgentAPI, window: Any) -> None:
+    """ids=[] のときは save_as を補う（ids 空 + save_as 無しは別のエラーになるため）。"""
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[])
+    corrected = excinfo.value.to_dict()["corrected_call"]
+    api.apply_style(**corrected["arguments"])
+    assert window.scene.document.styles
+
+
+def test_geometry_keys_are_refused_and_point_at_update_objects(api: AgentAPI, window: Any) -> None:
     """これを通すと apply_style が検証の緩い update_objects になってしまう。"""
     oid = _make_rects(api, 1)[0]
     with pytest.raises(AgentError) as excinfo:
         api.apply_style(ids=[oid], style={"x": 10})
     error = excinfo.value.to_dict()["errors"][0]
     assert error["code"] == "not_a_style_key"
-    assert error["corrected_call"]["tool"] == "update_objects"
+    corrected = error["corrected_call"]
+    assert corrected["tool"] == "update_objects"
+    # 呼び出し側が渡した id が入っているので、そのまま送り返せば通る。
+    api.update_objects(**corrected["arguments"])
+    assert window.scene.document.object_by_id(oid).x == 10.0
 
 
 def test_a_misspelled_style_key_suggests_the_real_one(api: AgentAPI, window: Any) -> None:
