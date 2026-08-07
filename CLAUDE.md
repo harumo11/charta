@@ -98,6 +98,7 @@ myproject/
     "background": "#FFFFFF"
   },
   "objects": [ /* 下記オブジェクト定義の配列。配列順 = z順（後ろほど前面） */ ],
+  "styles": { /* 名前付きスタイル登録（apply_style の save_as）。空なら省略される */ },
   "next_id": 42
 }
 ```
@@ -187,7 +188,7 @@ myproject/
 | `source_id`, `target_id` | int or null | 接続先オブジェクト ID。null なら固定端点 |
 | `source_anchor`, `target_anchor` | str | "top"/"bottom"/"left"/"right"/"center"/"nearest" |
 | `source_point`, `target_point` | [x,y] | 固定端点の座標（`*_id` が null のとき有効） |
-| `routing` | str | "straight" / "orthogonal"（直角折れ線） |
+| `routing` | str | "straight"（直線・何も避けない） / "orthogonal"（直角折れ線。間にある図形を避ける） |
 | `stroke`, `stroke_width`, `dash`, `arrow_end` | — | 線・矢じりプロパティ |
 
 用語定義: **アンカー（接続点）** = コネクタが図形の縁のどこに接続するかを示す定義済み点。
@@ -236,7 +237,24 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - 接続先の `itemChange`（`ItemPositionHasChanged`/ジオメトリ変更）を**シグナル/スロット**で購読し、コネクタの `connector_item` が再計算・再描画する。
   - 用語定義: **シグナル/スロット** = Qt のオブジェクト間イベント通知機構。あるオブジェクトの変化を別オブジェクトが受け取る。
 - 接続先削除時の既定挙動: **その端点を最後の座標で固定化**（`*_id` を null にし `*_point` に座標を焼き込む）。孤立させない。
-- v1 のルーティングは `straight` と `orthogonal`（単純な直角折れ線）のみ。自動経路回避は将来拡張。
+- ルーティングは `straight`（直線）と `orthogonal`（直角折れ線）の 2 つ。
+  **`orthogonal` は間にある図形を避ける**（2026-08-07。それまでは中点で 1 回折れるだけで
+  図形を平気で貫通していた）。実装は `app/graphics/avoid.py`（Qt 非依存の純関数）。
+  - **後方互換の要件**: 素の肘曲がり経路がどの障害物とも交差しないなら、
+    従来と**同一の点列**を返す（`build_orthogonal_route` の早期リターン）。
+    障害物のない単純な図は 1px も変わらない。
+  - 近似である。候補経路（L 字 2 種・素の肘 2 種・各障害物の辺を通る HVH/VHV）を
+    列挙し `(交差数, 貫通長, 折れ数, 総長)` の辞書式最小を採る。A* も可視グラフも使わない。
+    避けきれない配置では「交差の最も少ない経路」に劣化し、**例外は投げない**
+    （`svg_exporter` にエラー経路が無いため、これは要件）。
+  - 障害物から除外するもの: コネクタ自身とその接続先／箱型でない型（line・arrow・
+    他のコネクタ。斜めの線の外接矩形は広大で 2px の線が画面の 1/4 を塞ぐ）／不可視／面積 0。
+  - **キャンバスと SVG のパリティ**が最も壊れやすい。障害物の収集は
+    `collect_obstacles` を両消費者（`connector_item` / `svg_exporter`）で共有し、
+    回転の適用を関数内に閉じ込めてある。`tests/test_routing_avoid.py` が固定する。
+  - 接続先以外の図形が動いたときの経路更新は `CanvasScene._schedule_connector_reroute`
+    が担う（`QTimer.singleShot(0)` で同一ターン内の変更を 1 回にまとめる）。
+    人間のドラッグ中はモデルが更新されないため（§9.6）、**更新はドロップ時**。
 
 ### 9.4 数式
 - `math/mathtext_render.py`: LaTeX 文字列 → matplotlib SVG バックエンドで SVG 文字列を生成 → `math_item.py`（`QGraphicsSvgItem`）に読み込み表示。
@@ -292,7 +310,7 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 ## 12. 既知の制約・将来拡張（スコープ外）
 - SVG 出力のフォント/画像/SVG アイテムの Qt 標準経路は不安定 → 自前シリアライザで回避する（本設計の前提）。
 - mathtext は LaTeX 完全互換ではない → 将来 `usetex=True` 切替を用意する余地を残す。
-- 将来拡張（v1 では実装しない）: サブ図ラベル自動採番 (a)(b)(c)、スタイルのコピー/ペースト、コネクタの自動経路回避、簡易レイヤーの高度化。
+- 将来拡張（v1 では実装しない）: サブ図ラベル自動採番 (a)(b)(c)、簡易レイヤーの高度化。
 - **明示的にスコープ外**: `.pptx` 取り込み/書き出し、スケールバー、**自動背景除去（rembg 等のワンクリック全自動系）**。自動背景除去は一度実装した（rembg + GrabCut）が、最先端の外部ツールに品質・使い勝手で劣るため 2026-07-23 に全削除した。再実装しないこと。ただし **SAM3 選択的マスキング（「## 9.5」）は 2026-07-27 に正式スコープ化済みで、この除外に含まない**。
 
 ---
@@ -382,10 +400,53 @@ printf '{"jsonrpc":"2.0","id":1,"method":"describe_state","params":{}}\n' \
 `charta_exec` の名前空間・タイムアウトを開示する。詳細は
 `.claude/working/architecture/agent.md`「## メソッド引数スキーマ」を参照。
 
+### 図の破綻を機械可読に点検する: critique / layout_objects / apply_style / move_objects の relative（2026-08-07 追加）
+
+エージェントが `render_canvas` で目視するしかなかった「画面外・重なり・文字あふれ」等の
+点検と、「座標を計算して並べる」「見た目をまとめて配る」を宣言的 API に落とし込んだ。
+
+**診断層は 2 段構え**（速度とスレッド安全性のための分離）:
+- `app/graphics/diagnostics.py`: Qt 非依存の純関数。`Document` のスナップショット
+  （dataclass。bbox・テキスト採寸済みの寸法などを先に確定させたもの）を受け取り、
+  画面外・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・出力実寸で小さすぎる
+  文字（`CHECK_NAMES`）を検出する。`Document` にも Qt にも触れないので、
+  ワーカースレッドへ出しても競合しない。
+- `app/agent/diagnose.py`: GUI スレッドでスナップショットを作る側。`QFontMetricsF`
+  でのテキスト採寸など Qt が要る処理はここで行い、`diagnostics.py` の純関数へ渡す。
+  遅延評価（要求された検査だけ採寸する）と revision キャッシュ（同じ revision の
+  スナップショットを再利用する）を持つ。
+
+**`critique(checks=None, ids=None, include_suggestions=True, async_=False)`**:
+読み取り専用の診断。各所見に `corrected_call`（`move_objects` / `update_objects` /
+`order_objects` のいずれか、そのまま送れる形）が付く。`render` で PNG を目視するより
+安く判定もぶれないので、描いた直後に呼ぶのが想定用途（`render(include=["warnings"])`
+も同じ検査を返すが `corrected_call` は付かない）。`async_=True` でワーカースレッド
+実行 + `job_id` を返す（オブジェクトが数百ある図で GUI を固めないため。解析が純関数
+であることがこれを安全にしている）。
+
+**`layout_objects(ids, mode="row", gap=40.0, gap_y=None, columns=None, align="start", origin=None, force=False, undo_label=None, expect_revision=None)`**:
+行/列/グリッドに座標を**計算して**並べる（`arrange_objects` は既に置かれている箱を
+揃えるだけで座標を作らない）。並ぶ順は `ids` の配列順。`mode="grid"` には `columns`
+が必須で、列幅は各列の最大幅、行高は各行の最大高。サイズは変えず位置だけを変える。
+
+**`apply_style(ids, style=None, from_id=None, keys=None, save_as=None, force=False, undo_label=None, expect_revision=None)`**:
+見た目キーの束を複数オブジェクトへ 1 undo ステップで配る。束の指定は
+`style={...}`（その場限り）/ `style="登録名"`（`save_as` で `project.json` に
+登録済みのもの）/ `from_id=7`（既存オブジェクトの見た目をコピー）の 3 形いずれか
+1 つ。型によって持つキーが違う（text/math は `fill`/`stroke` ではなく `color`）ため、
+持たないキーは黙って捨てず `skipped` として報告する（`update_objects` は同じ状況を
+`key_not_on_type` でエラーにするので、混在した型への配布はこちら）。
+
+**`move_objects` の `items` 要素に `relative` 形が追加**:
+`{"id": 9, "relative": {"to": 3, "side": "below", "gap": 40, "align": "center"}}`。
+`side` は above/below/left_of/right_of/inside、`align` は start/center/end、
+`gap` 既定 24。要素は配列順に解決するので、同じ呼び出しの中で先に動かした
+オブジェクトを後の要素の基準にできる（「A の下に B、B の下に C」が 1 往復）。
+
 ### 検証
 
 ```bash
-uv run pytest                                  # test_agent_{schema,methods,render,api,host}.py
+uv run pytest                                  # test_agent_{schema,methods,render,api,host,diagnose}.py, test_styles.py, test_graphics_{boxes,legibility}.py, test_arrange_layout.py
 QT_QPA_PLATFORM=offscreen uv run --group agent python scripts/smoke_agent.py   # 実 MCP で E2E
 uv run python scripts/gen_arch_index.py --check                                 # 索引の陳腐化
 ```

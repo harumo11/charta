@@ -107,6 +107,8 @@ _KEY_NOTES: dict[str, str] = {
     "source_anchor": _ANCHOR_NOTE,
     "target_anchor": _ANCHOR_NOTE,
     "latex": "matplotlib mathtext（LaTeX のサブセット）。\\usepackage 不可・日本語不可",
+    "routing": "straight = 直線（何も避けない）/ orthogonal = 直角折れ線で"
+    "間にある図形を避ける（近似。避けきれない配置では交差の少ない経路になる）",
 }
 
 #: 幾何が endpoints/connector の型で、box 系キーを書こうとしたときの誘導先。

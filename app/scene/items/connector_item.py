@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QGraphicsItem
 
 from app.commands.commands import SetPropertyCommand
 from app.graphics.arrows import arrow_visible, shorten_amount
+from app.graphics.avoid import collect_obstacles
 from app.graphics.routing import (
     Box,
     Point,
@@ -214,7 +215,52 @@ class ConnectorItem(BaseItem):
             p1 = self._live_source
         if self._live_target is not None:
             p2 = self._live_target
-        self._points = build_routing(p1, p2, conn.routing)
+        # orthogonal は間にある図形を避ける。ライブ box（ドラッグ中の見かけの位置）を
+        # 渡すのはキャンバス側だけで、エクスポータはモデル値を使う。回転の適用は
+        # `collect_obstacles` の中に閉じ込めてあるので、確定状態では両者が一致する。
+        obstacles = (
+            collect_obstacles(self._document, conn, live_boxes=self._live_obstacle_boxes())
+            if conn.routing == "orthogonal" and self._document is not None
+            else []
+        )
+        self._points = build_routing(p1, p2, conn.routing, obstacles)
+
+    def _live_obstacle_boxes(self) -> dict[int, tuple[Box, float]]:
+        """シーン上のアイテムから見た各オブジェクトの (box, rotation)。
+
+        アイテムが無いオブジェクトは含めない（`collect_obstacles` がモデル値に
+        フォールバックする）。ドラッグ中は `live_geometry()` がライブ値を返すので、
+        掴んでいる図形を避けながら経路が追従する。
+        """
+        scene = self.scene()
+        if scene is None or self._document is None:
+            return {}
+        boxes: dict[int, tuple[Box, float]] = {}
+        for obj in self._document.objects:
+            item = getattr(scene, "item_for", None)
+            item = item(obj) if callable(item) else None
+            if item is None:
+                continue
+            box = logical_box_for_item(item)
+            if box is None:
+                continue
+            live_geometry = getattr(item, "live_geometry", None)
+            geom = live_geometry() if callable(live_geometry) else {}
+            boxes[obj.id] = (box, float(geom.get("rotation", 0.0)))
+        return boxes
+
+    def refresh_route(self) -> None:
+        """経路を計算し直して再描画する（自分以外の図形が動いたときに呼ばれる）。
+
+        `orthogonal` の回避は「自分の接続先以外」にも依存するので、`bind_endpoints`
+        の購読だけでは足りない。これを呼ばないと、キャンバスだけ古い経路のまま
+        SVG 出力と食い違う（唯一の真実源を持つ意味が無くなる）。
+        """
+        self.prepareGeometryChange()
+        self._recompute_points()
+        self.update()
+        if self._handles is not None:
+            self._handles.update_positions()
 
     # ------------------------------------------------------------------
     # ライブ端点オーバーライド（コネクタ編集UX契約 §2.1）

@@ -32,6 +32,7 @@ from app.graphics.arrows import (
     triangle_points,
     unit_vector,
 )
+from app.graphics.avoid import collect_obstacles
 from app.graphics.image_pipeline import processed_png_base64
 from app.graphics.routing import (
     build_routing,
@@ -296,7 +297,11 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
     SVG と画面注釈で座標がずれない。
     """
     src_pt, tgt_pt = connector_endpoints_from_model(document, obj)
-    points = build_routing(src_pt, tgt_pt, obj.routing)
+    # orthogonal は間にある図形を避ける。障害物の収集は `collect_obstacles` を
+    # キャンバス側（connector_item）と共有する — 別々に集めると同じ図で
+    # 画面と SVG の経路が食い違う（唯一の真実源を分岐させない、の一部）。
+    obstacles = collect_obstacles(document, obj) if obj.routing == "orthogonal" else []
+    points = build_routing(src_pt, tgt_pt, obj.routing, obstacles)
 
     line_points = list(points)
     arrow_size = max(float(obj.arrow_size), 0.0)

@@ -10,7 +10,7 @@ import math
 import sys
 import warnings
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QUndoStack
 from PySide6.QtWidgets import QGraphicsScene
 
@@ -24,6 +24,10 @@ Guide = tuple[str, float]  # ("v", x) 縦ガイド / ("h", y) 横ガイド
 
 _GRID_COLOR = QColor(0, 0, 0, 40)
 _GUIDE_COLOR = QColor(255, 0, 170, 200)
+
+#: これらのキーが変わったら orthogonal コネクタの経路を計算し直す。
+#: 経路回避は「自分の接続先以外」の図形の位置・大きさ・可視性にも依存するため。
+_REROUTE_TRIGGER_KEYS = frozenset({"x", "y", "width", "height", "rotation", "visible", "routing"})
 
 
 class CanvasScene(QGraphicsScene):
@@ -55,6 +59,9 @@ class CanvasScene(QGraphicsScene):
 
         # グループ選択拡張の再入防止ガード（selectionChanged フィードバックループ回避）。
         self._expanding_selection: bool = False
+
+        # orthogonal コネクタの経路再計算を 1 イベントループに 1 回へまとめるフラグ。
+        self._reroute_pending: bool = False
 
         # crop モード中の ImageItem（ビュー状態。CanvasView/ToolManager が参照する）。
         self._active_crop_item: BaseItem | None = None
@@ -93,14 +100,42 @@ class CanvasScene(QGraphicsScene):
         後続のリスナー（LayerPanel 等）にも通知が届かなくなる。
         """
         self._try_add_item_for(obj)
+        self._schedule_connector_reroute()
 
     def on_object_removed(self, obj: BaseObject) -> None:
         """`document.remove_object` の通知。対応 item を除去する。"""
         self.remove_item_for(obj)
+        self._schedule_connector_reroute()
 
     def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None:
         """`document.set_values` の通知。対応 item をモデル値に同期する。"""
         self.sync_item(obj)
+        if set(keys) & _REROUTE_TRIGGER_KEYS:
+            self._schedule_connector_reroute()
+
+    def _schedule_connector_reroute(self) -> None:
+        """orthogonal コネクタの経路再計算を予約する（同一ターン内は 1 回にまとめる）。
+
+        `orthogonal` は「自分の接続先以外」の図形も避けるので、無関係な
+        オブジェクトが動いたら計算し直す必要がある。ただし 20 個を動かす
+        undo マクロは `set_values` を 20 回呼ぶため、素直に毎回再計算すると
+        20 倍の無駄になる。`QTimer.singleShot(0)` でイベントループの最後まで
+        遅らせ、まとめて 1 回だけ走らせる（**応答性のための合流**）。
+
+        該当コネクタが 1 本も無いシーンでは、ここでの走査 1 回で終わる。
+        """
+        if self._reroute_pending:
+            return
+        self._reroute_pending = True
+        QTimer.singleShot(0, self._reroute_connectors)
+
+    def _reroute_connectors(self) -> None:
+        """予約されていた経路再計算を実行する（モデルには一切書かない）。"""
+        self._reroute_pending = False
+        for item in list(self._items.values()):
+            refresh = getattr(item, "refresh_route", None)
+            if callable(refresh) and getattr(item.obj, "routing", None) == "orthogonal":
+                refresh()
 
     def on_order_changed(self) -> None:
         """`document.move_to_index` の通知。全 item の z 値を並び順に合わせ直す。"""

@@ -190,28 +190,25 @@ def resolve_anchor(
     return fixed_point
 
 
-def build_routing(p1: Point, p2: Point, routing: str) -> list[Point]:
+def build_routing(
+    p1: Point, p2: Point, routing: str, obstacles: list[Box] | None = None
+) -> list[Point]:
     """`p1`->`p2` の経路点列を返す。
 
-    - straight: [p1, p2]。
-    - orthogonal: 3セグメントの直角折れ線 [p1, elbow1, elbow2, p2]。
-      水平差(dx)が垂直差(dy)より大きければ中点xで縦に折れ、そうでなければ
-      中点yで横に折れる、という単純規則。
+    - straight: [p1, p2]。`obstacles` は無視する（直線は直線であるべきなので）。
+    - orthogonal: 直角折れ線。`obstacles` を渡すと**間にある図形を避ける**
+      （`app/graphics/avoid.py`）。障害物が素の肘曲がりを塞いでいなければ
+      従来と同一の点列を返すので、単純な図の見た目は変わらない。
+      渡さなければ従来どおり中点で 1 回折れるだけ。
+
+    `obstacles` は省略可なので、既存の呼び出しはそのまま動く。
     """
     if routing == "straight":
         return [p1, p2]
     if routing == "orthogonal":
-        x1, y1 = p1
-        x2, y2 = p2
-        if abs(x2 - x1) > abs(y2 - y1):
-            mid_x = (x1 + x2) / 2.0
-            elbow1: Point = (mid_x, y1)
-            elbow2: Point = (mid_x, y2)
-        else:
-            mid_y = (y1 + y2) / 2.0
-            elbow1 = (x1, mid_y)
-            elbow2 = (x2, mid_y)
-        return [p1, elbow1, elbow2, p2]
+        from app.graphics.avoid import build_orthogonal_route
+
+        return build_orthogonal_route(p1, p2, obstacles or [])
     raise ValueError(f"unknown routing: {routing!r}")
 
 
