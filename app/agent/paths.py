@@ -66,6 +66,19 @@ def prune_renders(keep: int = RENDER_KEEP) -> None:
             pass
 
 
+def default_export_dir(project_dir: str | None) -> Path:
+    """書き出しの既定の置き場。相対パスはここを基点に解決する。
+
+    プロジェクト保存済みなら `<project>/exports/`（CLAUDE.md §6 の構成）、
+    未保存ならランタイムディレクトリ配下。**必ず許可ルートの内側**になるので、
+    エージェントは `export_file(kind="svg", path="fig.svg")` と書くだけで通る。
+    絶対パスを組み立てて許可リストに弾かれる、という往復が要らなくなる。
+    """
+    base = Path(project_dir) / "exports" if project_dir else runtime_dir() / "exports"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def default_allowed_roots(project_dir: str | None) -> list[Path]:
     """ファイル引数として既定で許可するディレクトリ。
 

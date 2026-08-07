@@ -113,9 +113,7 @@ def test_internal_exceptions_return_a_traceback_not_a_crash(
 
 
 def test_round_trip_through_handle_line(host: AgentHost) -> None:
-    line = json.dumps(
-        _request("create_objects", objects=[{"type": "rect", "width": 5, "height": 5}])
-    )
+    line = json.dumps(_request("create_objects", items=[{"type": "rect", "width": 5, "height": 5}]))
     response = host.handle_line(line)
     assert response["result"]["created"][0]["type"] == "rect"
 
@@ -191,7 +189,7 @@ def test_autosave_is_suspended_during_mutations(host: AgentHost, window: Any) ->
 
     type(host.api).create_objects = spy  # type: ignore[method-assign]
     try:
-        _result(host, "create_objects", objects=[{"type": "rect", "width": 5, "height": 5}])
+        _result(host, "create_objects", items=[{"type": "rect", "width": 5, "height": 5}])
     finally:
         type(host.api).create_objects = original  # type: ignore[method-assign]
     assert seen == [False], "変更中は autosave タイマーが止まっている"
@@ -319,7 +317,7 @@ def test_real_socket_round_trip(listening: Any, qapp: Any) -> None:
         assert client.call("ping")["result"]["ok"] is True
         created = client.call(
             "create_objects",
-            objects=[{"type": "rect", "x": 10, "y": 10, "width": 60, "height": 30}],
+            items=[{"type": "rect", "x": 10, "y": 10, "width": 60, "height": 30}],
         )
         assert created["result"]["created"][0]["type"] == "rect"
         assert len(window.scene.document.objects) == 1
@@ -327,7 +325,7 @@ def test_real_socket_round_trip(listening: Any, qapp: Any) -> None:
         rendered = client.call("render", max_edge=256, overlay="full")
         assert Path(rendered["result"]["path"]).exists()
 
-        bad = client.call("update_objects", updates=[{"id": 1, "set": {"dash": "dotted"}}])
+        bad = client.call("update_objects", items=[{"id": 1, "dash": "dotted"}])
         assert bad["error"]["data"]["errors"][0]["code"] == "invalid_enum"
     finally:
         client.close()
@@ -342,7 +340,7 @@ def test_multiple_requests_on_one_connection(listening: Any, qapp: Any) -> None:
         for i in range(5):
             result = client.call(
                 "create_objects",
-                objects=[{"type": "rect", "x": i * 10, "y": 0, "width": 5, "height": 5}],
+                items=[{"type": "rect", "x": i * 10, "y": 0, "width": 5, "height": 5}],
             )
             assert result["result"]["revision"] == i + 1
     finally:

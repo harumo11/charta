@@ -33,6 +33,26 @@ MAX_TIMEOUT_S = 120.0
 #: 出力が巨大になってもエージェントの文脈を潰さないよう切り詰める。
 MAX_OUTPUT_CHARS = 20_000
 
+#: `build_namespace` が入れる名前（`__name__` / `__builtins__` を除く）。
+#: `app/agent/methods.py` の `charta_exec` 記述と
+#: `tests/test_agent_methods.py::test_exec_namespace_doc_matches_build_namespace`
+#: が突き合わせるので、`build_namespace` に語彙を足したらここも足すこと。
+NAMESPACE_NAMES: tuple[str, ...] = (
+    "api",
+    "window",
+    "scene",
+    "doc",
+    "undo",
+    "edit",
+    "cmds",
+    "objects",
+    "geometry",
+    "serialize",
+    "arrange",
+    "bounding_box",
+    "translate_geom",
+)
+
 
 class ExecTimeout(Exception):
     """ウォッチドッグによる打ち切り。"""

@@ -68,6 +68,7 @@ _STYLE_KEYS: frozenset[str] = frozenset(
         "underline",
         "color",
         "align",
+        "valign",
     }
 )
 

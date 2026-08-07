@@ -171,6 +171,7 @@ class TextObject(BaseObject):
     underline: bool = False
     color: str = "#000000"
     align: str = "left"
+    valign: str = "top"
 
     TYPE: ClassVar[str] = "text"
 
@@ -199,6 +200,9 @@ class ConnectorObject(BaseObject):
     stroke_width: float = 2.0
     dash: str = "solid"
     arrow_end: str = "triangle"
+    # 既定値は旧固定値（connector_item._ARROW_SIZE / svg_exporter._CONNECTOR_ARROW_SIZE）
+    # と同一。よって arrow_size を持たない既存 project.json は見た目が変わらない。
+    arrow_size: float = 12.0
 
     TYPE: ClassVar[str] = "connector"
     GEOMETRY: ClassVar[str] = "connector"

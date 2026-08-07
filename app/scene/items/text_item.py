@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.export.text_outline import text_to_path
+from app.export.text_outline import _VALIGN_FACTOR, text_to_path, valign_offset
 from app.model.objects import BaseObject
 from app.scene.items.box_item import BoxItem
 from app.scene.items.registry import register_item
@@ -104,17 +104,23 @@ class TextItem(BoxItem):
             bool(obj.italic),
             bool(obj.underline),
             obj.align,
+            obj.valign,
             float(self._w),
+            float(self._h),
         )
         cached = self._layout_rect_cache
         if cached is not None and cached[0] == key:
             return cached[1]
-        metrics = QFontMetricsF(_font_for(obj))
+        font = _font_for(obj)
+        metrics = QFontMetricsF(font)
         align = _ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft)
         flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
         rect = metrics.boundingRect(
             QRectF(0.0, 0.0, max(self._w, 1.0), 1_000_000.0), flags, obj.text
         )
+        offset = valign_offset(obj.text, font, QRectF(0.0, 0.0, self._w, self._h), obj.valign)
+        if offset:
+            rect = rect.translated(0.0, offset)
         self._layout_rect_cache = (key, rect)
         return rect
 
@@ -143,23 +149,30 @@ class TextItem(BoxItem):
         if self._export_outline:
             font = _font_for(self.obj)
             underline = bool(self.obj.underline)
-            path = text_to_path(text, font, rect, self.obj.align, underline=underline)
+            path = text_to_path(
+                text, font, rect, self.obj.align, underline=underline, valign=self.obj.valign
+            )
             painter.fillPath(path, QBrush(color))
             return
-        painter.setFont(_font_for(self.obj))
+        font = _font_for(self.obj)
+        painter.setFont(font)
         painter.setPen(QPen(color))
         align = _ALIGN_MAP.get(self.obj.align, Qt.AlignmentFlag.AlignLeft)
         # TextDontClip: 箱が行高より低いときにディセンダ（`_` や `y` の下）が
         # ピクセル単位で切れるのを防ぐ。アウトライン経路（`text_to_path`、SVG/PDF）は
         # 元からクリップしないので、これを付けないと**画面・PNG と SVG/PDF で
         # 見た目が食い違う**（出力品質最優先の設計上これは許容できない）。
+        # 縦位置は Qt の AlignVCenter を使わず（Qt 内部の行高算出が text_outline.py の
+        # lineSpacing 積み上げとズレるため）、rect 自体を valign_offset() 分だけ
+        # 下げることで PDF アウトラインと一致させる（フラグは常に AlignTop のまま）。
         flags = (
             int(align)
             | int(Qt.AlignmentFlag.AlignTop)
             | int(Qt.TextFlag.TextWordWrap)
             | int(Qt.TextFlag.TextDontClip)
         )
-        painter.drawText(rect, flags, text)
+        offset = valign_offset(text, font, rect, self.obj.valign)
+        painter.drawText(rect.translated(0.0, offset), flags, text)
 
     # ------------------------------------------------------------------
     # テキスト編集
@@ -231,12 +244,21 @@ class TextItem(BoxItem):
                 )
             )
             if abs(new_height - old_height) > 1.0:
+                # valign のアンカー辺を保つ（top: dy==0 で既存挙動と完全同一。
+                # middle: 箱の垂直中心を維持。bottom: 下端を維持）。
+                dy = (new_height - old_height) * _VALIGN_FACTOR.get(self.obj.valign, 0.0)
+                new_geom: dict[str, float] = {"height": new_height}
+                old_geom: dict[str, float] = {"height": old_height}
+                if dy != 0.0:
+                    old_y = self.obj.y
+                    new_geom["y"] = old_y - dy
+                    old_geom["y"] = old_y
                 undo_stack.push(
                     SetGeometryCommand(
                         self._document,
                         self.obj,
-                        {"height": new_height},
-                        {"height": old_height},
+                        new_geom,
+                        old_geom,
                         text="edit text resize",
                     )
                 )

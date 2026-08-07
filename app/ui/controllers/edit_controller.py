@@ -274,18 +274,35 @@ class EditController:
         self.align_objects(self._scene.selected_objects(), mode)
 
     def align_objects(
-        self, objs: list[BaseObject], mode: str, text: str = "整列", force: bool = False
+        self,
+        objs: list[BaseObject],
+        mode: str,
+        text: str = "整列",
+        force: bool = False,
+        reference: BaseObject | None = None,
     ) -> list[BaseObject]:
         """`objs` を `mode` に整列する。実際に動いたオブジェクトを返す。
 
-        `mode` は left|right|top|bottom|center_h|center_v。対象は 2 個以上必要
-        （コネクタとロック済みを除いた後で判定する）。
+        `mode` は left|right|top|bottom|center_h|center_v。
+
+        `reference` が None なら基準は「対象全体の外接矩形」で、対象は 2 個以上必要
+        （コネクタとロック済みを除いた後で判定する）。`reference` を与えると
+        その 1 個を基準にして残りを揃える。基準は対象から除外されるので絶対に
+        動かず、戻り値にも現れない（`objs` に含まれていても同じ）。この場合は
+        対象 1 個でも成立する。
         """
         targets = self._arrangeable(objs, force)
-        if len(targets) < 2:
-            return []
+        if reference is not None:
+            targets = [o for o in targets if o.id != reference.id]
+            if not targets:
+                return []
+            ref_box: Box | None = bounding_box(reference)
+        else:
+            if len(targets) < 2:
+                return []
+            ref_box = None
         boxes = {o.id: bounding_box(o) for o in targets}
-        new_xy = arrange.align_positions(boxes, mode)
+        new_xy = arrange.align_positions(boxes, mode, reference=ref_box)
         return self._apply_box_moves(targets, boxes, new_xy, text=text)
 
     def distribute_selected(self, axis: str) -> None:

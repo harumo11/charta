@@ -16,7 +16,7 @@ from PySide6.QtGui import QBrush, QColor, QPainterPath, QPainterPathStroker, QTr
 from PySide6.QtWidgets import QGraphicsItem
 
 from app.commands.commands import SetPropertyCommand
-from app.graphics.arrows import shorten_amount
+from app.graphics.arrows import arrow_visible, shorten_amount
 from app.graphics.routing import (
     Box,
     Point,
@@ -37,7 +37,6 @@ from app.scene.items.shape_item import pen_for
 if TYPE_CHECKING:
     from app.model.document import Document
 
-_ARROW_SIZE = 12.0  # ConnectorObject は arrow_size を持たないため既定値固定(§3)。
 _SNAP_SCREEN_PX = 12.0  # アンカー磁石スナップの判定距離(画面px。回転ハンドル等と同様に換算)。
 
 
@@ -566,8 +565,11 @@ class ConnectorItem(BaseItem):
     # ------------------------------------------------------------------
     # QGraphicsItem インターフェース
     # ------------------------------------------------------------------
+    def _arrow_size(self) -> float:
+        return max(float(self.obj.arrow_size), 0.0)
+
     def _has_arrowhead(self) -> bool:
-        return self.obj.arrow_end != "none"
+        return arrow_visible(self.obj.arrow_end, self._arrow_size())
 
     def boundingRect(self) -> QRectF:
         points = self._points
@@ -577,7 +579,7 @@ class ConnectorItem(BaseItem):
         ys = [p[1] for p in points]
         margin = max(float(self.obj.stroke_width), 0.0) / 2.0 + 1.0
         if self._has_arrowhead():
-            margin += _ARROW_SIZE
+            margin += self._arrow_size()
         rect = QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
         return rect.adjusted(-margin, -margin, margin, margin)
 
@@ -591,7 +593,7 @@ class ConnectorItem(BaseItem):
         stroker = QPainterPathStroker()
         width = max(float(self.obj.stroke_width), 8.0)
         if self._has_arrowhead():
-            width += _ARROW_SIZE
+            width += self._arrow_size()
         stroker.setWidth(width)
         return stroker.createStroke(path)
 
@@ -604,10 +606,11 @@ class ConnectorItem(BaseItem):
 
         direction = endpoint_direction(points)
         tip = QPointF(*points[-1])
+        arrow_size = self._arrow_size()
         draw_points = [QPointF(*p) for p in points]
         if self._has_arrowhead():
             dx, dy = direction
-            shorten = shorten_amount(self.obj.arrow_end, _ARROW_SIZE)
+            shorten = shorten_amount(self.obj.arrow_end, arrow_size)
             if shorten:
                 draw_points[-1] = QPointF(tip.x() - dx * shorten, tip.y() - dy * shorten)
 
@@ -617,7 +620,7 @@ class ConnectorItem(BaseItem):
         if self._has_arrowhead():
             color = QColor(self.obj.stroke) if self.obj.stroke else QColor(0, 0, 0)
             paint_arrowhead(
-                painter, tip, direction, self.obj.arrow_end, _ARROW_SIZE, pen_for(self.obj), color
+                painter, tip, direction, self.obj.arrow_end, arrow_size, pen_for(self.obj), color
             )
 
     def create_handles(self) -> ConnectorHandleSet:

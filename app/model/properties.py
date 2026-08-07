@@ -134,6 +134,7 @@ _IMAGE_PROPS: list[PropSpec] = [
 ]
 
 _ALIGN_OPTIONS: tuple[str, ...] = ("left", "center", "right")
+_VALIGN_OPTIONS: tuple[str, ...] = ("top", "middle", "bottom")
 
 _FREEHAND_PROPS: list[PropSpec] = [
     PropSpec(key="stroke", label="線色", kind="color"),
@@ -158,6 +159,7 @@ _TEXT_PROPS: list[PropSpec] = [
     PropSpec(key="underline", label="下線", kind="bool"),
     PropSpec(key="color", label="文字色", kind="color"),
     PropSpec(key="align", label="整列", kind="enum", options=_ALIGN_OPTIONS),
+    PropSpec(key="valign", label="縦位置", kind="enum", options=_VALIGN_OPTIONS),
 ]
 
 _MATH_PROPS: list[PropSpec] = [
@@ -178,6 +180,7 @@ _CONNECTOR_PROPS: list[PropSpec] = [
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),
     PropSpec(key="arrow_end", label="終端矢じり", kind="enum", options=_ARROW_OPTIONS),
+    PropSpec(key="arrow_size", label="矢じりサイズ", kind="number", minimum=0.0),
 ]
 
 PROPERTIES: dict[str, list[PropSpec]] = {

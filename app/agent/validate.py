@@ -79,6 +79,21 @@ def batch_error(errors: list[FieldError], applied: int = 0) -> AgentError:
     )
 
 
+def renamed_argument(method: str, old: str, new: str, note: str = "") -> AgentError:
+    """廃止された引数名で呼ばれたときのエラー（正しい呼び方を添える）。"""
+    return AgentError(
+        "renamed_argument",
+        f"{method} の引数 {old!r} は {new!r} に改名されました",
+        corrected_call={
+            "tool": method,
+            "arguments": {new: f"<旧 {old} の中身をそのまま>"},
+            "note": note or f"{old} に渡していた配列をそのまま {new} に渡してください",
+        },
+        hint="全バッチメソッドの配列引数は 'items' に統一されています。"
+        "要素の形は describe_schema(method=...) で確認できます。",
+    )
+
+
 def _suggest(value: str, candidates: list[str]) -> str | None:
     matches = difflib.get_close_matches(value, candidates, n=1, cutoff=0.5)
     return matches[0] if matches else None
@@ -260,7 +275,7 @@ def _wrong_geometry_error(type_name: str, key: str, obj_id: int | None) -> Field
     if geometry == "endpoints" and obj_id is not None:
         error.extra["corrected_call"] = {
             "tool": "move_objects",
-            "arguments": {"moves": [{"id": obj_id, "dx": 0, "dy": 0}]},
+            "arguments": {"items": [{"id": obj_id, "dx": 0, "dy": 0}]},
             "note": "dx / dy に動かしたい量を入れてください（p1 と p2 が一緒に動きます）",
         }
     elif geometry == "connector":
@@ -289,15 +304,30 @@ def validate_values(
     for key, value in values.items():
         prop = keys.get(key)
         if prop is None:
-            errors.append(
-                _err(
-                    "unknown_key",
-                    key,
-                    f"{type_name} に {key!r} というプロパティはありません",
-                    allowed=sorted(editable),
-                    suggestion=_suggest(key, sorted(editable)),
+            owners = schema.types_with_key(key)
+            if owners:
+                # 別の型には実在するキー（例: connector に arrow_size）。
+                # ここで difflib の曖昧候補を出すと「近い名前」を正解だと信じて
+                # 再送 → また失敗、の往復を生む。型名という確実な情報だけ返す。
+                errors.append(
+                    _err(
+                        "key_not_on_type",
+                        key,
+                        f"{type_name} に {key!r} はありません。{key!r} を持つのは {owners} です",
+                        available_on=owners,
+                        allowed=sorted(editable),
+                    )
                 )
-            )
+            else:
+                errors.append(
+                    _err(
+                        "unknown_key",
+                        key,
+                        f"{type_name} に {key!r} というプロパティはありません",
+                        allowed=sorted(editable),
+                        suggestion=_suggest(key, sorted(editable)),
+                    )
+                )
             continue
         if geometry != "box" and key in schema.GEOMETRY_TRUTH_KEYS["box"]:
             errors.append(_wrong_geometry_error(type_name, key, obj_id))

@@ -68,6 +68,16 @@ def shorten_amount(shape: str, size: float) -> float:
     return SHORTEN.get(shape, 0.0) * size
 
 
+def arrow_visible(shape: str, size: float) -> bool:
+    """矢じりを実際に描くか。"none" もサイズ 0 以下も描かない。
+
+    line/arrow（shape_item, svg_exporter._render_line）に二重で存在していた
+    `shape != "none" and size > 0.0` の抽出。connector も同じ規則に揃えることで、
+    「同じ矢じりプロパティなのに型で挙動が違う」状態を避ける。
+    """
+    return shape != "none" and size > 0.0
+
+
 def unit_vector(p_from: Point, p_to: Point) -> Point | None:
     """`p_from` → `p_to` の単位ベクトル。長さ 0 なら None（矢じり描画をスキップさせる）。
 

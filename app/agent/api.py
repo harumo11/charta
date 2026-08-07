@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import base64
+import difflib
+import inspect
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
@@ -26,8 +28,16 @@ from typing import TYPE_CHECKING, Any
 from PySide6.QtCore import QBuffer, QByteArray, QRectF, QTimer
 from PySide6.QtGui import QFont, QUndoCommand
 
-from app.agent import paths, render, schema
-from app.agent.validate import AgentError, FieldError, batch_error, check_locked, check_type_name
+from app.agent import exec_env, paths, render, schema
+from app.agent import methods as agent_methods
+from app.agent.validate import (
+    AgentError,
+    FieldError,
+    batch_error,
+    check_locked,
+    check_type_name,
+    renamed_argument,
+)
 from app.agent.validate import validate_values as _validate_values
 from app.commands.commands import (
     AddObjectCommand,
@@ -66,6 +76,10 @@ _ALIGN_MODES = ("left", "right", "top", "bottom", "center_h", "center_v")
 _ARRANGE_ACTIONS = (*_ALIGN_MODES, "distribute_h", "distribute_v")
 _ORDER_ACTIONS = ("front", "back", "forward", "backward", "group", "ungroup")
 _EXPORT_KINDS = ("png", "pdf", "svg")
+#: `render(include=...)` の語彙。既定に objects を入れないのは、件数に比例して
+#: 肥大するのにほとんどの呼び出しでは path しか使われないため。
+_RENDER_INCLUDE = ("objects", "warnings", "all")
+_RENDER_INCLUDE_DEFAULT = ("warnings",)
 _PROJECT_ACTIONS = ("new", "open", "save", "save_as")
 
 #: `place_image` / `export_file` などがファイルを触るときの拡張子。
@@ -194,16 +208,30 @@ class AgentAPI:
     def _allowed_roots(self) -> list[Any]:
         return paths.default_allowed_roots(self._window._project_dir)
 
+    def _export_dir(self) -> Any:
+        return paths.default_export_dir(self._window._project_dir)
+
     def _check_path(self, path: str, *, must_exist: bool = False) -> str:
         import os
 
         roots = self._allowed_roots()
         if not paths.is_within(path, roots):
+            # 環境変数の案内だけでは、エージェントは自力で解決できない
+            # （動作中プロセスの env は変えられない）。**実際に書ける場所**を返す。
+            export_dir = self._export_dir()
             raise AgentError(
                 "path_denied",
                 f"{path} は許可されたディレクトリの外です。"
-                f"環境変数 {paths.ALLOWED_PATHS_ENV} で追加できます",
+                f"下記 allowed_roots のいずれかの配下を指定してください"
+                f"（書き出しなら相対パスにすると {export_dir} に置かれます）",
                 allowed_roots=[str(r) for r in roots],
+                default_export_dir=str(export_dir),
+                corrected_call={
+                    "tool": "export_file",
+                    "arguments": {"kind": "svg", "path": os.path.basename(path) or "figure.svg"},
+                    "note": "相対パスは既定の書き出し先に解決される",
+                },
+                hint=f"人間が別の場所を許可したいときは環境変数 {paths.ALLOWED_PATHS_ENV}",
             )
         resolved = str(os.path.abspath(os.path.expanduser(path)))
         if must_exist and not os.path.exists(resolved):
@@ -254,6 +282,14 @@ class AgentAPI:
             capabilities={
                 "sam3_available": sam3_available,
                 "exec_enabled": getattr(window, "_agent_exec_enabled", False),
+                "exec": {
+                    "enabled": getattr(window, "_agent_exec_enabled", False),
+                    "default_timeout_s": exec_env.DEFAULT_TIMEOUT_S,
+                    "max_timeout_s": exec_env.MAX_TIMEOUT_S,
+                    "namespace": list(exec_env.NAMESPACE_NAMES),
+                    "hint": "複合操作は charta_exec が 1 往復で済む。詳細は "
+                    "describe_schema(method='charta_exec')",
+                },
             },
             limits={
                 "create_batch_max": CREATE_BATCH_MAX,
@@ -261,16 +297,62 @@ class AgentAPI:
                 "render_max_edge": render.MAX_MAX_EDGE,
                 "svg_max_bytes": SVG_MAX_BYTES,
             },
+            paths={
+                # 最初の失敗の前に「どこへ書けるか」を引けるようにする
+                # （書き出せずに往復する、というのが実地の不満だった）。
+                "default_export_dir": str(self._export_dir()),
+                "allowed_roots": [str(r) for r in self._allowed_roots()],
+                "hint": "export_file の path は相対にすると default_export_dir に置かれる",
+            },
         )
 
-    def describe_schema(self, type: str | None = None) -> dict[str, Any]:  # noqa: A002
-        """全オブジェクト型の編集可能キー・範囲・enum・幾何契約。"""
-        try:
-            result = schema.describe_schema(self._document, type)
-        except KeyError:
-            error = check_type_name(type)
-            assert error is not None
-            raise AgentError(error.code, error.message, **error.extra) from None
+    def describe_schema(
+        self, type: str | None = None, method: str | None = None  # noqa: A002
+    ) -> dict[str, Any]:
+        """全オブジェクト型の編集可能キー・範囲・enum・幾何契約と、RPC メソッドの引数形。
+
+        `type` と `method` はどちらも省略でき、独立に絞り込める:
+
+        - どちらも未指定: `object_types` 全件 + `methods` 全件（`charta_exec` を含む）
+          + `traps` / `coverage`。
+        - `type` のみ: 従来どおり当該型の `object_types` に絞る。`methods` は省く。
+        - `method` のみ: `methods` を 1 件に絞る。`object_types` / `coverage` は省くが
+          `units` / `artboard` / `anchors` / `traps` は常に返す。
+
+        メソッドの引数形が分からなくなったら
+        `describe_schema(method='create_objects')` のように呼ぶこと。
+        """
+        methods_only: dict[str, Any] | None = None
+        if method is not None:
+            try:
+                methods_only = agent_methods.describe_methods(method_signatures(), only=method)
+            except KeyError:
+                available = sorted(agent_methods.METHOD_SPECS)
+                matches = difflib.get_close_matches(method, available, n=1, cutoff=0.5)
+                raise AgentError(
+                    "unknown_method",
+                    f"未知のメソッド {method!r}。有効なのは {available} です",
+                    available=available,
+                    suggestion=matches[0] if matches else None,
+                ) from None
+
+        if type is not None or method is None:
+            try:
+                result = dict(schema.describe_schema(self._document, type))
+            except KeyError:
+                error = check_type_name(type)
+                assert error is not None
+                raise AgentError(error.code, error.message, **error.extra) from None
+        else:
+            # method のみ: object_types / coverage は省くが、それ以外は常に返す。
+            full = schema.describe_schema(self._document, None)
+            result = {k: v for k, v in full.items() if k not in ("object_types", "coverage")}
+
+        if method is not None:
+            assert methods_only is not None
+            result["methods"] = methods_only["methods"]
+        elif type is None:
+            result["methods"] = agent_methods.describe_methods(method_signatures())["methods"]
         return {"ok": True, **result}
 
     def _object_summary(self, obj: BaseObject, detail: str) -> dict[str, Any]:
@@ -381,13 +463,37 @@ class AgentAPI:
         overlay: str = "none",
         transparent: bool = False,
         inline: bool = False,
+        include: list[str] | None = None,
     ) -> dict[str, Any]:
         """キャンバスを PNG にして **ファイルパスを返す**。
 
         インライン base64 を既定にしないのは、MCP クライアント側で画像が
         テキストとして数万トークン消費し、出力上限にも掛かるため。
         エージェントは返ってきたパスを組込みの読み取りツールで開くこと。
+
+        `include` は追加で返すセクション（置換セマンティクス）。既定は
+        `["warnings"]` で、**可視オブジェクト全件の bbox（`objects`）は返さない** —
+        これは件数に比例して肥大するのに、たいていの呼び出しでは path しか
+        使われないため。id とピクセルの対応が要るときだけ `include=["objects"]`
+        （`"all"` で全部、`[]` で最小）。
         """
+        if include is not None and not isinstance(include, list | tuple):
+            # 文字列を渡すと set() が 1 文字ずつに割れ、意味不明な invalid_enum になる。
+            raise AgentError(
+                "type_mismatch",
+                'include は文字列の配列です（例 ["objects"]）',
+                allowed=list(_RENDER_INCLUDE),
+            )
+        include_set = set(_RENDER_INCLUDE_DEFAULT if include is None else include)
+        unknown = sorted(include_set - set(_RENDER_INCLUDE))
+        if unknown:
+            raise AgentError(
+                "invalid_enum",
+                f"include に未知の値 {unknown} があります",
+                allowed=list(_RENDER_INCLUDE),
+            )
+        if "all" in include_set:
+            include_set = {"objects", "warnings"}
         if source not in ("artboard", "window"):
             raise AgentError(
                 "invalid_enum",
@@ -430,9 +536,12 @@ class AgentAPI:
                 "overlay": overlay,
                 "artboard": schema.artboard_info(document),
             },
-            "objects": render.object_boxes(document, view),
-            "warnings": render.offscreen_warnings(document),
         }
+        if "objects" in include_set:
+            # 要求されたときだけ呼ぶ（全オブジェクトの resolved_bounding_box 計算も省ける）。
+            payload["objects"] = render.object_boxes(document, view)
+        if "warnings" in include_set:
+            payload["warnings"] = render.offscreen_warnings(document)
         if inline:
             payload["image_base64"] = _png_base64(image)
             payload["mime_type"] = "image/png"
@@ -475,20 +584,46 @@ class AgentAPI:
 
     def create_objects(
         self,
-        objects: list[dict[str, Any]],
+        items: list[dict[str, Any]] | None = None,
+        connections: list[dict[str, Any]] | None = None,
         insert_at: str = "front",
         select: bool = False,
         undo_label: str | None = None,
         expect_revision: int | None = None,
+        *,
+        objects: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """複数のオブジェクトを 1 undo ステップで作成する。"""
+        """複数のオブジェクトを 1 undo ステップで作成する。
+
+        `items` の各要素はフラット（`{"type": "rect", "x": 0, ...}`）。任意で
+        `"ref": "A"` を付けると、同じ呼び出しの `connections` から
+        `{"source_ref": "A", ...}` で参照できる（作成 → id を見る → 接続、の
+        2 往復が 1 往復になる）。`connections` の端点は `*_id`（既存オブジェクト）
+        と `*_ref`（この呼び出しで作るもの）のどちらでも指定できる。
+
+        items も connections も**全件検証が通るまで 1 つも適用しない**。
+        全体が 1 undo マクロなので、人間は Ctrl+Z 一発で戻せる。
+        """
+        if objects is not None:
+            raise renamed_argument("create_objects", "objects", "items")
         self._require_revision(expect_revision)
-        if not isinstance(objects, list) or not objects:
-            raise AgentError("type_mismatch", "objects は 1 件以上の配列である必要があります")
-        if len(objects) > CREATE_BATCH_MAX:
+        if not isinstance(items, list):
+            raise AgentError("type_mismatch", "items は配列である必要があります")
+        conn_specs = connections if connections is not None else []
+        if not isinstance(conn_specs, list):
+            raise AgentError("type_mismatch", "connections は配列である必要があります")
+        if not items and not conn_specs:
+            raise AgentError("type_mismatch", "items か connections に 1 件以上必要です")
+        if len(items) > CREATE_BATCH_MAX:
             raise AgentError(
                 "too_large",
-                f"1 回に作成できるのは {CREATE_BATCH_MAX} 件までです（{len(objects)} 件）",
+                f"1 回に作成できるのは {CREATE_BATCH_MAX} 件までです（{len(items)} 件）",
+            )
+        if len(conn_specs) > CREATE_BATCH_MAX:
+            raise AgentError(
+                "too_large",
+                f"1 回に作成できるコネクタは {CREATE_BATCH_MAX} 本までです"
+                f"（{len(conn_specs)} 本）",
             )
         if insert_at not in ("front", "back"):
             raise AgentError(
@@ -497,13 +632,31 @@ class AgentAPI:
 
         document = self._document
         errors: list[FieldError] = []
-        planned: list[tuple[str, dict[str, Any]]] = []
+        planned: list[tuple[str, dict[str, Any], str | None]] = []
+        declared_refs: dict[str, int] = {}  # ref -> planned 内の位置
 
-        for index, spec in enumerate(objects):
+        # ---- フェーズ A: 検証のみ（非破壊）------------------------------
+        for index, spec in enumerate(items):
             if not isinstance(spec, dict):
                 errors.append(FieldError("type_mismatch", "各要素はオブジェクトです", index=index))
                 continue
             values = dict(spec)
+            ref = values.pop("ref", None)
+            if ref is not None:
+                if not isinstance(ref, str) or not ref:
+                    errors.append(
+                        FieldError("type_mismatch", "ref は空でない文字列です", index=index)
+                    )
+                    continue
+                if ref in declared_refs:
+                    errors.append(
+                        FieldError(
+                            "duplicate_ref",
+                            f"ref {ref!r} が重複しています（呼び出し内で一意にしてください）",
+                            index=index,
+                        )
+                    )
+                    continue
             type_name = values.pop("type", None)
             type_error = check_type_name(type_name)
             if type_error is not None:
@@ -511,15 +664,7 @@ class AgentAPI:
                 errors.append(type_error)
                 continue
             if type_name in _TOOL_CREATED_TYPES:
-                tool = _TOOL_CREATED_TYPES[type_name]
-                errors.append(
-                    FieldError(
-                        "not_editable",
-                        f"{type_name} は create_objects では作れません。{tool} を使ってください",
-                        index=index,
-                        extra={"tool": tool},
-                    )
-                )
+                errors.append(self._tool_created_error(type_name, index))
                 continue
             coerced, value_errors = _validate_values(type_name, values, index=index)
             if value_errors:
@@ -529,31 +674,54 @@ class AgentAPI:
             if math_error is not None:
                 errors.append(math_error)
                 continue
+            if ref is not None:
+                declared_refs[ref] = len(planned)
             # 採寸は検証後に行う（不正な値で採寸してもエラーが分かりにくくなるだけ）。
-            planned.append((type_name, self._auto_size(type_name, coerced)))
+            planned.append((type_name, self._auto_size(type_name, coerced), ref))
+
+        planned_conns, conn_errors = self._plan_connections(
+            conn_specs, known_refs=frozenset(declared_refs)
+        )
+        errors.extend(conn_errors)
 
         if errors:
             raise batch_error(errors)
 
+        # ---- フェーズ B: 適用（1 マクロ）--------------------------------
         created: list[BaseObject] = []
-        with self._macro(self._label(undo_label, f"{len(planned)} 個作成")) as macro:
-            for type_name, values in planned:
+        connectors: list[BaseObject] = []
+        ref_to_id: dict[str, int] = {}
+        if planned and planned_conns:
+            label = f"{len(planned)} 個作成 + コネクタ {len(planned_conns)} 本"
+        elif planned_conns:
+            label = f"コネクタ {len(planned_conns)} 本"
+        else:
+            label = f"{len(planned)} 個作成"
+        with self._macro(self._label(undo_label, label)) as macro:
+            for type_name, values, ref in planned:
                 obj = new_object(type_name, document.new_id(), **values)
                 macro.push(
                     AddObjectCommand(document, obj, text=UNDO_PREFIX + f"{type_name} を作成")
                 )
                 created.append(obj)
+                if ref is not None:
+                    ref_to_id[ref] = obj.id
             if insert_at == "back":
                 # push 済みなので index_of は最新。同じマクロ内で背面へ送る。
                 for obj in reversed(created):
                     old_index = document.index_of(obj)
                     if old_index != 0:
                         macro.push(ReorderCommand(document, obj, 0, old_index))
+            # _macro の push は redo を即時実行するので、ここでは上の作成が
+            # 既に document に反映済み ＝ ref の id で端点を解ける。
+            connectors = self._apply_connections(macro, planned_conns, ref_to_id)
+        if connectors:
+            self._scene.rebind_connectors()
 
         if select:
             self.set_selection([o.id for o in created])
 
-        return self._ok(
+        result = self._ok(
             created=[
                 {
                     "id": o.id,
@@ -563,6 +731,39 @@ class AgentAPI:
                 }
                 for o in created
             ]
+        )
+        if planned_conns:
+            result["connectors"] = [self._connector_entry(o) for o in connectors]
+        if ref_to_id:
+            result["refs"] = ref_to_id
+        return result
+
+    def _tool_created_error(self, type_name: str, index: int) -> FieldError:
+        """create_objects の items で作れない型のエラー（往復の少ない代替へ誘導する）。"""
+        if type_name == "connector":
+            return FieldError(
+                "not_editable",
+                "connector は items では作れません。"
+                "同じ呼び出しの connections に書いてください（1 往復で済みます）",
+                index=index,
+                extra={
+                    "tool": "create_objects",
+                    "corrected_call": {
+                        "tool": "create_objects",
+                        "arguments": {
+                            "items": [{"ref": "A", "type": "rect"}, {"ref": "B", "type": "rect"}],
+                            "connections": [{"source_ref": "A", "target_ref": "B"}],
+                        },
+                        "note": "既存オブジェクト同士だけを結ぶなら connect_objects でもよい",
+                    },
+                },
+            )
+        tool = _TOOL_CREATED_TYPES[type_name]
+        return FieldError(
+            "not_editable",
+            f"{type_name} は create_objects では作れません。{tool} を使ってください",
+            index=index,
+            extra={"tool": tool},
         )
 
     def place_image(
@@ -641,29 +842,93 @@ class AgentAPI:
             ]
         )
 
-    def connect_objects(
-        self,
-        connections: list[dict[str, Any]],
-        undo_label: str | None = None,
-        expect_revision: int | None = None,
-    ) -> dict[str, Any]:
-        """図形どうしを追従するコネクタで結ぶ。"""
-        self._require_revision(expect_revision)
-        if not isinstance(connections, list) or not connections:
-            raise AgentError("type_mismatch", "connections は 1 件以上の配列です")
+    def _plan_connections(
+        self, specs: list[dict[str, Any]], *, known_refs: frozenset[str], allow_refs: bool = True
+    ) -> tuple[list[dict[str, Any]], list[FieldError]]:
+        """コネクタ仕様を検証する純粋フェーズ（何も適用しない）。
 
+        `known_refs` は同じ呼び出しでこれから作られるオブジェクトの ref 名。
+        `*_ref` はここでは解決せず planned に持ち越し、id 割り当ては
+        `_apply_connections` が行う（id は適用時にしか払い出せないため）。
+        """
         document = self._document
         errors: list[FieldError] = []
         planned: list[dict[str, Any]] = []
+        reserved = schema.RESERVED_KEYS["connection_item"]
 
-        for index, spec in enumerate(connections):
+        for index, spec in enumerate(specs):
             if not isinstance(spec, dict):
                 errors.append(FieldError("type_mismatch", "各要素はオブジェクトです", index=index))
                 continue
             values = dict(spec)
+            refs: dict[str, str | None] = {}
+            bad = False
+            for side in ("source", "target"):
+                ref_key = f"{side}_ref"
+                ref = values.pop(ref_key, None)
+                if ref is None:
+                    refs[side] = None
+                    continue
+                if not allow_refs:
+                    # connect_objects には ref を宣言する場所が無い。「items に宣言しろ」と
+                    # 言うと存在しない道を指すことになり、リトライループを生む。
+                    errors.append(
+                        FieldError(
+                            "ref_not_supported",
+                            f"connect_objects は既存オブジェクト専用で {ref_key} は使えません。"
+                            "これから作るオブジェクトと結ぶなら create_objects の "
+                            "items（ref 付き）+ connections を使ってください",
+                            index=index,
+                            extra={
+                                "corrected_call": {
+                                    "tool": "create_objects",
+                                    "arguments": {
+                                        "items": [{"ref": ref, "type": "rect"}],
+                                        "connections": [{f"{side}_ref": ref}],
+                                    },
+                                    "note": "1 往復で作成と接続が済みます",
+                                }
+                            },
+                        )
+                    )
+                    bad = True
+                    continue
+                if values.get(f"{side}_id") is not None:
+                    errors.append(
+                        FieldError(
+                            "ambiguous_endpoint",
+                            f"{side}_id と {ref_key} は同時に指定できません",
+                            index=index,
+                        )
+                    )
+                    bad = True
+                    continue
+                if not isinstance(ref, str) or ref not in known_refs:
+                    errors.append(
+                        FieldError(
+                            "unknown_ref",
+                            f"{ref_key}={ref!r} は同じ呼び出しの items に宣言されていません",
+                            index=index,
+                            extra={"allowed": sorted(known_refs)},
+                        )
+                    )
+                    bad = True
+                    continue
+                refs[side] = ref
+            if bad:
+                continue
+            if refs["source"] is not None and refs["source"] == refs["target"]:
+                errors.append(
+                    FieldError(
+                        "self_reference",
+                        "source_ref と target_ref は別である必要があります",
+                        index=index,
+                    )
+                )
+                continue
             source_id = values.get("source_id")
             target_id = values.get("target_id")
-            if source_id == target_id:
+            if source_id is not None and source_id == target_id:
                 errors.append(
                     FieldError(
                         "self_reference",
@@ -672,7 +937,6 @@ class AgentAPI:
                     )
                 )
                 continue
-            bad = False
             for key in ("source_id", "target_id"):
                 oid = values.get(key)
                 if oid is None:
@@ -690,54 +954,94 @@ class AgentAPI:
                     bad = True
             if bad:
                 continue
+            # ref が指すのは items の要素で、items は connector を受け付けないので
+            # 「コネクタ同士の接続」は ref 経路では構造的に起こらない。
             values.setdefault("source_anchor", "nearest")
             values.setdefault("target_anchor", "nearest")
             values.setdefault("arrow_end", "triangle")
+            leftover = set(values) & reserved
+            if leftover:
+                errors.append(
+                    FieldError("type_mismatch", f"未知の予約キー {sorted(leftover)}", index=index)
+                )
+                continue
             coerced, value_errors = _validate_values("connector", values, index=index)
             if value_errors:
                 errors.extend(value_errors)
                 continue
-            planned.append(coerced)
+            planned.append({"values": coerced, "refs": refs})
+        return planned, errors
 
+    def _apply_connections(
+        self, macro: Any, planned: list[dict[str, Any]], ref_to_id: dict[str, int]
+    ) -> list[BaseObject]:
+        """検証済みコネクタを既に開いているマクロへ適用する（新規マクロは開かない）。"""
+        document = self._document
+        created: list[BaseObject] = []
+        for entry in planned:
+            values = dict(entry["values"])
+            for side in ("source", "target"):
+                ref = entry["refs"].get(side)
+                if ref is not None:
+                    values[f"{side}_id"] = ref_to_id[ref]
+            obj = new_object("connector", document.new_id(), **values)
+            # 端点座標を先に解いておく（rebind 前でも幾何が正しくなるように）。
+            src_set = anchor_set_for_object(
+                document.object_by_id(obj.source_id) if obj.source_id is not None else None
+            )
+            tgt_set = anchor_set_for_object(
+                document.object_by_id(obj.target_id) if obj.target_id is not None else None
+            )
+            p1, p2 = compute_endpoints(
+                src_set,
+                (obj.source_point[0], obj.source_point[1]),
+                obj.source_anchor,
+                tgt_set,
+                (obj.target_point[0], obj.target_point[1]),
+                obj.target_anchor,
+            )
+            obj.source_point = [p1[0], p1[1]]
+            obj.target_point = [p2[0], p2[1]]
+            macro.push(AddObjectCommand(document, obj, text=UNDO_PREFIX + "コネクタを作成"))
+            created.append(obj)
+        return created
+
+    def _connector_entry(self, obj: BaseObject) -> dict[str, Any]:
+        return {
+            "id": obj.id,
+            "type": "connector",
+            "source_id": obj.source_id,
+            "target_id": obj.target_id,
+            "bbox": list(resolved_bounding_box(self._document, obj)),
+        }
+
+    def connect_objects(
+        self,
+        items: list[dict[str, Any]] | None = None,
+        undo_label: str | None = None,
+        expect_revision: int | None = None,
+        *,
+        connections: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """既存の図形どうしを追従するコネクタで結ぶ。
+
+        これから作るオブジェクトも一緒に結ぶなら `create_objects` の
+        `items`（`ref` 付き）+ `connections` のほうが 1 往復で済む。
+        """
+        if connections is not None:
+            raise renamed_argument("connect_objects", "connections", "items")
+        self._require_revision(expect_revision)
+        if not isinstance(items, list) or not items:
+            raise AgentError("type_mismatch", "items は 1 件以上の配列です")
+
+        planned, errors = self._plan_connections(items, known_refs=frozenset(), allow_refs=False)
         if errors:
             raise batch_error(errors)
 
-        created: list[BaseObject] = []
         with self._macro(self._label(undo_label, f"コネクタ {len(planned)} 本")) as macro:
-            for values in planned:
-                obj = new_object("connector", document.new_id(), **values)
-                # 端点座標を先に解いておく（rebind 前でも幾何が正しくなるように）。
-                src_set = anchor_set_for_object(
-                    document.object_by_id(obj.source_id) if obj.source_id is not None else None
-                )
-                tgt_set = anchor_set_for_object(
-                    document.object_by_id(obj.target_id) if obj.target_id is not None else None
-                )
-                p1, p2 = compute_endpoints(
-                    src_set,
-                    (obj.source_point[0], obj.source_point[1]),
-                    obj.source_anchor,
-                    tgt_set,
-                    (obj.target_point[0], obj.target_point[1]),
-                    obj.target_anchor,
-                )
-                obj.source_point = [p1[0], p1[1]]
-                obj.target_point = [p2[0], p2[1]]
-                macro.push(AddObjectCommand(document, obj, text=UNDO_PREFIX + "コネクタを作成"))
-                created.append(obj)
+            created = self._apply_connections(macro, planned, {})
         self._scene.rebind_connectors()
-        return self._ok(
-            created=[
-                {
-                    "id": o.id,
-                    "type": "connector",
-                    "source_id": o.source_id,
-                    "target_id": o.target_id,
-                    "bbox": list(resolved_bounding_box(document, o)),
-                }
-                for o in created
-            ]
-        )
+        return self._ok(created=[self._connector_entry(o) for o in created])
 
     # ------------------------------------------------------------------
     # 編集
@@ -745,32 +1049,74 @@ class AgentAPI:
 
     def update_objects(
         self,
-        updates: list[dict[str, Any]],
+        items: list[dict[str, Any]] | None = None,
         force: bool = False,
         undo_label: str | None = None,
         expect_revision: int | None = None,
+        *,
+        updates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """複数オブジェクトのプロパティを 1 undo ステップで変更する。"""
+        """複数オブジェクトのプロパティを 1 undo ステップで変更する。
+
+        各要素はフラット: `{"id": 5, "stroke_width": 3.5}`。同じ変更を複数へ
+        まとめてかけるなら `{"ids": [5, 6], "opacity": 0.5}`。
+        """
+        if updates is not None:
+            # 引数名だけでなく**要素の形も**変わった。note でそれを言わないと、
+            # 「配列をそのまま items へ」に従った 2 往復目が legacy_shape で必ず失敗する。
+            raise renamed_argument(
+                "update_objects",
+                "updates",
+                "items",
+                note="要素の形も変わりました。{id, set: {...}} ではなく "
+                "{id, ...プロパティ} とフラットに並べてください",
+            )
         self._require_revision(expect_revision)
-        if not isinstance(updates, list) or not updates:
-            raise AgentError("type_mismatch", "updates は 1 件以上の配列です")
-        if len(updates) > UPDATE_BATCH_MAX:
+        if not isinstance(items, list) or not items:
+            raise AgentError("type_mismatch", "items は 1 件以上の配列です")
+        if len(items) > UPDATE_BATCH_MAX:
             raise AgentError("too_large", f"1 回の更新は {UPDATE_BATCH_MAX} 件までです")
 
         errors: list[FieldError] = []
         planned: list[tuple[BaseObject, dict[str, Any]]] = []
+        reserved = schema.RESERVED_KEYS["update_item"]
 
-        for index, spec in enumerate(updates):
-            if not isinstance(spec, dict) or "set" not in spec:
-                errors.append(FieldError("type_mismatch", "各要素は {id, set} です", index=index))
+        for index, spec in enumerate(items):
+            if not isinstance(spec, dict):
+                errors.append(FieldError("type_mismatch", "各要素はオブジェクトです", index=index))
+                continue
+            if "set" in spec:
+                nested = spec["set"]
+                corrected: dict[str, Any] = {k: spec[k] for k in ("id", "ids") if k in spec}
+                if isinstance(nested, dict):
+                    corrected.update(nested)
+                errors.append(
+                    FieldError(
+                        "legacy_shape",
+                        "{id, set} 形は廃止されました。プロパティを直接並べてください",
+                        index=index,
+                        extra={
+                            "corrected_call": {
+                                "tool": "update_objects",
+                                "arguments": {"items": [corrected]},
+                            }
+                        },
+                    )
+                )
                 continue
             target_ids = spec.get("ids") or ([spec["id"]] if "id" in spec else [])
             if not target_ids:
                 errors.append(FieldError("type_mismatch", "id か ids が必要です", index=index))
                 continue
-            values = spec["set"]
-            if not isinstance(values, dict) or not values:
-                errors.append(FieldError("type_mismatch", "set は空でない辞書です", index=index))
+            values = {k: v for k, v in spec.items() if k not in reserved}
+            if not values:
+                errors.append(
+                    FieldError(
+                        "type_mismatch",
+                        "変更するプロパティが 1 つもありません（id / ids 以外のキーが要ります）",
+                        index=index,
+                    )
+                )
                 continue
             for oid in target_ids:
                 obj = self._document.object_by_id(oid) if isinstance(oid, int) else None
@@ -833,21 +1179,26 @@ class AgentAPI:
 
     def move_objects(
         self,
-        moves: list[dict[str, Any]],
+        items: list[dict[str, Any]] | None = None,
         undo_label: str | None = None,
         expect_revision: int | None = None,
+        *,
+        moves: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """オブジェクトを移動する。**幾何種別を問わず動く**唯一の移動手段。
 
         box 型は x/y、line/arrow は p1 と p2 を一緒に、コネクタは固定端点を動かす。
+        各要素はフラット: `{"id": 5, "dx": 10, "dy": 0}` か `{"id": 5, "to": [x, y]}`。
         """
+        if moves is not None:
+            raise renamed_argument("move_objects", "moves", "items")
         self._require_revision(expect_revision)
-        if not isinstance(moves, list) or not moves:
-            raise AgentError("type_mismatch", "moves は 1 件以上の配列です")
+        if not isinstance(items, list) or not items:
+            raise AgentError("type_mismatch", "items は 1 件以上の配列です")
 
         document = self._document
         planned: list[tuple[BaseObject, dict[str, Any], dict[str, Any]]] = []
-        for index, spec in enumerate(moves):
+        for index, spec in enumerate(items):
             if not isinstance(spec, dict) or "id" not in spec:
                 raise AgentError(
                     "type_mismatch", "各要素は {id, dx, dy} か {id, to} です", index=index
@@ -923,8 +1274,20 @@ class AgentAPI:
     # 配置
     # ------------------------------------------------------------------
 
-    def arrange_objects(self, ids: list[int], action: str, force: bool = False) -> dict[str, Any]:
-        """整列（左/右/上/下/水平中央/垂直中央）または等間隔分布。"""
+    def arrange_objects(
+        self,
+        ids: list[int],
+        action: str,
+        force: bool = False,
+        relative_to: int | None = None,
+    ) -> dict[str, Any]:
+        """整列（左/右/上/下/水平中央/垂直中央）または等間隔分布。
+
+        `relative_to` に id を渡すと、そのオブジェクトの辺・中心を基準に `ids` を
+        揃える。基準自身は動かず `moved` にも出ない（`ids` に含めても同じ）。
+        基準ありなら対象 1 個でも成立するので、「ラベルを矩形の中心に合わせる」が
+        1 呼び出しで書ける。
+        """
         if action not in _ARRANGE_ACTIONS:
             raise AgentError(
                 "invalid_enum",
@@ -932,6 +1295,25 @@ class AgentAPI:
                 allowed=list(_ARRANGE_ACTIONS),
             )
         objs = self._resolve_many(ids)
+        reference = None
+        if relative_to is not None:
+            if action.startswith("distribute_"):
+                # 黙って無視すると「効いたつもりで効かない」最悪の失敗モードになる。
+                raise AgentError(
+                    "invalid_value",
+                    "relative_to は整列 (left/right/top/bottom/center_h/center_v) "
+                    "でのみ使えます。分布は両端固定なので基準の概念がありません",
+                    allowed=list(_ALIGN_MODES),
+                )
+            reference = self._resolve(relative_to)
+            if reference.type == "connector":
+                # bounding_box(connector) は接続中に古い値になりうる（routing の
+                # resolved_bounding_box を参照）。_arrangeable が対象から除くのと同じ理由。
+                raise AgentError(
+                    "invalid_value",
+                    "connector は独立した位置の真実源を持たないため relative_to に指定できません",
+                    id=relative_to,
+                )
         if action.startswith("distribute_"):
             axis = action.split("_", 1)[1]
             moved = self._edit.distribute_objects(
@@ -940,9 +1322,13 @@ class AgentAPI:
             required = 3
         else:
             moved = self._edit.align_objects(
-                objs, action, text=UNDO_PREFIX + f"整列 ({action})", force=force
+                objs,
+                action,
+                text=UNDO_PREFIX + f"整列 ({action})",
+                force=force,
+                reference=reference,
             )
-            required = 2
+            required = 1 if reference is not None else 2
         return self._ok(
             moved=[
                 {"id": o.id, "bbox": list(resolved_bounding_box(self._document, o))} for o in moved
@@ -1017,12 +1403,25 @@ class AgentAPI:
         kind: str,
         path: str,
         transparent: bool = False,
-        outline_text: bool = True,
+        outline_text: bool = False,
     ) -> dict[str, Any]:
+        """出版品質で書き出す。`path` は相対にすると既定の書き出し先に置かれる。
+
+        `outline_text` の既定は **False**（CLAUDE.md §8。Nature 等の投稿規定が
+        編集可能なテキストを要求するため 2026-08-02 に ON→OFF へ反転済み。UI の
+        `_ask_outline_text` も既定 No）。フォント埋め込みを受け付けない入稿先の
+        ときだけ True にする。
+        """
         if kind not in _EXPORT_KINDS:
             raise AgentError(
                 "invalid_enum", f"kind は {list(_EXPORT_KINDS)} です", allowed=list(_EXPORT_KINDS)
             )
+        import os as _os
+
+        if not _os.path.isabs(_os.path.expanduser(path)):
+            # 相対パスは既定の書き出し先（<project>/exports、未保存ならランタイム配下）
+            # に置く。これがあるので「パスを組み立てて許可リストに弾かれる」往復が消える。
+            path = str(self._export_dir() / path)
         resolved = self._check_path(path)
         document = self._document
         if kind == "png":
@@ -1316,3 +1715,47 @@ def _format_outline(document: Document, entries: list[dict[str, Any]]) -> str:
 
 def known_types() -> list[str]:
     return sorted(OBJECT_REGISTRY)
+
+
+def method_signatures() -> dict[str, list[dict[str, Any]]]:
+    """公開 `AgentAPI` メソッドの引数を機械可読にした索引（`app.agent.methods` が使う）。
+
+    `from __future__ import annotations` があるので `inspect.signature` の
+    `annotation` は文字列で来る（`app.agent.schema._ANNOTATION_KINDS` と同じ前提）。
+    `self` と `*args` / `**kwargs` は含めない。`host.py` は import しない
+    （`app.agent.host` は `app.agent.api` を import するので、逆向きにすると循環する）。
+    """
+    result: dict[str, list[dict[str, Any]]] = {}
+    for name in sorted(dir(AgentAPI)):
+        if name.startswith("_"):
+            continue
+        attr = getattr(AgentAPI, name, None)
+        if not callable(attr) or isinstance(attr, property):
+            continue
+        params: list[dict[str, Any]] = []
+        for pname, param in inspect.signature(attr).parameters.items():
+            if pname == "self":
+                continue
+            if param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            has_default = param.default is not inspect.Parameter.empty
+            params.append(
+                {
+                    "name": pname,
+                    "type": (
+                        param.annotation
+                        if param.annotation is not inspect.Parameter.empty
+                        else None
+                    ),
+                    "required": not has_default,
+                    "default": param.default if has_default else None,
+                    # 廃止された引数名（renamed_argument のトラップ）は残っているが、
+                    # 印を付けないと「使ってよい引数」に見えて誤誘導する。
+                    "deprecated": pname in agent_methods.deprecated_params(name),
+                }
+            )
+        result[name] = params
+    return result

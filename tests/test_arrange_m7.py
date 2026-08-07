@@ -392,3 +392,82 @@ def test_distribute_selected_requires_at_least_three(window: Any) -> None:
     idx_before = stack.index()
     window.distribute_selected("h")
     assert stack.index() == idx_before
+
+
+# --------------------------------------------------------------------------
+# reference / relative_to: 基準オブジェクトに合わせる（基準は動かない）
+# --------------------------------------------------------------------------
+
+
+def test_align_positions_with_reference_box_aligns_to_it() -> None:
+    boxes = {1: (0.0, 0.0, 10.0, 10.0), 2: (5.0, 5.0, 20.0, 20.0)}
+    ref = (100.0, 200.0, 40.0, 60.0)
+
+    assert arrange.align_positions(boxes, "left", reference=ref)[1][0] == pytest.approx(100.0)
+    assert arrange.align_positions(boxes, "right", reference=ref)[1][0] == pytest.approx(130.0)
+    assert arrange.align_positions(boxes, "top", reference=ref)[1][1] == pytest.approx(200.0)
+    assert arrange.align_positions(boxes, "bottom", reference=ref)[1][1] == pytest.approx(250.0)
+
+
+def test_align_positions_with_reference_center_v_matches_reference_center() -> None:
+    """ラベル(高さ10)を箱(y=200,高さ60)の垂直中央に置く、という今回の用途そのもの。"""
+    boxes = {7: (0.0, 0.0, 10.0, 10.0)}
+    ref = (100.0, 200.0, 40.0, 60.0)
+
+    x, y = arrange.align_positions(boxes, "center_v", reference=ref)[7]
+    assert y + 10.0 / 2.0 == pytest.approx(200.0 + 60.0 / 2.0)
+    assert x == pytest.approx(0.0), "center_v must not touch x"
+
+    x2, _y2 = arrange.align_positions(boxes, "center_h", reference=ref)[7]
+    assert x2 + 10.0 / 2.0 == pytest.approx(100.0 + 40.0 / 2.0)
+
+
+def test_align_positions_reference_none_is_unchanged_behavior() -> None:
+    """既定 None は従来の「選択全体の外接矩形」基準と完全一致（GUI 非破壊）。"""
+    boxes = {1: (0.0, 0.0, 10.0, 10.0), 2: (50.0, 30.0, 20.0, 5.0)}
+    for mode in ("left", "right", "top", "bottom", "center_h", "center_v"):
+        assert arrange.align_positions(boxes, mode) == arrange.align_positions(
+            boxes, mode, reference=None
+        )
+
+
+def test_align_objects_with_reference_moves_single_target(window: Any) -> None:
+    stack = window.undo_stack
+    box = _add_rect(window, 100.0, 200.0)
+    box.width, box.height = 40.0, 60.0
+    label = _add_rect(window, 0.0, 0.0)
+    ref_snapshot = (box.x, box.y, box.width, box.height)
+
+    idx_before = stack.index()
+    moved = window._edit.align_objects([label], "center_v", reference=box)
+
+    assert [o.id for o in moved] == [label.id], "reference must never appear in moved"
+    assert label.y + label.height / 2.0 == pytest.approx(box.y + box.height / 2.0)
+    assert (box.x, box.y, box.width, box.height) == ref_snapshot
+    assert stack.index() == idx_before + 1
+
+
+def test_align_objects_reference_included_in_objs_is_excluded_from_targets(window: Any) -> None:
+    box = _add_rect(window, 100.0, 200.0)
+    box.width, box.height = 40.0, 60.0
+    label = _add_rect(window, 0.0, 0.0)
+
+    moved = window._edit.align_objects([label, box], "center_v", reference=box)
+
+    assert [o.id for o in moved] == [label.id]
+    assert box.y == pytest.approx(200.0)
+
+
+def test_align_selected_still_uses_selection_bbox(window: Any) -> None:
+    """GUI 経路は reference 追加後も従来どおり選択全体の外接矩形基準（回帰）。"""
+    scene = window.scene
+    r0 = _add_rect(window, 0.0, 0.0)
+    r1 = _add_rect(window, 50.0, 30.0)
+    scene.clearSelection()
+    scene.item_for(r0).setSelected(True)
+    scene.item_for(r1).setSelected(True)
+
+    window.align_selected("left")
+
+    assert r0.x == pytest.approx(0.0)
+    assert r1.x == pytest.approx(0.0)

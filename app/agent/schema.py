@@ -35,6 +35,23 @@ TOOL_ONLY_KEYS: dict[str, str] = {
     "group_id": "order_objects",
 }
 
+#: バッチ要素で「プロパティではなく構造」を表す予約キー。
+#:
+#: 全バッチメソッドの要素はフラット（`{"id": 5, "fill": "#ff0000"}`）なので、
+#: 予約キーを抜いた残りがプロパティになる。この方式が成り立つ前提は
+#: 「予約キー ∩ 全型の editable_keys = ∅」で、これは
+#: tests/test_agent_schema.py::test_reserved_keys_never_collide_with_editable_properties
+#: が恒久的に守る（将来 add-object-type で型を足して衝突したら落ちる）。
+#: `id` / `type` は実フィールドだが READ_ONLY_KEYS なので editable には現れない。
+RESERVED_KEYS: dict[str, frozenset[str]] = {
+    "create_item": frozenset({"type", "ref"}),
+    "update_item": frozenset({"id", "ids"}),
+    # source_id / target_id は connector の実プロパティなので予約しない
+    # （そのまま validate_values に流れるべき）。予約するのは *_ref だけ。
+    "connection_item": frozenset({"source_ref", "target_ref"}),
+    "move_item": frozenset({"id", "dx", "dy", "to", "anchor"}),
+}
+
 #: 幾何種別 -> 幾何の真実源となるキー。
 GEOMETRY_TRUTH_KEYS: dict[str, tuple[str, ...]] = {
     "box": ("x", "y", "width", "height", "rotation"),
@@ -222,6 +239,16 @@ def all_keys(type_name: str) -> dict[str, dict[str, Any]]:
     return {p["key"]: p for p in properties_for(type_name)}
 
 
+def types_with_key(key: str) -> list[str]:
+    """`key` を編集可能プロパティとして持つ型名（無ければ空）。
+
+    「この型には無いが別の型にはある」キー（例: connector に arrow_size）を
+    検出するために使う。difflib の曖昧候補を出す代わりに、実在する型名という
+    確実な情報を返すのが目的。
+    """
+    return sorted(name for name in OBJECT_REGISTRY if key in editable_keys(name))
+
+
 def _coverage() -> dict[str, dict[str, list[str]]]:
     """`PROPERTIES` が覆っていないキーの一覧（型追加時の記述漏れを可視化する診断）。"""
     result: dict[str, dict[str, list[str]]] = {}
@@ -264,6 +291,18 @@ TRAPS: list[str] = [
     "text は width / height を省略するとサーバが内容に合わせて採寸する",
     "rect / ellipse は width > 0 かつ height > 0 でないと不可視になる（エラーにはならない）",
     "locked=true は人間がロックしたもの。force=true を付けない限り書き込みは拒否される",
+    "キーは型ごとに違う。例えば arrow_size は line / arrow / connector にあるが "
+    "rect には無い。この型に無いキーを送ると key_not_on_type で「持っている型」が返る",
+    "矩形の中にラベルを置くときは、text を矩形と同じ box（x/y/width/height）に置いて "
+    "align='center' + valign='middle' にする。y を手計算する必要はない",
+    "既存オブジェクトを別のオブジェクト基準で揃えるなら "
+    "arrange_objects(ids=[...], action='center_v', relative_to=<基準id>)。基準は動かない",
+    "全バッチメソッドの配列引数は items で、要素はフラット。引数形を忘れたら "
+    "describe_schema(method='create_objects') で引ける",
+    "「作る → つなぐ」は create_objects の items に ref を付け、"
+    "同じ呼び出しの connections から source_ref / target_ref で参照すると 1 往復で済む",
+    "export_file の path は**相対にする**のが確実（既定の書き出し先に置かれる）。"
+    "絶対パスは許可ルートの配下のみで、現在の値は describe_state の paths で引ける",
 ]
 
 UNITS: dict[str, str] = {

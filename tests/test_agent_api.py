@@ -109,7 +109,7 @@ def test_get_svg_refuses_when_too_large(api: AgentAPI) -> None:
 
 def test_render_returns_a_path_not_inline_base64_by_default(api: AgentAPI) -> None:
     _make_rects(api, 1)
-    result = api.render(max_edge=300)
+    result = api.render(max_edge=300, include=["objects"])
     assert "image_base64" not in result
     assert Path(result["path"]).exists()
     assert result["view"]["source"] == "artboard"
@@ -134,6 +134,32 @@ def test_render_rejects_unknown_source_and_missing_ids(api: AgentAPI) -> None:
     with pytest.raises(AgentError) as excinfo:
         api.render(object_ids=[999])
     assert excinfo.value.code == "unknown_id"
+
+
+def test_render_omits_object_boxes_by_default(api: AgentAPI) -> None:
+    _make_rects(api, 1)
+    result = api.render(max_edge=200)
+    assert "objects" not in result
+    assert "warnings" in result
+    assert "path" in result
+
+
+def test_render_include_objects_returns_boxes(api: AgentAPI) -> None:
+    _make_rects(api, 1)
+    result = api.render(max_edge=200, include=["objects"])
+    assert result["objects"][0]["image_bbox"]
+    assert "warnings" not in result, "include=['objects'] は置換セマンティクス"
+
+    both = api.render(max_edge=200, include=["all"])
+    assert both["objects"][0]["image_bbox"]
+    assert "warnings" in both
+
+
+def test_render_rejects_unknown_include(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.render(include=["boxes"])
+    assert excinfo.value.code == "invalid_enum"
+    assert "allowed" in excinfo.value.extra
 
 
 # --------------------------------------------------------------------------
@@ -197,11 +223,18 @@ def test_invalid_latex_is_rejected_before_anything_is_applied(api: AgentAPI, win
     assert len(window.scene.document.objects) == before, "1 件も適用してはいけない"
 
 
-def test_image_and_connector_cannot_be_created_with_create_objects(api: AgentAPI) -> None:
-    for type_name, tool in (("image", "place_image"), ("connector", "connect_objects")):
-        with pytest.raises(AgentError) as excinfo:
-            api.create_objects([{"type": type_name}])
-        assert excinfo.value.to_dict()["errors"][0]["tool"] == tool
+def test_connector_type_in_items_points_at_the_connections_list(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.create_objects([{"type": "image"}])
+    error = excinfo.value.to_dict()["errors"][0]
+    assert error["tool"] == "place_image"
+
+    with pytest.raises(AgentError) as excinfo:
+        api.create_objects([{"type": "connector"}])
+    error = excinfo.value.to_dict()["errors"][0]
+    corrected = error["corrected_call"]
+    assert corrected["tool"] == "create_objects"
+    assert "connections" in corrected["arguments"]
 
 
 def test_batch_validation_aborts_without_applying_anything(api: AgentAPI, window: Any) -> None:
@@ -226,7 +259,7 @@ def test_batch_validation_aborts_without_applying_anything(api: AgentAPI, window
 def test_update_objects_applies_and_is_one_undo_entry(api: AgentAPI, window: Any) -> None:
     ids = _make_rects(api, 2)
     before = window.undo_stack.count()
-    api.update_objects([{"ids": ids, "set": {"fill": "#00ff00", "stroke_width": 4.0}}])
+    api.update_objects([{"ids": ids, "fill": "#00ff00", "stroke_width": 4.0}])
     assert window.undo_stack.count() == before + 1
     for oid in ids:
         obj = window.scene.document.object_by_id(oid)
@@ -251,21 +284,75 @@ def test_update_objects_rejects_invalid_values_without_partial_application(
 
 def test_update_objects_respects_lock_unless_forced(api: AgentAPI, window: Any) -> None:
     oid = _make_rects(api, 1)[0]
-    api.update_objects([{"id": oid, "set": {"locked": True}}])
+    api.update_objects([{"id": oid, "locked": True}])
     with pytest.raises(AgentError) as excinfo:
-        api.update_objects([{"id": oid, "set": {"fill": "#ff0000"}}])
+        api.update_objects([{"id": oid, "fill": "#ff0000"}])
     assert excinfo.value.to_dict()["errors"][0]["code"] == "locked"
-    api.update_objects([{"id": oid, "set": {"fill": "#ff0000"}}], force=True)
+    api.update_objects([{"id": oid, "fill": "#ff0000"}], force=True)
     assert window.scene.document.object_by_id(oid).fill == "#ff0000"
 
 
 def test_expect_revision_detects_concurrent_edits(api: AgentAPI, window: Any) -> None:
     oid = _make_rects(api, 1)[0]
     stale = window.scene.document.revision
-    api.update_objects([{"id": oid, "set": {"opacity": 0.5}}])
+    api.update_objects([{"id": oid, "opacity": 0.5}])
     with pytest.raises(AgentError) as excinfo:
-        api.update_objects([{"id": oid, "set": {"opacity": 0.2}}], expect_revision=stale)
+        api.update_objects([{"id": oid, "opacity": 0.2}], expect_revision=stale)
     assert excinfo.value.code == "revision_conflict"
+
+
+def test_update_objects_takes_flat_items(api: AgentAPI, window: Any) -> None:
+    oid = _make_rects(api, 1)[0]
+    before = window.undo_stack.count()
+    api.update_objects([{"id": oid, "fill": "#00ff00"}])
+    assert window.undo_stack.count() == before + 1
+    assert window.scene.document.object_by_id(oid).fill == "#00ff00"
+
+
+def test_update_objects_accepts_ids_for_a_shared_change(api: AgentAPI, window: Any) -> None:
+    a, b = _make_rects(api, 2)
+    before = window.undo_stack.count()
+    api.update_objects([{"ids": [a, b], "opacity": 0.5}])
+    assert window.undo_stack.count() == before + 1
+    document = window.scene.document
+    assert document.object_by_id(a).opacity == pytest.approx(0.5)
+    assert document.object_by_id(b).opacity == pytest.approx(0.5)
+
+
+def test_update_item_without_any_property_is_rejected(api: AgentAPI) -> None:
+    oid = _make_rects(api, 1)[0]
+    with pytest.raises(AgentError) as excinfo:
+        api.update_objects([{"id": oid}])
+    assert excinfo.value.code == "validation_failed"
+
+
+def test_legacy_set_shape_is_rejected_with_a_corrected_call(api: AgentAPI) -> None:
+    oid = _make_rects(api, 1)[0]
+    with pytest.raises(AgentError) as excinfo:
+        api.update_objects([{"id": oid, "set": {"fill": "#00ff00"}}])
+    payload = excinfo.value.to_dict()
+    assert payload["errors"][0]["code"] == "legacy_shape"
+    corrected = payload["errors"][0]["corrected_call"]
+    assert corrected["arguments"]["items"][0] == {"id": oid, "fill": "#00ff00"}
+
+
+@pytest.mark.parametrize(
+    "method, old_kwarg",
+    [
+        ("create_objects", "objects"),
+        ("update_objects", "updates"),
+        ("move_objects", "moves"),
+        ("connect_objects", "connections"),
+    ],
+)
+def test_renamed_batch_arguments_are_rejected_with_a_corrected_call(
+    api: AgentAPI, method: str, old_kwarg: str
+) -> None:
+    call = getattr(api, method)
+    with pytest.raises(AgentError) as excinfo:
+        call(items=[{"type": "rect"}], **{old_kwarg: [{"type": "rect"}]})
+    assert excinfo.value.code == "renamed_argument"
+    assert excinfo.value.extra["corrected_call"]["tool"] == method
 
 
 def test_move_objects_handles_every_geometry_kind(api: AgentAPI, window: Any) -> None:
@@ -298,7 +385,7 @@ def test_writing_x_on_an_arrow_returns_a_corrected_call(api: AgentAPI) -> None:
         "created"
     ][0]["id"]
     with pytest.raises(AgentError) as excinfo:
-        api.update_objects([{"id": arrow_id, "set": {"x": 40}}])
+        api.update_objects([{"id": arrow_id, "x": 40}])
     error = excinfo.value.to_dict()["errors"][0]
     assert error["code"] == "wrong_geometry_key"
     assert error["corrected_call"]["tool"] == "move_objects"
@@ -358,6 +445,51 @@ def test_arrange_objects_rejects_unknown_action(api: AgentAPI) -> None:
     assert excinfo.value.code == "invalid_enum"
 
 
+def test_arrange_objects_relative_to_centers_target_on_reference(
+    api: AgentAPI, window: Any
+) -> None:
+    """ラベルを矩形の中心へ。y の手計算をせずに済ませる経路。"""
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 1300.0, "y": 760.0, "width": 320.0, "height": 220.0},
+            {"type": "text", "x": 0.0, "y": 0.0, "width": 320.0, "height": 50.0, "text": "C"},
+        ]
+    )["created"]
+    box_id, label_id = created[0]["id"], created[1]["id"]
+    doc = window.scene.document
+    box = doc.object_by_id(box_id)
+    label = doc.object_by_id(label_id)
+    box_snapshot = (box.x, box.y, box.width, box.height)
+
+    result = api.arrange_objects([label_id], "center_v", relative_to=box_id)
+
+    assert [entry["id"] for entry in result["moved"]] == [label_id]
+    assert label.y + label.height / 2.0 == pytest.approx(box.y + box.height / 2.0)
+    assert (box.x, box.y, box.width, box.height) == box_snapshot
+
+
+def test_arrange_objects_relative_to_rejects_distribute(api: AgentAPI) -> None:
+    ids = _make_rects(api, 3)
+    with pytest.raises(AgentError) as excinfo:
+        api.arrange_objects(ids[:2], "distribute_h", relative_to=ids[2])
+    assert excinfo.value.code == "invalid_value"
+
+
+def test_arrange_objects_relative_to_rejects_connector(api: AgentAPI) -> None:
+    ids = _make_rects(api, 2)
+    conn_id = api.connect_objects([{"source_id": ids[0], "target_id": ids[1]}])["created"][0]["id"]
+    with pytest.raises(AgentError) as excinfo:
+        api.arrange_objects(ids, "left", relative_to=conn_id)
+    assert excinfo.value.code == "invalid_value"
+
+
+def test_arrange_objects_relative_to_unknown_id_raises(api: AgentAPI) -> None:
+    ids = _make_rects(api, 2)
+    with pytest.raises(AgentError) as excinfo:
+        api.arrange_objects(ids, "left", relative_to=99999)
+    assert excinfo.value.code == "unknown_id"
+
+
 def test_order_objects_z_and_grouping(api: AgentAPI, window: Any) -> None:
     ids = _make_rects(api, 3)
     api.order_objects([ids[0]], "front")
@@ -399,6 +531,118 @@ def test_connect_objects_rejects_self_reference_and_missing_ids(api: AgentAPI) -
     with pytest.raises(AgentError) as excinfo:
         api.connect_objects([{"source_id": oid, "target_id": 4242}])
     assert excinfo.value.to_dict()["errors"][0]["code"] == "unknown_id"
+
+
+def test_create_objects_with_refs_and_connections_is_one_round_trip(
+    api: AgentAPI, window: Any
+) -> None:
+    result = api.create_objects(
+        items=[
+            {"ref": "A", "type": "rect", "x": 0, "y": 0, "width": 100, "height": 100},
+            {"ref": "B", "type": "rect", "x": 300, "y": 0, "width": 100, "height": 100},
+            {"ref": "C", "type": "rect", "x": 600, "y": 0, "width": 100, "height": 100},
+        ],
+        connections=[
+            {"source_ref": "A", "target_ref": "B"},
+            {"source_ref": "A", "target_ref": "C"},
+        ],
+    )
+    assert len(result["created"]) == 3
+    assert len(result["connectors"]) == 2
+    assert set(result["refs"]) == {"A", "B", "C"}
+
+
+def test_create_with_connections_is_a_single_undo_entry(api: AgentAPI, window: Any) -> None:
+    before = window.undo_stack.count()
+    api.create_objects(
+        items=[
+            {"ref": "A", "type": "rect", "width": 50, "height": 50},
+            {"ref": "B", "type": "rect", "width": 50, "height": 50},
+        ],
+        connections=[{"source_ref": "A", "target_ref": "B"}],
+    )
+    assert window.undo_stack.count() == before + 1
+    window.undo_stack.undo()
+    assert window.scene.document.objects == []
+
+
+def test_unknown_ref_aborts_before_creating_anything(api: AgentAPI, window: Any) -> None:
+    before_objects = len(window.scene.document.objects)
+    before_undo = window.undo_stack.count()
+    with pytest.raises(AgentError) as excinfo:
+        api.create_objects(
+            items=[{"ref": "A", "type": "rect", "width": 10, "height": 10}],
+            connections=[{"source_ref": "A", "target_ref": "does_not_exist"}],
+        )
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "validation_failed"
+    error = payload["errors"][0]
+    assert error["code"] == "unknown_ref"
+    assert "A" in error["allowed"]
+    assert len(window.scene.document.objects) == before_objects
+    assert window.undo_stack.count() == before_undo
+
+
+def test_duplicate_ref_is_rejected(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.create_objects(
+            items=[
+                {"ref": "A", "type": "rect", "width": 10, "height": 10},
+                {"ref": "A", "type": "rect", "width": 10, "height": 10},
+            ]
+        )
+    assert excinfo.value.to_dict()["errors"][0]["code"] == "duplicate_ref"
+
+
+def test_ref_and_id_can_be_mixed_in_one_connection(api: AgentAPI, window: Any) -> None:
+    existing_id = _make_rects(api, 1)[0]
+    result = api.create_objects(
+        items=[{"ref": "B", "type": "rect", "width": 50, "height": 50}],
+        connections=[{"source_id": existing_id, "target_ref": "B"}],
+    )
+    assert len(result["connectors"]) == 1
+    conn = window.scene.document.object_by_id(result["connectors"][0]["id"])
+    assert conn.source_id == existing_id
+    assert conn.target_id == result["refs"]["B"]
+
+
+def test_specifying_both_source_id_and_source_ref_is_ambiguous(api: AgentAPI) -> None:
+    existing_id = _make_rects(api, 1)[0]
+    with pytest.raises(AgentError) as excinfo:
+        api.create_objects(
+            items=[{"ref": "B", "type": "rect", "width": 50, "height": 50}],
+            connections=[{"source_id": existing_id, "source_ref": "B", "target_ref": "B"}],
+        )
+    assert excinfo.value.to_dict()["errors"][0]["code"] == "ambiguous_endpoint"
+
+
+def test_connectors_created_in_the_same_call_follow_their_targets(
+    api: AgentAPI, window: Any
+) -> None:
+    result = api.create_objects(
+        items=[
+            {"ref": "A", "type": "rect", "x": 0, "y": 0, "width": 100, "height": 100},
+            {"ref": "B", "type": "rect", "x": 400, "y": 0, "width": 100, "height": 100},
+        ],
+        connections=[
+            {
+                "source_ref": "A",
+                "target_ref": "B",
+                "source_anchor": "right",
+                "target_anchor": "left",
+            }
+        ],
+    )
+    conn_id = result["connectors"][0]["id"]
+    before_bbox = list(result["connectors"][0]["bbox"])
+    b_id = result["refs"]["B"]
+    api.move_objects([{"id": b_id, "dx": 0, "dy": 300}])
+
+    from app.graphics.routing import resolved_bounding_box
+
+    document = window.scene.document
+    after_bbox = list(resolved_bounding_box(document, document.object_by_id(conn_id)))
+    assert after_bbox != before_bbox
 
 
 # --------------------------------------------------------------------------
@@ -550,7 +794,7 @@ def test_direct_model_mutation_is_never_needed(api: AgentAPI, window: Any) -> No
     document.add_object(RectObject(id=document.new_id()))
     baseline = document.revision
     oid = document.objects[-1].id
-    api.update_objects([{"id": oid, "set": {"opacity": 0.25}}])
+    api.update_objects([{"id": oid, "opacity": 0.25}])
     assert document.revision > baseline
     assert window.scene.item_for(document.object_by_id(oid)).opacity() == pytest.approx(0.25)
 
@@ -660,3 +904,99 @@ def test_mask_job_lifecycle_with_a_stubbed_engine(
 
     window.undo_stack.undo()
     assert window.scene.document.object_by_id(oid).mask_src is None
+
+
+# --------------------------------------------------------------------------
+# エラー面の誤誘導防止（レビュー指摘の回帰）
+# --------------------------------------------------------------------------
+
+
+def test_legacy_call_with_only_the_old_argument_is_guided(api: AgentAPI) -> None:
+    """旧引数名**だけ**を送るのが、古い API を覚えたエージェントの唯一の呼び方。
+
+    items が必須位置引数のままだと素の TypeError に潰れ、corrected_call が届かない。
+    """
+    with pytest.raises(AgentError) as excinfo:
+        api.create_objects(objects=[{"type": "rect", "width": 10, "height": 10}])
+    assert excinfo.value.code == "renamed_argument"
+    assert excinfo.value.extra["corrected_call"]["tool"] == "create_objects"
+
+
+def test_update_objects_rename_note_mentions_the_flattened_element(api: AgentAPI) -> None:
+    """引数名だけ直しても 2 往復目が legacy_shape で失敗するので、note が要素の形も言う。"""
+    with pytest.raises(AgentError) as excinfo:
+        api.update_objects(updates=[{"id": 1, "set": {"fill": "#ff0000"}}])
+    note = excinfo.value.extra["corrected_call"]["note"]
+    assert "set" in note and "フラット" in note
+
+
+def test_connect_objects_refs_point_at_create_objects(api: AgentAPI) -> None:
+    """connect_objects に ref を宣言する場所は無い。「items に宣言しろ」は存在しない道。"""
+    ids = _make_rects(api, 1)
+    with pytest.raises(AgentError) as excinfo:
+        api.connect_objects([{"source_ref": "A", "target_id": ids[0]}])
+    first = excinfo.value.extra["errors"][0]
+    assert first["code"] == "ref_not_supported"
+    assert first["corrected_call"]["tool"] == "create_objects"
+
+
+def test_render_include_as_a_bare_string_is_rejected_readably(api: AgentAPI) -> None:
+    """文字列を渡すと set() が 1 文字ずつに割れ、意味不明な invalid_enum になっていた。"""
+    with pytest.raises(AgentError) as excinfo:
+        api.render(include="objects")
+    assert excinfo.value.code == "type_mismatch"
+    assert "配列" in excinfo.value.message
+
+
+def test_connections_only_call_labels_the_undo_entry_without_zero(
+    api: AgentAPI, window: Any
+) -> None:
+    ids = _make_rects(api, 2)
+    api.create_objects([], connections=[{"source_id": ids[0], "target_id": ids[1]}])
+    assert "0 個作成" not in window.undo_stack.undoText()
+    assert "コネクタ 1 本" in window.undo_stack.undoText()
+
+
+# --------------------------------------------------------------------------
+# 書き出し先の発見性（エージェントが env を変えられないことが前提）
+# --------------------------------------------------------------------------
+
+
+def test_export_file_relative_path_lands_in_the_default_export_dir(
+    api: AgentAPI, tmp_path: Path
+) -> None:
+    """何も知らないエージェントが `path="fig.svg"` と書くだけで通ること。"""
+    _make_rects(api, 1)
+    result = api.export_file(kind="svg", path="fig.svg")
+    written = Path(result["path"])
+    assert written.exists() and written.stat().st_size > 0
+    assert written.parent == Path(api.describe_state()["paths"]["default_export_dir"])
+    written.unlink()
+
+
+def test_describe_state_discloses_where_it_can_write(api: AgentAPI) -> None:
+    """最初の失敗の前に「どこへ書けるか」が引けること。"""
+    paths_info = api.describe_state()["paths"]
+    assert Path(paths_info["default_export_dir"]).is_dir()
+    assert paths_info["allowed_roots"]
+
+
+def test_path_denied_offers_a_relative_path_the_agent_can_actually_use(api: AgentAPI) -> None:
+    """環境変数の案内は動作中プロセスでは実行不能。実際に書ける道を返すこと。"""
+    with pytest.raises(AgentError) as excinfo:
+        api.export_file(kind="svg", path="/etc/charta_denied.svg")
+    extra = excinfo.value.extra
+    assert excinfo.value.code == "path_denied"
+    assert extra["corrected_call"]["arguments"]["path"] == "charta_denied.svg"
+    assert extra["default_export_dir"]
+    assert extra["allowed_roots"]
+
+
+def test_export_file_keeps_text_editable_by_default(api: AgentAPI) -> None:
+    """CLAUDE.md §8: 既定はアウトライン化 OFF（投稿規定が編集可能なテキストを要求する）。"""
+    api.create_objects([{"type": "text", "text": "Editable", "x": 10, "y": 10}])
+    result = api.export_file(kind="svg", path="editable.svg")
+    written = Path(result["path"])
+    svg = written.read_text(encoding="utf-8")
+    written.unlink()
+    assert "<text" in svg, "既定でテキストが <text> として残る（アウトライン化されない）"

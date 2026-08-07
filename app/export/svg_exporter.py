@@ -23,8 +23,9 @@ from xml.sax.saxutils import escape, quoteattr
 from PySide6.QtCore import QRectF
 from PySide6.QtGui import QFont, QFontInfo, QFontMetricsF, QPainterPath
 
-from app.export.text_outline import text_to_path
+from app.export.text_outline import text_to_path, valign_offset
 from app.graphics.arrows import (
+    arrow_visible,
     circle_center_radius,
     open_segment_ends,
     shorten_amount,
@@ -254,12 +255,12 @@ def _render_line(obj: BaseObject) -> str:
     direction = unit_vector((x1, y1), (x2, y2))
     arrow_size = max(float(obj.arrow_size), 0.0)
     lx1, ly1, lx2, ly2 = x1, y1, x2, y2
-    if direction is not None and arrow_size > 0.0:
+    if direction is not None:
         dx, dy = direction
-        if obj.arrow_end != "none":
+        if arrow_visible(obj.arrow_end, arrow_size):
             shorten = shorten_amount(obj.arrow_end, arrow_size)
             lx2, ly2 = x2 - dx * shorten, y2 - dy * shorten
-        if obj.arrow_start != "none":
+        if arrow_visible(obj.arrow_start, arrow_size):
             shorten = shorten_amount(obj.arrow_start, arrow_size)
             lx1, ly1 = x1 + dx * shorten, y1 + dy * shorten
 
@@ -270,26 +271,21 @@ def _render_line(obj: BaseObject) -> str:
         f'{_dash_attr(obj.dash, obj.stroke_width)} stroke-linecap="round"/>'
     )
     parts = [body]
-    if direction is not None and arrow_size > 0.0:
+    if direction is not None:
         dx, dy = direction
-        if obj.arrow_end != "none":
+        if arrow_visible(obj.arrow_end, arrow_size):
             parts.append(
                 _render_arrowhead(
                     x2, y2, dx, dy, obj.arrow_end, arrow_size, obj.stroke, obj.stroke_width
                 )
             )
-        if obj.arrow_start != "none":
+        if arrow_visible(obj.arrow_start, arrow_size):
             parts.append(
                 _render_arrowhead(
                     x1, y1, -dx, -dy, obj.arrow_start, arrow_size, obj.stroke, obj.stroke_width
                 )
             )
     return "".join(parts)
-
-
-# connector には arrow_size フィールドが無いため、矢じり既定サイズを固定する
-# （M6契約 §3: 「arrow_size 相当は既定 12」）。
-_CONNECTOR_ARROW_SIZE = 12.0
 
 
 def _render_connector(document: Document, obj: BaseObject) -> str:
@@ -303,8 +299,8 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
     points = build_routing(src_pt, tgt_pt, obj.routing)
 
     line_points = list(points)
-    arrow_size = _CONNECTOR_ARROW_SIZE
-    if obj.arrow_end != "none":
+    arrow_size = max(float(obj.arrow_size), 0.0)
+    if arrow_visible(obj.arrow_end, arrow_size):
         dx, dy = endpoint_direction(points)
         shorten = shorten_amount(obj.arrow_end, arrow_size)
         if shorten > 0.0:
@@ -320,7 +316,7 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
         f'{_dash_attr(obj.dash, obj.stroke_width)} stroke-linecap="round"/>'
     )
     parts = [body]
-    if obj.arrow_end != "none":
+    if arrow_visible(obj.arrow_end, arrow_size):
         dx, dy = endpoint_direction(points)
         tip_x, tip_y = points[-1]
         parts.append(
@@ -347,10 +343,10 @@ def _build_text_font(obj: BaseObject) -> QFont:
 
 def _render_text(obj: BaseObject, outline_text: bool) -> str:
     font = _build_text_font(obj)
+    rect = QRectF(0.0, 0.0, obj.width, obj.height)
 
     if outline_text:
-        rect = QRectF(0.0, 0.0, obj.width, obj.height)
-        path = text_to_path(obj.text, font, rect, obj.align, bool(obj.underline))
+        path = text_to_path(obj.text, font, rect, obj.align, bool(obj.underline), obj.valign)
         d = qpainterpath_to_svg_path_d(path)
         if not d:
             return _xml_comment("text: empty, skipped")
@@ -360,6 +356,8 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
     # outline_text=True と同じ QFont から QFontMetricsF で px 実寸を導出することで、
     # モデルの point-size をそのまま SVG の user-unit(px) に流用していた旧実装の
     # ずれ（outline/画面/PDF の見た目と不一致）を解消する。
+    # <text> と outline の valign は同じ font・同じ valign_offset() で揃える
+    # （text_to_path と別式を書かないこと。CLAUDE.md 参照）。
     metrics = QFontMetricsF(font)
     # SVG の font-size は **em サイズ**（= 解決後のピクセルサイズ）。
     # `ascent + descent` は行ボックスの高さであって em ではない（Noto Sans CJK では
@@ -368,6 +366,7 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
     font_size_px = float(QFontInfo(font).pixelSize())
     line_spacing = metrics.lineSpacing()
     baseline = metrics.ascent()
+    offset = valign_offset(obj.text, font, rect, obj.valign)
 
     lines = obj.text.split("\n") if obj.text else [""]
     anchor = _ALIGN_ANCHOR.get(obj.align, "start")
@@ -376,7 +375,8 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
     style = ' font-style="italic"' if obj.italic else ""
     decoration = ' text-decoration="underline"' if obj.underline else ""
     tspans = "".join(
-        f'<tspan x="{_fmt(x)}" y="{_fmt(baseline + i * line_spacing)}">{escape(line)}</tspan>'
+        f'<tspan x="{_fmt(x)}" y="{_fmt(baseline + offset + i * line_spacing)}">'
+        f"{escape(line)}</tspan>"
         for i, line in enumerate(lines)
     )
     text_el = (

@@ -55,7 +55,32 @@ charta は研究図用の単ページ・ベクター作図アプリ（ローカ�
 2. `get_scene` で現状を把握（id / 型 / 名前 / bbox / z順 / 選択）。
 3. 変更する: `create_objects` / `update_objects` / `move_objects` / `connect_objects`。
    1 呼び出し = 1 undo エントリ。論理的にひとまとまりの作業は 1 呼び出しにまとめること。
+   **全バッチメソッドの配列引数は `items`、要素はフラット**
+   （`update_objects` の要素は `{"id": 5, "fill": "#ff0000"}` のように直接プロパティを
+   並べる。`{"id":.., "set": {...}}` 形は廃止された）。
+   引数形を忘れたら `describe_schema(method="create_objects")` のように引くこと
+   （バッチ要素の形・実例・廃止された引数名まで機械可読で返る）。
 4. `render_canvas` で確認する。**思った通りに描けたと仮定しないこと。**
+
+## 作る → つなぐは 1 往復で
+`create_objects` の `items` に `"ref": "A"` を付け、同じ呼び出しの `connections` から
+`{"source_ref": "A", "target_ref": "B"}` で参照すると、作成 → id を見る → 接続の
+2 往復が 1 往復になる（戻り値の `refs` に ref -> id が入る）。
+
+## 複合操作は charta_exec で 1 往復
+グリッド配置・一括リスタイルなど**3 手以上の複合操作**は、宣言的ツールを何度も
+往復するより `charta_exec` で Python を 1 回書くほうが速い。名前空間・タイムアウト・
+実例は `describe_schema(method="charta_exec")` で確認できる。
+
+## render_canvas の戻り値は既定で軽い
+既定では `path` / `view` / `warnings` しか返らない（可視オブジェクト全件の bbox である
+`objects` は opt-in）。id とピクセルの対応が要るときだけ `include=["objects"]` を渡すこと。
+
+## 書き出し
+`export_file` の `path` は**相対にする**（`"figure.svg"` など）。保存済みなら
+`<project>/exports/`、未保存ならランタイム配下に置かれる。絶対パスは許可ルートの配下のみで、
+現在の値は `describe_state` の `paths.default_export_dir` / `paths.allowed_roots` で事前に引ける。
+`outline_text` の既定は False（投稿規定が編集可能なテキストを要求するため）。
 
 ## 画像の見方（重要）
 `render_canvas` は PNG を書き出して **ファイルパスを返す**。返ってきた `path` を
@@ -267,8 +292,15 @@ class ChartaConnection:
 _conn = ChartaConnection()
 
 
-def _call(method: str, **params: Any) -> dict[str, Any]:
-    return _conn.call(method, params)
+def _call(_rpc_method: str, /, **params: Any) -> dict[str, Any]:
+    """RPC を 1 本呼ぶ。
+
+    第 1 引数は**位置専用**（`/`）にしてある。普通の引数名にすると、`method` や
+    `params` という名前の RPC 引数を持つツール（`describe_schema(method=...)`）で
+    「got multiple values for argument」になる。位置専用なら **kwargs と
+    構造的に衝突しない。
+    """
+    return _conn.call(_rpc_method, params)
 
 
 # --------------------------------------------------------------------------
@@ -287,11 +319,20 @@ def describe_state() -> dict[str, Any]:
 
 
 @mcp.tool()
-def describe_schema(type: str | None = None) -> dict[str, Any]:  # noqa: A002
+def describe_schema(
+    type: str | None = None, method: str | None = None
+) -> dict[str, Any]:  # noqa: A002
     """全オブジェクト型の**書き込めるキー・型・値域・enum の選択肢・既定値**と、
-    幾何種別の契約（どのキーが真実源か）を返す。セッション開始時に 1 回呼ぶこと。
-    `type` を指定すると 1 型に絞れる。"""
-    return _call("describe_schema", type=type)
+    幾何種別の契約（どのキーが真実源か）、そして**メソッドの引数形**を返す。
+    セッション開始時に 1 回呼ぶこと。
+
+    `type` を指定すると 1 オブジェクト型に絞れる（`methods` は省かれる）。
+    `method` を指定すると 1 メソッドの引数形（バッチ要素の形・実例・廃止された
+    引数名）に絞れる（`object_types` は省かれる）。**メソッドの引数形が分からなく
+    なったら** `describe_schema(method="create_objects")` のように呼ぶこと
+    （`charta_exec` を含む全 RPC メソッドがここで引ける）。両方省略すると
+    全型 + 全メソッド + 落とし穴一覧が返る。"""
+    return _call("describe_schema", type=type, method=method)
 
 
 @mcp.tool()
@@ -326,6 +367,7 @@ def render_canvas(
     max_edge: int = 1024,
     overlay: str = "none",
     transparent: bool = False,
+    include: list[str] | None = None,
 ) -> dict[str, Any]:
     """キャンバスを PNG にして **ファイルパスを返す**（返り値の `path` を読み取りツールで開く）。
 
@@ -336,8 +378,10 @@ def render_canvas(
     - `overlay`: none | labels | boxes | full。どの形が どの id か分からないときは "full"
     - `max_edge` は長辺の画素数（256〜2048、既定 1024）
 
-    戻り値には可視オブジェクト全件の **画像 px の bbox** と、画像 px ↔ アートボード px の
-    変換式が入っているので、オーバーレイ無しでもピクセルと id を対応付けられる。"""
+    戻り値には既定で `path` / `view` / `warnings` しか入らない（レスポンスを小さく保つため）。
+    可視オブジェクト全件の **画像 px の bbox** が要るときだけ `include=["objects"]` を渡すと、
+    `view` の変換式と合わせてオーバーレイ無しでもピクセルと id を対応付けられる。
+    `include=["all"]` で全部、`include=[]` で最小。"""
     return _call(
         "render",
         source=source,
@@ -347,6 +391,7 @@ def render_canvas(
         max_edge=max_edge,
         overlay=overlay,
         transparent=transparent,
+        include=include,
     )
 
 
@@ -360,7 +405,8 @@ def get_svg(outline_text: bool = False, max_bytes: int = 100_000) -> dict[str, A
 
 @mcp.tool()
 def create_objects(
-    objects: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+    connections: list[dict[str, Any]] | None = None,
     insert_at: str = "front",
     select: bool = False,
     undo_label: str | None = None,
@@ -368,17 +414,33 @@ def create_objects(
 ) -> dict[str, Any]:
     """オブジェクトをまとめて作成する（全体で 1 undo エントリ）。
 
-    各要素は `{"type": ..., ...プロパティ}`。型は rect / ellipse / line / arrow /
-    freehand / text / math（image は `place_image`、connector は `connect_objects`）。
+    各要素は `{"type": ..., ...プロパティ}` とフラット。型は rect / ellipse / line /
+    arrow / freehand / text / math（image は `place_image`）。
 
     幾何は型によって違う:
     - box 型（rect/ellipse/text/math/freehand）: x / y / width / height / rotation
     - line / arrow: **p1 と p2**（絶対アートボード px）。x / y は無い
     text と math は width / height を省くと内容に合わせて採寸される。
-    有効なキーは `describe_schema` で確認すること。1 件でも不正なら**何も適用されない**。"""
+
+    **作る → つなぐを 1 往復で**: 要素に `"ref": "A"` を付け、`connections` から
+    `{"source_ref": "A", "target_ref": "B"}` で参照する。端点は `*_id`（既存）と
+    `*_ref`（この呼び出しで作るもの）を混ぜてよい。戻り値の `refs` に ref -> id が入る。
+
+        create_objects(
+          items=[{"ref": "A", "type": "rect", "x": 300, "y": 420, "width": 320, "height": 220},
+                 {"ref": "B", "type": "rect", "x": 1300, "y": 420, "width": 320, "height": 220},
+                 {"type": "text", "x": 300, "y": 420, "width": 320, "height": 220,
+                  "text": "A", "align": "center", "valign": "middle"}],
+          connections=[{"source_ref": "A", "target_ref": "B",
+                        "source_anchor": "right", "target_anchor": "left"}])
+
+    ラベルは矩形と同じ box に置いて `align`/`valign` で寄せると y の手計算が要らない。
+    有効なキーは `describe_schema` で確認すること。items も connections も
+    1 件でも不正なら**何も適用されない**。"""
     return _call(
         "create_objects",
-        objects=objects,
+        items=items,
+        connections=connections,
         insert_at=insert_at,
         select=select,
         undo_label=undo_label,
@@ -388,20 +450,21 @@ def create_objects(
 
 @mcp.tool()
 def update_objects(
-    updates: list[dict[str, Any]],
+    items: list[dict[str, Any]],
     force: bool = False,
     undo_label: str | None = None,
     expect_revision: int | None = None,
 ) -> dict[str, Any]:
     """プロパティをまとめて変更する（全体で 1 undo エントリ）。
 
-    各要素は `{"id": 7, "set": {...}}` または `{"ids": [7, 8], "set": {...}}`。
+    各要素はフラット: `{"id": 7, "fill": "#ff0000"}`。同じ変更を複数へまとめてかける
+    なら `{"ids": [7, 8], "opacity": 0.5}`。
     値は型・値域・enum に照らして検証され、1 件でも不正なら**何も適用されない**
     （エラーには許容値と修正候補が入る）。ロック済みオブジェクトは `force=true` が要る。
     位置を変えたいときは `move_objects` のほうが確実（line/arrow でも正しく動く）。"""
     return _call(
         "update_objects",
-        updates=updates,
+        items=items,
         force=force,
         undo_label=undo_label,
         expect_revision=expect_revision,
@@ -410,7 +473,7 @@ def update_objects(
 
 @mcp.tool()
 def move_objects(
-    moves: list[dict[str, Any]],
+    items: list[dict[str, Any]],
     undo_label: str | None = None,
     expect_revision: int | None = None,
 ) -> dict[str, Any]:
@@ -420,7 +483,7 @@ def move_objects(
     `{"id": 7, "to": [x, y], "anchor": "top_left"|"center"}`。
     box 型は x/y、line/arrow は p1 と p2 を一緒に、connector は固定端点を動かす。"""
     return _call(
-        "move_objects", moves=moves, undo_label=undo_label, expect_revision=expect_revision
+        "move_objects", items=items, undo_label=undo_label, expect_revision=expect_revision
     )
 
 
@@ -440,12 +503,20 @@ def duplicate_objects(
 
 
 @mcp.tool()
-def arrange_objects(ids: list[int], action: str, force: bool = False) -> dict[str, Any]:
+def arrange_objects(
+    ids: list[int], action: str, force: bool = False, relative_to: int | None = None
+) -> dict[str, Any]:
     """整列と等間隔分布。
 
     `action`: left | right | top | bottom | center_h | center_v（2 個以上必要）/
-    distribute_h | distribute_v（3 個以上必要）。コネクタは独立した位置を持たないので対象外。"""
-    return _call("arrange_objects", ids=ids, action=action, force=force)
+    distribute_h | distribute_v（3 個以上必要）。コネクタは独立した位置を持たないので対象外。
+
+    `relative_to` に id を渡すと、そのオブジェクトの辺・中心を基準に `ids` を揃える。
+    基準自身は動かず `moved` にも出ない（`ids` に含めても同じ）。基準ありなら対象 1 個で
+    成立する。例: ラベル 7 を矩形 6 の中心に置く →
+    `arrange_objects(ids=[7], action="center_v", relative_to=6)` と `center_h` の 2 回。
+    分布 (distribute_*) との併用はエラー。"""
+    return _call("arrange_objects", ids=ids, action=action, force=force, relative_to=relative_to)
 
 
 @mcp.tool()
@@ -459,19 +530,23 @@ def order_objects(ids: list[int], action: str, force: bool = False) -> dict[str,
 
 @mcp.tool()
 def connect_objects(
-    connections: list[dict[str, Any]],
+    items: list[dict[str, Any]],
     undo_label: str | None = None,
     expect_revision: int | None = None,
 ) -> dict[str, Any]:
-    """図形どうしを**追従するコネクタ**で結ぶ（接続先を動かすと線も追従する）。
+    """**既存の**図形どうしを追従するコネクタで結ぶ（接続先を動かすと線も追従する）。
 
     各要素は `{"source_id": 3, "target_id": 5, "source_anchor": "right",
-    "target_anchor": "left", "routing": "straight"|"orthogonal", "arrow_end": "triangle"}`。
+    "target_anchor": "left", "routing": "straight"|"orthogonal", "arrow_end": "triangle",
+    "arrow_size": 12}`。
     アンカーは box 型が tl/top/tr/left/center/right/bl/bottom/br、line が start/center/end、
-    共通で "nearest"（既定）。"""
+    共通で "nearest"（既定）。
+
+    これから作る図形も一緒に結ぶなら `create_objects` の `items`（`ref` 付き）+
+    `connections` のほうが 1 往復で済む。"""
     return _call(
         "connect_objects",
-        connections=connections,
+        items=items,
         undo_label=undo_label,
         expect_revision=expect_revision,
     )
@@ -498,12 +573,18 @@ def place_image(
 
 @mcp.tool()
 def export_file(
-    kind: str, path: str, transparent: bool = False, outline_text: bool = True
+    kind: str, path: str, transparent: bool = False, outline_text: bool = False
 ) -> dict[str, Any]:
     """出版品質で書き出す。`kind`: png（高DPIラスター）| pdf（ベクター）| svg（ベクター）。
 
-    `transparent` は png のみ。`outline_text` は pdf / svg で、既定 True
-    （フォント環境に依存せず再現するが、書き出し後にテキスト編集できなくなる）。"""
+    **`path` は相対にするのが確実**（`"figure.svg"` など）。保存済みなら
+    `<project>/exports/`、未保存ならランタイム配下に置かれる。絶対パスは許可ルートの
+    配下のみで、現在の値は `describe_state` の `paths.allowed_roots` /
+    `paths.default_export_dir` で事前に引ける。
+
+    `transparent` は png のみ。`outline_text` は pdf / svg で、**既定 False**
+    （Nature 等の投稿規定が編集可能なテキストを要求するため）。フォント埋め込みを
+    受け付けない入稿先のときだけ True にする（再現性は上がるが編集不能になる）。"""
     return _call(
         "export_file", kind=kind, path=path, transparent=transparent, outline_text=outline_text
     )

@@ -561,3 +561,147 @@ def test_text_bounding_rect_covers_overflowing_ink(qapp: Any) -> None:
     with CanvasScene(doc) as scene:
         item = scene.item_for(obj)
         assert item.boundingRect().contains(item._text_layout_rect())
+
+
+# --------------------------------------------------------------------------
+# valign（縦位置）
+# --------------------------------------------------------------------------
+
+
+def _ink_rows(arr: np.ndarray) -> tuple[int, int]:
+    """アルファ非ゼロ画素が存在する行の [min, max] を返す（存在すること前提）。"""
+    rows = np.where((arr[..., 3] > 0).any(axis=1))[0]
+    assert rows.size > 0, "インクが1ピクセルも描かれていない"
+    return int(rows.min()), int(rows.max())
+
+
+def test_text_valign_default_top_is_pixel_identical_to_before(qapp: Any) -> None:
+    """valign 未指定（既定 "top"）の描画は、valign="top" を明示した場合と厳密に一致する
+    （`valign_offset` は factor==0.0 のとき必ず 0.0 を返すため、既存挙動を変えない）。
+    """
+    obj_default = TextObject(id=1, text="charta", x=0, y=0, width=120, height=80, font_size=20)
+    obj_explicit_top = TextObject(
+        id=2, text="charta", x=0, y=0, width=120, height=80, font_size=20, valign="top"
+    )
+    assert obj_default.valign == "top"
+    arr_default = _render_item(TextItem(obj_default))
+    arr_top = _render_item(TextItem(obj_explicit_top))
+    assert np.array_equal(arr_default, arr_top)
+
+
+def test_text_valign_middle_shifts_ink_down(qapp: Any) -> None:
+    """valign="middle" は valign="top" よりインクの開始行が下にずれる。"""
+    top_obj = TextObject(
+        id=1, text="Ay", x=0, y=0, width=100, height=150, font_size=24, valign="top"
+    )
+    mid_obj = TextObject(
+        id=2, text="Ay", x=0, y=0, width=100, height=150, font_size=24, valign="middle"
+    )
+    top_first, _ = _ink_rows(_render_item(TextItem(top_obj), w=100, h=150))
+    mid_first, _ = _ink_rows(_render_item(TextItem(mid_obj), w=100, h=150))
+    assert mid_first > top_first
+
+
+def test_text_valign_bottom_aligns_last_line_to_box_bottom(qapp: Any) -> None:
+    """valign="bottom" は最終行のインクが箱の下端付近に来る。"""
+    from app.export.text_outline import text_block_height
+    from app.scene.items.text_item import _font_for
+
+    obj = TextObject(
+        id=1, text="Ay", x=0, y=0, width=100, height=150, font_size=24, valign="bottom"
+    )
+    font = _font_for(obj)
+    block_h = text_block_height(obj.text, font, obj.width)
+
+    _, last_row = _ink_rows(_render_item(TextItem(obj), w=100, h=150))
+    # 下端行のインク下端は箱下端近傍（ディセンダ・行高の余白程度の誤差内）。
+    assert obj.height - last_row < block_h
+    assert last_row > obj.height * 0.5
+
+
+def test_text_bounding_rect_covers_ink_for_middle_valign(qapp: Any) -> None:
+    """valign="middle" でも、レイアウトキャッシュキーに valign が入っているため
+    `boundingRect` があふれ分を正しく含む（キャッシュ無効化の担保）。
+    """
+    from app.model.document import Document
+    from app.scene.canvas_scene import CanvasScene
+
+    doc = Document()
+    obj = TextObject(
+        id=doc.new_id(),
+        x=0,
+        y=0,
+        text="gy_,",
+        font_size=60,
+        width=200,
+        height=250,
+        valign="top",
+    )
+    doc.add_object(obj)
+    with CanvasScene(doc) as scene:
+        item = scene.item_for(obj)
+        top_rect = item._text_layout_rect()
+        obj.valign = "middle"
+        middle_rect = item._text_layout_rect()
+        assert middle_rect != top_rect, "valign 変更後にキャッシュが無効化されていない"
+        assert item.boundingRect().contains(middle_rect)
+
+
+def test_commit_text_with_middle_valign_keeps_box_center(window: Any, qapp: Any) -> None:
+    """valign="middle" の箱で編集して高さが縮んでも、箱の垂直中心は不変（1 undo で復元）。"""
+    scene = window.scene
+    stack = window.undo_stack
+
+    obj = TextObject(
+        id=scene.document.new_id(),
+        text="長いテキストです\nさらに長い",
+        x=50,
+        y=50,
+        width=100,
+        height=120,
+        valign="middle",
+        font_size=20,
+    )
+    stack.push(AddObjectCommand(scene.document, obj))
+    item = scene.item_for(obj)
+    idx_before = stack.index()
+
+    old_y, old_height = obj.y, obj.height
+    old_center = old_y + old_height / 2.0
+
+    item.commit_text("短")
+    assert obj.height != old_height, "前提: 高さが変わったこと"
+    new_center = obj.y + obj.height / 2.0
+    assert new_center == pytest.approx(old_center, abs=0.5), "箱の垂直中心が保たれること"
+
+    assert stack.index() == idx_before + 1, "1 undo で戻ること（マクロが1件のままであること）"
+    stack.undo()
+    assert obj.text == "長いテキストです\nさらに長い"
+    assert obj.y == pytest.approx(old_y)
+    assert obj.height == pytest.approx(old_height)
+    stack.redo()
+    assert obj.text == "短"
+    assert obj.y == pytest.approx(new_center - obj.height / 2.0)
+
+
+def test_commit_text_with_top_valign_keeps_y_unchanged(window: Any, qapp: Any) -> None:
+    """valign="top"（既定）では、高さが変わっても y は不変（既存挙動の非破壊）。"""
+    scene = window.scene
+    stack = window.undo_stack
+
+    obj = TextObject(
+        id=scene.document.new_id(),
+        text="長いテキストです\nさらに長い",
+        x=50,
+        y=50,
+        width=100,
+        height=120,
+        valign="top",
+        font_size=20,
+    )
+    stack.push(AddObjectCommand(scene.document, obj))
+    item = scene.item_for(obj)
+
+    item.commit_text("短")
+    assert obj.height != 120, "前提: 高さが変わったこと"
+    assert obj.y == pytest.approx(50.0)

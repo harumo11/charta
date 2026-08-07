@@ -113,7 +113,7 @@ async def run(socket_path: str) -> None:
             await session.call_tool(
                 "create_objects",
                 {
-                    "objects": [
+                    "items": [
                         {
                             "type": "rect",
                             "name": "入力",
@@ -161,7 +161,7 @@ async def run(socket_path: str) -> None:
             await session.call_tool(
                 "connect_objects",
                 {
-                    "connections": [
+                    "items": [
                         {
                             "source_id": rect_a,
                             "target_id": rect_b,
@@ -177,22 +177,64 @@ async def run(socket_path: str) -> None:
         conn_id = connected["created"][0]["id"]
 
         print("\n[6] 接続先を動かすとコネクタが追従する")
-        await session.call_tool("move_objects", {"moves": [{"id": rect_b, "dx": 0, "dy": 260}]})
+        await session.call_tool("move_objects", {"items": [{"id": rect_b, "dx": 0, "dy": 260}]})
         scene = payload(await session.call_tool("get_scene", {"ids": [conn_id]}))
         conn_box = scene["objects"][0]["bbox"]
         check(conn_box[3] > 100, f"コネクタが縦に伸びた（h={conn_box[3]:.0f}）")
 
-        print("\n[7] 幾何種別の罠が actionable なエラーになる")
+        print("\n[7] ref 付き items + connections で「作る→つなぐ」を 1 往復に")
+        combo = payload(
+            await session.call_tool(
+                "create_objects",
+                {
+                    "items": [
+                        {
+                            "ref": "P",
+                            "type": "rect",
+                            "name": "処理",
+                            "x": 120,
+                            "y": 500,
+                            "width": 200,
+                            "height": 120,
+                        },
+                        {
+                            "ref": "Q",
+                            "type": "rect",
+                            "name": "検証",
+                            "x": 460,
+                            "y": 500,
+                            "width": 200,
+                            "height": 120,
+                        },
+                    ],
+                    "connections": [
+                        {
+                            "source_ref": "P",
+                            "target_ref": "Q",
+                            "source_anchor": "right",
+                            "target_anchor": "left",
+                        }
+                    ],
+                },
+            )
+        )
+        check(combo["ok"] is True, "create_objects(items+connections) が成功")
+        check(len(combo["created"]) == 2, "2 個作成された")
+        check(len(combo.get("connectors", [])) == 1, "コネクタも同じ呼び出しでできた")
+        check(set(combo.get("refs", {})) == {"P", "Q"}, "refs が id を解決して返る")
+        print(
+            "     (旧: create→id取得→connect_objects の 2 往復 /" " 新: create_objects 1 回に集約)"
+        )
+
+        print("\n[8] 幾何種別の罠が actionable なエラーになる")
         arrow = payload(
             await session.call_tool(
                 "create_objects",
-                {"objects": [{"type": "arrow", "p1": [480, 290], "p2": [640, 290]}]},
+                {"items": [{"type": "arrow", "p1": [480, 290], "p2": [640, 290]}]},
             )
         )
         arrow_id = arrow["created"][0]["id"]
-        bad = await session.call_tool(
-            "update_objects", {"updates": [{"id": arrow_id, "set": {"x": 40}}]}
-        )
+        bad = await session.call_tool("update_objects", {"items": [{"id": arrow_id, "x": 40}]})
         check(bool(bad.isError), "arrow に x を書くと isError")
         detail = error_payload(bad)
         first = (detail.get("errors") or [{}])[0]
@@ -202,16 +244,33 @@ async def run(socket_path: str) -> None:
             "修正済みの呼び出しが提示される",
         )
 
-        print("\n[8] enum の間違いに候補が付く")
+        print("\n[9] enum の間違いに候補が付く")
         bad_enum = await session.call_tool(
-            "update_objects", {"updates": [{"id": rect_a, "set": {"dash": "dotted"}}]}
+            "update_objects", {"items": [{"id": rect_a, "dash": "dotted"}]}
         )
         first = (error_payload(bad_enum).get("errors") or [{}])[0]
         check(first.get("suggestion") == "dot", "'dotted' → 'dot' を提案")
 
-        print("\n[9] レンダリング（パスを返す・インライン base64 ではない）")
+        print("\n[10] 他型にはあるが connector には無いキーは difflib 候補を出さない")
+        bad_key = await session.call_tool(
+            "update_objects", {"items": [{"id": conn_id, "fill": "#ff0000"}]}
+        )
+        check(bool(bad_key.isError), "connector に fill を書くと isError")
+        first = (error_payload(bad_key).get("errors") or [{}])[0]
+        check(first.get("code") == "key_not_on_type", "コードが key_not_on_type")
+        check("suggestion" not in first, "曖昧な候補は付かない")
+        check("rect" in (first.get("available_on") or []), "実在する型名は分かる")
+
+        print("\n[11] render_canvas は既定で objects（bbox 全件）を返さない")
+        minimal = payload(await session.call_tool("render_canvas", {"max_edge": 640}))
+        check("objects" not in minimal, "既定では objects を含まない")
+        check("warnings" in minimal, "warnings は既定で含まれる")
+
+        print("\n[12] レンダリング（パスを返す・インライン base64 ではない）")
         rendered = payload(
-            await session.call_tool("render_canvas", {"max_edge": 640, "overlay": "full"})
+            await session.call_tool(
+                "render_canvas", {"max_edge": 640, "overlay": "full", "include": ["objects"]}
+            )
         )
         image_path = Path(rendered["path"])
         check(image_path.exists(), f"PNG が生成された（{image_path.name}）")
@@ -228,7 +287,7 @@ async def run(socket_path: str) -> None:
         expected_x = boxes[rect_a]["artboard_bbox"][0] * scale
         check(abs(boxes[rect_a]["image_bbox"][0] - expected_x) < 0.5, "画像 px 換算が一致する")
 
-        print("\n[10] charta_exec（グリッド配置を 1 呼び出しで）")
+        print("\n[13] charta_exec（グリッド配置を 1 呼び出しで）")
         exec_result = payload(
             await session.call_tool(
                 "charta_exec",
@@ -251,7 +310,7 @@ async def run(socket_path: str) -> None:
         check(exec_result["commands_pushed"] == 6, "6 コマンドが実行された")
         check(exec_result["undo_entries_added"] == 1, "6 コマンドが 1 undo エントリにまとまる")
 
-        print("\n[11] exec の失敗はトレースバックで返る")
+        print("\n[14] exec の失敗はトレースバックで返る")
         broken = await session.call_tool("charta_exec", {"source": "doc.nonexistent_thing"})
         check(bool(broken.isError), "isError で返る")
         detail = error_payload(broken)
@@ -260,7 +319,7 @@ async def run(socket_path: str) -> None:
             "AttributeError が伝わる",
         )
 
-        print("\n[12] undo でエージェントの 1 操作がまるごと戻る")
+        print("\n[15] undo でエージェントの 1 操作がまるごと戻る")
         before = payload(await session.call_tool("get_scene", {}))
         undone = payload(await session.call_tool("undo_redo", {"direction": "undo"}))
         after = payload(await session.call_tool("get_scene", {}))
@@ -271,7 +330,7 @@ async def run(socket_path: str) -> None:
         )
         check(after["objects"][0]["id"] == rect_a, "それ以前の作業は残っている")
 
-        print("\n[13] 書き出し")
+        print("\n[16] 書き出し")
         out_dir = Path(tempfile.mkdtemp(prefix="charta_smoke_"))
         for kind, suffix in (("png", ".png"), ("pdf", ".pdf"), ("svg", ".svg")):
             exported = payload(
@@ -281,7 +340,30 @@ async def run(socket_path: str) -> None:
             )
             check(Path(exported["path"]).stat().st_size > 0, f"{kind} を書き出した")
 
-        print("\n[14] 状態の開示")
+        # 相対パスは既定の書き出し先に解決される。**このスクリプトは
+        # CHARTA_AGENT_PATHS で許可を広げているが、実エージェントは動作中プロセスの
+        # env を変えられない**ので、「何も知らなくても書ける」経路を必ず通す。
+        state_paths = payload(await session.call_tool("describe_state", {}))["paths"]
+        check("default_export_dir" in state_paths, "describe_state が書き出し先を開示する")
+        relative = payload(
+            await session.call_tool("export_file", {"kind": "svg", "path": "relative_figure.svg"})
+        )
+        check(
+            Path(relative["path"]).parent == Path(state_paths["default_export_dir"]),
+            "相対パスが default_export_dir に解決される",
+        )
+        check(Path(relative["path"]).stat().st_size > 0, "相対パスで書き出せた")
+
+        denied = error_payload(
+            await session.call_tool("export_file", {"kind": "svg", "path": "/etc/charta_x.svg"})
+        )
+        check(denied["code"] == "path_denied", "許可外は path_denied")
+        check(
+            denied.get("corrected_call", {}).get("arguments", {}).get("path") == "charta_x.svg",
+            "path_denied が相対パスの修正案を返す（env の案内だけで終わらない）",
+        )
+
+        print("\n[17] 状態の開示")
         state = payload(await session.call_tool("describe_state", {}))
         check(state["busy"]["busy"] is False, "busy でない")
         check(state["object_count"] == len(after["objects"]), "オブジェクト数が一致")

@@ -635,3 +635,89 @@ def test_geometry_changed_emit_does_not_write_back_to_model(window: Any) -> None
     stack.push(SetGeometryCommand(scene.document, rect1, new_geom, old_geom))
 
     assert (rect2.x, rect2.y, rect2.width, rect2.height) == snapshot
+
+
+# --------------------------------------------------------------------------
+# arrow_size: 旧固定値 12.0 との等価性・可変化・0 の扱い（line と同一規則）
+# --------------------------------------------------------------------------
+
+
+def _connector_doc(**conn_kwargs: Any) -> Document:
+    """rect 2 つとそれを結ぶ connector 1 本だけの Document。"""
+    doc = Document()
+    src = RectObject(id=doc.new_id(), x=0.0, y=0.0, width=100.0, height=80.0)
+    tgt = RectObject(id=doc.new_id(), x=300.0, y=0.0, width=100.0, height=80.0)
+    doc.add_object(src)
+    doc.add_object(tgt)
+    doc.add_object(
+        ConnectorObject(
+            id=doc.new_id(),
+            source_id=src.id,
+            target_id=tgt.id,
+            source_anchor="right",
+            target_anchor="left",
+            **conn_kwargs,
+        )
+    )
+    return doc
+
+
+def test_connector_default_arrow_size_matches_legacy_fixed_12(qapp: Any) -> None:
+    """既定値が旧固定値 12.0 と同一 = 既存 project.json の見た目が変わらない。"""
+    implicit = document_to_svg(_connector_doc())
+    explicit = document_to_svg(_connector_doc(arrow_size=12.0))
+    assert implicit == explicit
+
+
+def test_connector_from_dict_without_arrow_size_defaults_to_12() -> None:
+    """arrow_size キーを持たない旧 dict からの読み込み（前方互換）。"""
+    legacy = {
+        "id": 7,
+        "type": "connector",
+        "source_id": 1,
+        "target_id": 2,
+        "arrow_end": "triangle",
+    }
+    conn = ConnectorObject.from_dict(legacy)
+    assert conn.arrow_size == 12.0
+    assert conn.to_dict()["arrow_size"] == 12.0
+
+
+def test_connector_arrow_size_changes_svg_arrowhead_geometry(qapp: Any) -> None:
+    small = document_to_svg(_connector_doc(arrow_size=12.0))
+    large = document_to_svg(_connector_doc(arrow_size=24.0))
+    assert small != large, "arrow_size should reach the SVG output"
+    assert small.count("<path") == large.count("<path")
+
+
+def test_connector_arrow_size_zero_omits_arrowhead_in_svg_like_line(qapp: Any) -> None:
+    """size 0 は line と同じく「描かない・短縮しない」。"""
+    zero = document_to_svg(_connector_doc(arrow_size=0.0))
+    none_end = document_to_svg(_connector_doc(arrow_end="none"))
+    assert zero == none_end
+
+
+def test_connector_arrow_size_zero_paints_without_crash(window: Any) -> None:
+    rect1 = _add_rect(window, 0.0, 0.0)
+    rect2 = _add_rect(window, 300.0, 0.0)
+    conn = _add_connector(window, rect1, rect2, arrow_size=0.0)
+    item = window.scene.item_for(conn)
+    assert item is not None
+    assert item.boundingRect().isValid()
+
+
+def test_connector_bounding_rect_grows_with_arrow_size(window: Any) -> None:
+    rect1 = _add_rect(window, 0.0, 0.0)
+    rect2 = _add_rect(window, 300.0, 0.0)
+    conn = _add_connector(window, rect1, rect2, arrow_size=12.0)
+    item = window.scene.item_for(conn)
+    small = item.boundingRect()
+    small_shape = item.shape().boundingRect()
+
+    item.prepareGeometryChange()
+    conn.arrow_size = 40.0
+    large = item.boundingRect()
+    large_shape = item.shape().boundingRect()
+
+    assert large.width() > small.width()
+    assert large_shape.width() > small_shape.width()

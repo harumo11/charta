@@ -172,6 +172,7 @@ myproject/
 | `bold`, `italic`, `underline` | bool | — |
 | `color` | str | 文字色 |
 | `align` | str | "left"/"center"/"right" |
+| `valign` | str | "top"/"middle"/"bottom"（既定 "top"。vertical-align 語彙。align が CSS 語彙のため "center" は使わず、取り違えを避ける） |
 
 **math**（数式）
 | フィールド | 型 | 説明 |
@@ -360,10 +361,31 @@ printf '{"jsonrpc":"2.0","id":1,"method":"describe_state","params":{}}\n' \
   | nc -U $XDG_RUNTIME_DIR/charta/<pid>.sock
 ```
 
+### 引数形の統一と往復削減（2026-08-07、破壊的変更）
+
+外部エージェントが実際にこの API で図を描いたところ、**11 RPC 中 3 回が引数形の取り違えによる往復**だった。その実測に基づく改修:
+
+- **全バッチメソッドの配列引数は `items`、要素はフラット**（`create_objects` / `update_objects` / `move_objects` / `connect_objects`）。`update_objects` の `{id, set: {...}}` は廃止。旧引数名で呼ぶと `renamed_argument`、旧要素形なら `legacy_shape` が `corrected_call` 付きで返る。**`items` は既定 `None`** にしてある — 必須位置引数のままだと「旧引数名だけを送る」という現実の呼び方が素の `TypeError` に潰れ、用意した誘導が届かないため。
+- **「作る → つなぐ」は 1 往復**: `create_objects(items=[{"ref": "A", ...}], connections=[{"source_ref": "A", "target_ref": "B"}])`。検証は items も connections も全件先行（不変条件 3）、適用は 1 マクロ（不変条件 2）。`connect_objects` は `_plan_connections` / `_apply_connections` を共有する薄いメソッド。
+- **`render` の既定を軽く**: `path` / `view` / `warnings` のみ。可視オブジェクト全件の bbox は `include=["objects"]` で opt-in。
+- **エラーが誤誘導しないこと**を最優先する。他の型に実在するキーには difflib の曖昧候補を出さず `key_not_on_type` で「持っている型」を返す（近い名前を正解と信じて再送 → また失敗、という往復を生むため）。`corrected_call` が実シグネチャに通ることは `tests/test_agent_methods.py::test_corrected_calls_bind_to_the_real_signature` が恒久的に守る。
+
+### メソッド引数スキーマと発見性（`app/agent/methods.py`、2026-08-07 追加）
+
+`describe_schema` はオブジェクトのプロパティしか返さず、メソッドの引数形（バッチ
+要素はフラットか・配列引数の名前・廃止された引数名）が機械可読で引けなかったのが
+実地の往復増加の原因だった。`app/agent/methods.py`（Qt 非依存。`app/agent/api.py`
+を import しない——`schema.py` と同じ循環回避の向き）に `METHOD_SPECS` として
+全 RPC メソッド（`charta_exec` を含む）の要約・バッチ要素の形・実例・廃止された
+引数名をまとめ、`AgentAPI.describe_schema(type=None, method=None)` の `method` 引数
+で 1 メソッドに絞って引けるようにした。`describe_state` の `capabilities.exec` は
+`charta_exec` の名前空間・タイムアウトを開示する。詳細は
+`.claude/working/architecture/agent.md`「## メソッド引数スキーマ」を参照。
+
 ### 検証
 
 ```bash
-uv run pytest                                  # test_agent_{schema,render,api,host}.py
+uv run pytest                                  # test_agent_{schema,methods,render,api,host}.py
 QT_QPA_PLATFORM=offscreen uv run --group agent python scripts/smoke_agent.py   # 実 MCP で E2E
 uv run python scripts/gen_arch_index.py --check                                 # 索引の陳腐化
 ```

@@ -581,3 +581,193 @@ def test_font_pixel_size_is_device_independent(qapp: Any) -> None:
     printer_painter.end()
 
     assert on_image == on_printer == QFontInfo(font).pixelSize()
+
+
+# --------------------------------------------------------------------------
+# valign（縦位置）: 画面 / SVG <text> / SVG outline / PDF の 4 経路一致
+# --------------------------------------------------------------------------
+
+
+def _valign_svg_doc(
+    text: str, valign: str, height: float = 250.0, font_size: float = 28.0
+) -> Document:
+    """valign 検証専用の、テキスト 1 個だけの Document（背の高い箱）。"""
+    artboard = Artboard(
+        width_px=400, height_px=int(height) + 40, physical=Physical(width_mm=80.0, target_dpi=200)
+    )
+    doc = Document(artboard=artboard)
+    doc.add_object(
+        TextObject(
+            id=doc.new_id(),
+            x=10.0,
+            y=10.0,
+            width=300.0,
+            height=height,
+            text=text,
+            valign=valign,
+            font_size=font_size,
+        )
+    )
+    return doc
+
+
+def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
+    """折返し・改行混在で `text_block_height` == 実レイアウトの行数 × lineSpacing。"""
+    from app.export.text_outline import _layout_lines, text_block_height
+    from app.scene.items.text_item import _font_for
+
+    obj = TextObject(id=0, font_size=24.0)
+    font = _font_for(obj)
+    metrics = QFontMetricsF(font)
+
+    text = "line one that is somewhat long and will wrap around\nsecond paragraph\nthird"
+    wrap_width = 150.0
+    lines, _metrics, total = _layout_lines(text, font, wrap_width)
+    assert len(lines) >= 3, "前提: 折返しで複数行になっていること"
+    expected = len(lines) * metrics.lineSpacing()
+
+    assert text_block_height(text, font, wrap_width) == pytest.approx(expected)
+    assert total == pytest.approx(expected), "空行が無ければ総送り == 行数 × lineSpacing"
+
+
+def test_text_block_height_counts_blank_lines(qapp: Any) -> None:
+    """空行はグリフを持たないが縦位置は占める。行数で数えると valign がずれる。"""
+    from app.export.text_outline import _layout_lines, text_block_height
+    from app.scene.items.text_item import _font_for
+
+    obj = TextObject(id=0, font_size=24.0)
+    font = _font_for(obj)
+    metrics = QFontMetricsF(font)
+
+    text = "Hello\n\nWorld"
+    wrap_width = 400.0
+    lines, _metrics, _total = _layout_lines(text, font, wrap_width)
+    assert len(lines) == 2, "前提: 空行は描画対象の行としては落ちる"
+
+    # 実際には 3 行スロット分の高さを占める。
+    assert text_block_height(text, font, wrap_width) == pytest.approx(3 * metrics.lineSpacing())
+
+
+def test_valign_bottom_keeps_text_with_blank_lines_inside_the_box(qapp: Any) -> None:
+    """空行入りテキストでも bottom で箱からはみ出さない（実地のはみ出しバグの回帰）。"""
+    from PySide6.QtCore import QRectF
+
+    from app.export.text_outline import text_block_height, valign_offset
+    from app.scene.items.text_item import _font_for
+
+    obj = TextObject(id=0, font_size=16.0)
+    font = _font_for(obj)
+    rect = QRectF(0.0, 0.0, 120.0, 200.0)
+    text = "Hello\n\nWorld"
+
+    offset = valign_offset(text, font, rect, "bottom")
+    block = text_block_height(text, font, rect.width())
+
+    assert offset + block == pytest.approx(rect.height()), "ブロック下端が箱の下端に一致する"
+    assert offset >= 0.0
+
+
+def test_svg_text_element_baseline_matches_valign_offset(qapp: Any) -> None:
+    """非アウトライン `<text>` の最初の `<tspan>` の y が ascent + valign_offset と一致する。"""
+    from PySide6.QtCore import QRectF
+
+    from app.export.text_outline import valign_offset
+
+    doc = _valign_svg_doc("Hello valign", "middle", height=250.0)
+    text_obj = doc.objects[0]
+
+    font = _build_text_font(text_obj)
+    metrics = QFontMetricsF(font)
+    rect = QRectF(0.0, 0.0, text_obj.width, text_obj.height)
+    offset = valign_offset(text_obj.text, font, rect, text_obj.valign)
+    assert offset > 0.0, "前提: middle でオフセットが生じていること"
+    expected_y0 = metrics.ascent() + offset
+
+    svg = document_to_svg(doc, outline_text=False)
+    root = ET.fromstring(svg)
+    text_el = root.find(".//svg:text", _NS)
+    assert text_el is not None
+    tspan0 = text_el.find("svg:tspan", _NS)
+    assert tspan0 is not None
+    y0 = float(tspan0.get("y"))
+    assert y0 == pytest.approx(expected_y0, abs=0.01)
+
+
+def test_svg_outline_and_text_element_agree_on_valign(qapp: Any) -> None:
+    """同じ text を outline_text=True/False で出しても、valign による移動量が一致する。
+
+    Qt の `QSvgRenderer` はこちらが生成した `<text>`/`<tspan>` を安定して再現しない
+    （CLAUDE.md §4: Qt の SVG テキスト経路は不安定という前提そのもの）ため、
+    ラスタライズして比較するのではなく、両分岐が生成する幾何値を直接比較する。
+    絶対位置（ascent と実際のグリフ ink top の差、いわゆる cap-height の余白）は
+    経路によらず一定なので、それを打ち消すため valign="top"（offset==0）を基準とした
+    **差分**（bottom 移動量）で比較する。
+    """
+    from PySide6.QtCore import QRectF
+
+    from app.export.text_outline import text_to_path
+
+    def _outline_top(valign: str) -> float:
+        doc = _valign_svg_doc("Hello valign", valign, height=250.0)
+        obj = doc.objects[0]
+        font = _build_text_font(obj)
+        rect = QRectF(0.0, 0.0, obj.width, obj.height)
+        path = text_to_path(obj.text, font, rect, obj.align, valign=obj.valign)
+        return path.boundingRect().top()
+
+    def _text_baseline(valign: str) -> float:
+        doc = _valign_svg_doc("Hello valign", valign, height=250.0)
+        svg = document_to_svg(doc, outline_text=False)
+        root = ET.fromstring(svg)
+        tspan0 = root.find(".//svg:text/svg:tspan", _NS)
+        assert tspan0 is not None
+        return float(tspan0.get("y"))
+
+    outline_delta = _outline_top("bottom") - _outline_top("top")
+    text_delta = _text_baseline("bottom") - _text_baseline("top")
+
+    assert outline_delta == pytest.approx(text_delta, abs=0.5), (
+        f"outline と <text> とで valign による移動量が食い違う: "
+        f"outline={outline_delta:.2f} text={text_delta:.2f}"
+    )
+
+
+def test_png_export_matches_screen_for_middle_valign(qapp: Any) -> None:
+    """valign="middle" でも、画面描画(render_document)と PNG 書き出しが一致する。"""
+    from app.agent.render import render_document
+    from app.export.png_exporter import render_artboard_image
+
+    doc_screen = _valign_svg_doc("Ay charta", "middle", height=180.0)
+    doc_png = _valign_svg_doc("Ay charta", "middle", height=180.0)
+
+    w_px, h_px = artboard_pixel_size(doc_png)
+    screen_img, _ = render_document(doc_screen, max_edge=max(w_px, h_px))
+    png_img = render_artboard_image(doc_png)
+
+    screen_bbox = _ink_bbox_normalized(screen_img)
+    png_bbox = _ink_bbox_normalized(png_img)
+    assert screen_bbox is not None
+    assert png_bbox is not None
+    deviation = max(abs(a - b) for a, b in zip(screen_bbox, png_bbox, strict=True)) * w_px
+    assert deviation < 3.0, f"画面と PNG のずれが大きい(valign): {deviation:.2f}px"
+
+
+@pytest.mark.parametrize("outline_text", [True, False])
+def test_pdf_text_position_matches_png_for_valign(
+    qapp: Any, tmp_path: Path, outline_text: bool
+) -> None:
+    """valign="middle" の背の高い箱でも、PDF と PNG のインク位置が一致する
+    （4経路一致の最終ゲート）。
+    """
+    from app.export.png_exporter import render_artboard_image
+
+    doc_png = _valign_svg_doc("Hello valign", "middle", height=180.0)
+    doc_pdf = _valign_svg_doc("Hello valign", "middle", height=180.0)
+
+    png = _ink_bbox_normalized(render_artboard_image(doc_png))
+    pdf = _pdf_ink_bbox(doc_pdf, tmp_path / f"valign_{outline_text}.pdf", outline_text)
+    assert png is not None
+    assert pdf is not None, "PDF にテキストが 1 ピクセルも描かれていない"
+    w_px, _h_px = artboard_pixel_size(doc_png)
+    deviation = max(abs(a - b) for a, b in zip(png, pdf, strict=True)) * w_px
+    assert deviation < 3.0, f"PNG と PDF のずれが大きい(valign): {deviation:.2f}px"

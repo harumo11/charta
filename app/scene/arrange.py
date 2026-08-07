@@ -16,23 +16,38 @@ from app.model.objects import geometry_kind
 Box = tuple[float, float, float, float]  # (x, y, w, h)
 
 
-def align_positions(boxes: dict[int, Box], mode: str) -> dict[int, tuple[float, float]]:
-    """選択全体の基準に各 box を整列させた新しい (x, y) を返す。
+def _union_box(boxes: list[Box]) -> Box:
+    """複数 box の外接矩形。"""
+    xs_min = min(x for x, _y, _w, _h in boxes)
+    xs_max = max(x + w for x, _y, w, _h in boxes)
+    ys_min = min(y for _x, y, _w, _h in boxes)
+    ys_max = max(y + h for _x, y, _w, h in boxes)
+    return (xs_min, ys_min, xs_max - xs_min, ys_max - ys_min)
+
+
+def align_positions(
+    boxes: dict[int, Box], mode: str, reference: Box | None = None
+) -> dict[int, tuple[float, float]]:
+    """基準に各 box を整列させた新しい (x, y) を返す。
 
     mode: "left"/"right"/"top"/"bottom"/"center_h"/"center_v"
-        - left/right/top/bottom: 選択全体の外接矩形の該当端に揃える。
-        - center_h: 選択全体の水平中心（x 方向の中心）に各 box の水平中心を揃える。
-        - center_v: 選択全体の垂直中心（y 方向の中心）に各 box の垂直中心を揃える。
+        - left/right/top/bottom: 基準矩形の該当端に揃える。
+        - center_h: 基準矩形の水平中心（x 方向の中心）に各 box の水平中心を揃える。
+        - center_v: 基準矩形の垂直中心（y 方向の中心）に各 box の垂直中心を揃える。
+
+    reference: None なら従来どおり `boxes` 全体の外接矩形を基準にする（GUI の
+        「選択を整列」）。Box を与えると、その矩形の辺・中心を基準にする
+        （エージェントの `arrange_objects(relative_to=...)`）。基準自身は
+        `boxes` に含めないこと — 呼び出し側で除外する契約。
     """
     if not boxes:
         return {}
 
-    xs_min = min(x for x, _y, _w, _h in boxes.values())
-    xs_max = max(x + w for x, _y, w, _h in boxes.values())
-    ys_min = min(y for _x, y, _w, _h in boxes.values())
-    ys_max = max(y + h for _x, y, _w, h in boxes.values())
-    center_x = (xs_min + xs_max) / 2.0
-    center_y = (ys_min + ys_max) / 2.0
+    ref = reference if reference is not None else _union_box(list(boxes.values()))
+    xs_min, ys_min = ref[0], ref[1]
+    xs_max, ys_max = ref[0] + ref[2], ref[1] + ref[3]
+    center_x = xs_min + ref[2] / 2.0
+    center_y = ys_min + ref[3] / 2.0
 
     result: dict[int, tuple[float, float]] = {}
     for oid, (x, y, w, h) in boxes.items():
