@@ -328,10 +328,10 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
 
 
 def _build_text_font(obj: BaseObject) -> QFont:
-    """SVG 出力用の `QFont`（`text_item._font_for` と同じくピクセル実寸に固定する）。
+    """SVG 出力用の `QFont`（`text_item.font_for` と同じくピクセル実寸に固定する）。
 
     ポイントサイズのままだと描画デバイスの DPI で解決されてしまうため、
-    デバイス非依存の解決結果を焼き込む（理由は `text_item._font_for` の docstring）。
+    デバイス非依存の解決結果を焼き込む（理由は `text_item.font_for` の docstring）。
     """
     font = QFont(obj.font_family)
     font.setPointSizeF(max(float(obj.font_size), 1.0))

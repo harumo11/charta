@@ -101,6 +101,95 @@ def distribute_positions(boxes: dict[int, Box], axis: str) -> dict[int, tuple[fl
     return result
 
 
+#: `layout_positions` の並べ方。
+LAYOUT_MODES: tuple[str, ...] = ("row", "column", "grid")
+#: `layout_positions` の直交方向の揃え方。
+LAYOUT_ALIGNS: tuple[str, ...] = ("start", "center", "end")
+
+
+def _aligned_offset(extent: float, cell: float, align: str) -> float:
+    """`cell` の中で `extent` を `align` に従って配置したときのオフセット。"""
+    if align == "start":
+        return 0.0
+    if align == "center":
+        return (cell - extent) / 2.0
+    if align == "end":
+        return cell - extent
+    raise ValueError(f"unknown layout align: {align!r}")
+
+
+def layout_positions(
+    boxes: dict[int, Box],
+    order: list[int],
+    mode: str,
+    gap: float = 40.0,
+    gap_y: float | None = None,
+    columns: int | None = None,
+    align: str = "start",
+    origin: tuple[float, float] | None = None,
+) -> dict[int, tuple[float, float]]:
+    """サイズと間隔から**座標を作って**並べた新しい (x, y) を返す。
+
+    `align_positions` / `distribute_positions` が「既に置かれている箱を揃える」
+    のに対し、こちらは「サイズ + gap + align から座標を計算する」。行・列・
+    グリッドに並べ直すのに、呼び出し側が bbox 算術をする必要がなくなる。
+
+    - `order`: **並ぶ順**。`boxes` のキーをこの順に消費する（空間順ではなく
+      呼び出し側が意図した順。`distribute_positions` が中心座標でソートするのとは
+      逆の設計で、エージェントが渡した ids の順を尊重するためこうしてある）。
+    - `mode`: "row"（横並び）/ "column"（縦並び）/ "grid"（`columns` 個ずつ折り返す）。
+    - `gap`: 主方向の間隔。`gap_y` は grid の行間（None なら `gap`）。
+    - `align`: 直交方向の揃え。row なら縦、column なら横、grid ならセル内の両方向。
+    - `origin`: 並べ始める左上。None なら現在の外接矩形の左上（その場で整列される）。
+
+    grid の列幅は「その列の最大幅」、行高は「その行の最大高」にする（一律だと
+    サイズ不揃いのときに図が壊れて見える）。サイズは変更しない（位置だけ）。
+    """
+    if mode not in LAYOUT_MODES:
+        raise ValueError(f"unknown layout mode: {mode!r}")
+    if align not in LAYOUT_ALIGNS:
+        raise ValueError(f"unknown layout align: {align!r}")
+    if not boxes:
+        return {}
+    ordered_ids = [oid for oid in order if oid in boxes]
+    if not ordered_ids:
+        return {}
+    if mode == "grid":
+        if columns is None or columns < 1:
+            raise ValueError("layout_positions(mode='grid') requires columns >= 1")
+    else:
+        columns = len(ordered_ids) if mode == "row" else 1
+
+    start_x, start_y = (
+        origin if origin is not None else _union_box([boxes[oid] for oid in ordered_ids])[:2]
+    )
+    step_y = gap if gap_y is None else gap_y
+
+    # 行ごとに分割してから、列幅・行高を先に確定させる（ラギッドなグリッドを避ける）。
+    rows: list[list[int]] = [
+        ordered_ids[i : i + columns] for i in range(0, len(ordered_ids), columns)
+    ]
+    col_widths: list[float] = []
+    for col in range(columns):
+        widths = [boxes[row[col]][2] for row in rows if col < len(row)]
+        col_widths.append(max(widths) if widths else 0.0)
+    row_heights: list[float] = [max(boxes[oid][3] for oid in row) for row in rows]
+
+    result: dict[int, tuple[float, float]] = {}
+    y = start_y
+    for r, row in enumerate(rows):
+        x = start_x
+        for c, oid in enumerate(row):
+            _ox, _oy, w, h = boxes[oid]
+            result[oid] = (
+                x + _aligned_offset(w, col_widths[c], align),
+                y + _aligned_offset(h, row_heights[r], align),
+            )
+            x += col_widths[c] + gap
+        y += row_heights[r] + step_y
+    return result
+
+
 def clone_object_dicts(
     objs_dicts: list[dict[str, Any]],
     new_id_iter: Callable[[], int] | Iterator[int],

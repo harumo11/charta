@@ -165,7 +165,7 @@ class MathItem(BoxItem):
         painter.drawRect(rect)
         # フォントはピクセル実寸に固定する。painter 既定のポイントサイズのままだと
         # 描画デバイスの DPI で解決され、PDF（1200dpi）では 12.5 倍になって
-        # ページ外へ飛ぶ（`text_item._font_for` の docstring 参照）。
+        # ページ外へ飛ぶ（`text_item.font_for` の docstring 参照）。
         font = QFont(painter.font())
         font.setPixelSize(max(QFontInfo(font).pixelSize(), 1))
         painter.setFont(font)

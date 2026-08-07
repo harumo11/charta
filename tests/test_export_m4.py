@@ -539,7 +539,7 @@ def test_pdf_text_position_matches_png(qapp: Any, tmp_path: Path, outline_text: 
     `QFont.setPointSizeF` はポイントを**描画デバイスの DPI** で px 解決する。
     `QPrinter(HighResolution)` は 1200dpi なので、画面/PNG（96dpi）の 12.5 倍になり、
     `outline_text=False` ではテキストがページ外へ飛んで **PDF が真っ白**になっていた。
-    `_font_for` / `_build_text_font` が `setPixelSize` で実寸を焼き込むことで防ぐ。
+    `font_for` / `_build_text_font` が `setPixelSize` で実寸を焼き込むことで防ぐ。
     """
     from app.export.png_exporter import render_artboard_image
 
@@ -559,13 +559,13 @@ def test_pdf_text_position_matches_png(qapp: Any, tmp_path: Path, outline_text: 
 
 
 def test_font_pixel_size_is_device_independent(qapp: Any) -> None:
-    """`_font_for` が返すフォントは、どの描画デバイスでも同じピクセルサイズになる。"""
+    """`font_for` が返すフォントは、どの描画デバイスでも同じピクセルサイズになる。"""
     from PySide6.QtGui import QFont, QImage, QPainter
     from PySide6.QtPrintSupport import QPrinter
 
-    from app.scene.items.text_item import _font_for
+    from app.scene.items.text_item import font_for
 
-    font = _font_for(TextObject(id=0, text="x", font_size=30.0))
+    font = font_for(TextObject(id=0, text="x", font_size=30.0))
 
     image = QImage(60, 20, QImage.Format.Format_ARGB32)
     image_painter = QPainter(image)
@@ -614,10 +614,10 @@ def _valign_svg_doc(
 def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
     """折返し・改行混在で `text_block_height` == 実レイアウトの行数 × lineSpacing。"""
     from app.export.text_outline import _layout_lines, text_block_height
-    from app.scene.items.text_item import _font_for
+    from app.scene.items.text_item import font_for
 
     obj = TextObject(id=0, font_size=24.0)
-    font = _font_for(obj)
+    font = font_for(obj)
     metrics = QFontMetricsF(font)
 
     text = "line one that is somewhat long and will wrap around\nsecond paragraph\nthird"
@@ -633,10 +633,10 @@ def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
 def test_text_block_height_counts_blank_lines(qapp: Any) -> None:
     """空行はグリフを持たないが縦位置は占める。行数で数えると valign がずれる。"""
     from app.export.text_outline import _layout_lines, text_block_height
-    from app.scene.items.text_item import _font_for
+    from app.scene.items.text_item import font_for
 
     obj = TextObject(id=0, font_size=24.0)
-    font = _font_for(obj)
+    font = font_for(obj)
     metrics = QFontMetricsF(font)
 
     text = "Hello\n\nWorld"
@@ -653,10 +653,10 @@ def test_valign_bottom_keeps_text_with_blank_lines_inside_the_box(qapp: Any) -> 
     from PySide6.QtCore import QRectF
 
     from app.export.text_outline import text_block_height, valign_offset
-    from app.scene.items.text_item import _font_for
+    from app.scene.items.text_item import font_for
 
     obj = TextObject(id=0, font_size=16.0)
-    font = _font_for(obj)
+    font = font_for(obj)
     rect = QRectF(0.0, 0.0, 120.0, 200.0)
     text = "Hello\n\nWorld"
 

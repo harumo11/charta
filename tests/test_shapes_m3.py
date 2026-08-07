@@ -527,9 +527,9 @@ def test_text_descender_is_not_clipped_by_a_short_box(qapp: Any) -> None:
     元からクリップしないので、放置すると**画面と書き出しで見た目が食い違う**。
     """
     from app.agent.render import render_document
-    from app.scene.items.text_item import _font_for, default_text_size
+    from app.scene.items.text_item import default_text_size, font_for
 
-    font = _font_for(TextObject(id=0, text="charta_mcp.py", font_size=30))
+    font = font_for(TextObject(id=0, text="charta_mcp.py", font_size=30))
     natural_height = default_text_size("charta_mcp.py", font)[1]
     short = 48.0
     assert short < natural_height, "前提: 箱は自然な行高より低い"
@@ -605,12 +605,12 @@ def test_text_valign_middle_shifts_ink_down(qapp: Any) -> None:
 def test_text_valign_bottom_aligns_last_line_to_box_bottom(qapp: Any) -> None:
     """valign="bottom" は最終行のインクが箱の下端付近に来る。"""
     from app.export.text_outline import text_block_height
-    from app.scene.items.text_item import _font_for
+    from app.scene.items.text_item import font_for
 
     obj = TextObject(
         id=1, text="Ay", x=0, y=0, width=100, height=150, font_size=24, valign="bottom"
     )
-    font = _font_for(obj)
+    font = font_for(obj)
     block_h = text_block_height(obj.text, font, obj.width)
 
     _, last_row = _ink_rows(_render_item(TextItem(obj), w=100, h=150))

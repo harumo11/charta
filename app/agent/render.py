@@ -257,33 +257,17 @@ def object_boxes(
 
 
 def offscreen_warnings(document: Document) -> list[dict[str, Any]]:
-    """アートボードの外に完全に出ているオブジェクト（描いたのに見えない、の主因）。"""
-    artboard = document.artboard
-    aw, ah = float(artboard.width_px), float(artboard.height_px)
-    warnings: list[dict[str, Any]] = []
-    for obj in document.objects:
-        if not obj.visible:
-            continue
-        x, y, w, h = resolved_bounding_box(document, obj)
-        if x + w < 0 or y + h < 0 or x > aw or y > ah:
-            warnings.append(
-                {
-                    "code": "offscreen",
-                    "id": obj.id,
-                    "message": f"オブジェクト {obj.id} ({obj.type}) は"
-                    f" bbox {[x, y, w, h]} でアートボードの外にあり、描画されません",
-                }
-            )
-        elif obj.GEOMETRY == "box" and (w <= 0.0 or h <= 0.0):
-            warnings.append(
-                {
-                    "code": "degenerate",
-                    "id": obj.id,
-                    "message": f"オブジェクト {obj.id} ({obj.type}) は"
-                    f" width={w} height={h} のため不可視です",
-                }
-            )
-    return warnings
+    """「描いたのに意図どおり見えない」の構造化された一覧。
+
+    かつては画面外と退化寸法だけを見ていたが、実際の失敗は重なり・遮蔽・
+    文字あふれ・低コントラスト・小さすぎる文字のほうが多い。判定は
+    `app/agent/diagnose.py` へ移してあり、ここはその全件を返す薄い経路
+    （`render(include=["warnings"])` の中身）。suggestion / corrected_call 付きで
+    欲しい場合は `AgentAPI.critique` を使う。
+    """
+    from app.agent import diagnose
+
+    return diagnose.collect(document)
 
 
 # --------------------------------------------------------------------------

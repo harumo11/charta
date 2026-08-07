@@ -14,34 +14,25 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from app.graphics.boxes import Box, Point
+from app.graphics.boxes import box_center as _box_center
+from app.graphics.boxes import rotate_point as _rotate_point
 from app.model.objects import geometry_kind
 
-Box = tuple[float, float, float, float]  # (x, y, w, h) 軸並行bbox
-Point = tuple[float, float]
-
-
-def _box_center(box: Box) -> Point:
-    x, y, w, h = box
-    return (x + w / 2.0, y + h / 2.0)
-
-
-def _rotate_point(point: Point, center: Point, rotation: float) -> Point:
-    """`point` を `center` まわりに `rotation` 度回転した点を返す（Qt規約: 正=時計回り、y下向き）。
-
-    `rotation == 0.0` は浮動小数誤差回避のため無回転（`point` をそのまま）で返す。
-    """
-    if rotation == 0.0:
-        return point
-    theta = math.radians(rotation)
-    cx, cy = center
-    px, py = point
-    dx = px - cx
-    dy = py - cy
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    rx = cx + dx * cos_t - dy * sin_t
-    ry = cy + dx * sin_t + dy * cos_t
-    return (rx, ry)
+__all__ = [
+    "Box",
+    "Point",
+    "anchor_set_for_object",
+    "anchors_for",
+    "build_routing",
+    "compute_endpoints",
+    "connector_endpoints_from_model",
+    "endpoint_direction",
+    "nearest_anchor_name",
+    "resolve_anchor",
+    "resolved_bounding_box",
+    "set_reference",
+]
 
 
 def anchors_for(

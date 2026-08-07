@@ -28,18 +28,18 @@ from app.scene.items.registry import register_item
 if TYPE_CHECKING:
     from app.model.document import Document
 
-_ALIGN_MAP: dict[str, Qt.AlignmentFlag] = {
+ALIGN_MAP: dict[str, Qt.AlignmentFlag] = {
     "left": Qt.AlignmentFlag.AlignLeft,
     "center": Qt.AlignmentFlag.AlignHCenter,
     "right": Qt.AlignmentFlag.AlignRight,
 }
 
-_MIN_TEXT_WIDTH = 20.0
-_MIN_TEXT_HEIGHT = 20.0
-_TEXT_MARGIN = 8.0
+MIN_TEXT_WIDTH = 20.0
+MIN_TEXT_HEIGHT = 20.0
+TEXT_MARGIN = 8.0
 
 
-def _font_for(obj: BaseObject) -> QFont:
+def font_for(obj: BaseObject) -> QFont:
     """モデルの font_size から `QFont` を組み立てる（**描画デバイスの DPI に依存しない**）。
 
     最後に `setPixelSize` でピクセル実寸に固定するのが要点。ポイントサイズのままだと
@@ -68,8 +68,8 @@ def default_text_size(text: str, font: QFont) -> tuple[float, float]:
     content = text if text else " "
     flags = int(Qt.TextFlag.TextWordWrap)
     rect = metrics.boundingRect(QRectF(0.0, 0.0, 10000.0, 10000.0), flags, content)
-    width = max(rect.width() + _TEXT_MARGIN, _MIN_TEXT_WIDTH)
-    height = max(rect.height() + _TEXT_MARGIN, _MIN_TEXT_HEIGHT)
+    width = max(rect.width() + TEXT_MARGIN, MIN_TEXT_WIDTH)
+    height = max(rect.height() + TEXT_MARGIN, MIN_TEXT_HEIGHT)
     return (width, height)
 
 
@@ -111,9 +111,9 @@ class TextItem(BoxItem):
         cached = self._layout_rect_cache
         if cached is not None and cached[0] == key:
             return cached[1]
-        font = _font_for(obj)
+        font = font_for(obj)
         metrics = QFontMetricsF(font)
-        align = _ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft)
+        align = ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft)
         flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
         rect = metrics.boundingRect(
             QRectF(0.0, 0.0, max(self._w, 1.0), 1_000_000.0), flags, obj.text
@@ -147,17 +147,17 @@ class TextItem(BoxItem):
             return
         color = QColor(self.obj.color) if self.obj.color else QColor(0, 0, 0)
         if self._export_outline:
-            font = _font_for(self.obj)
+            font = font_for(self.obj)
             underline = bool(self.obj.underline)
             path = text_to_path(
                 text, font, rect, self.obj.align, underline=underline, valign=self.obj.valign
             )
             painter.fillPath(path, QBrush(color))
             return
-        font = _font_for(self.obj)
+        font = font_for(self.obj)
         painter.setFont(font)
         painter.setPen(QPen(color))
-        align = _ALIGN_MAP.get(self.obj.align, Qt.AlignmentFlag.AlignLeft)
+        align = ALIGN_MAP.get(self.obj.align, Qt.AlignmentFlag.AlignLeft)
         # TextDontClip: 箱が行高より低いときにディセンダ（`_` や `y` の下）が
         # ピクセル単位で切れるのを防ぐ。アウトライン経路（`text_to_path`、SVG/PDF）は
         # 元からクリップしないので、これを付けないと**画面・PNG と SVG/PDF で
@@ -226,14 +226,14 @@ class TextItem(BoxItem):
             return
         from app.commands.commands import SetGeometryCommand, SetPropertyCommand
 
-        font = _font_for(self.obj)
+        font = font_for(self.obj)
         metrics = QFontMetricsF(font)
-        wrap_width = max(self.obj.width, _MIN_TEXT_WIDTH)
+        wrap_width = max(self.obj.width, MIN_TEXT_WIDTH)
         flags = int(Qt.TextFlag.TextWordWrap)
         rect = metrics.boundingRect(
             QRectF(0.0, 0.0, wrap_width, 1_000_000.0), flags, new_text if new_text else " "
         )
-        new_height = max(rect.height() + _TEXT_MARGIN, _MIN_TEXT_HEIGHT)
+        new_height = max(rect.height() + TEXT_MARGIN, MIN_TEXT_HEIGHT)
         old_height = self.obj.height
 
         undo_stack.beginMacro("edit text")
