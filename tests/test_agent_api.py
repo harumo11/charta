@@ -594,6 +594,68 @@ def test_an_oversized_object_is_shrunk_not_endlessly_nudged(api: AgentAPI, windo
     assert api.critique(checks=["clipped"])["findings"] == []
 
 
+def test_every_suggested_fix_actually_changes_something(api: AgentAPI, window: Any) -> None:
+    """**no-op な修正案を作らない。**
+
+    実機デモで踏んだ無限ループの再現線。`text_overflow(host_shape)` に対して
+    「文字を自然サイズにリサイズ」を返していたが、ラベルは既に自然サイズなので
+    何も変わらず、同じ警告が永久に出続けた。修正案は必ず revision を進めること。
+    """
+    label_id = _autosized_label_overflowing_its_host(api)
+    findings = api.critique(checks=["text_overflow"], ids=[label_id])["findings"]
+    assert findings, "この配置では所見が出るはず"
+    assert findings[0]["kind"] == "host_shape"
+    for finding in findings:
+        call = finding["corrected_call"]
+        before = window.scene.document.revision
+        getattr(api, call["tool"])(**call["arguments"])
+        assert (
+            window.scene.document.revision > before
+        ), f"{finding['code']}({finding.get('kind')}) の修正案が no-op: {call}"
+
+
+def _autosized_label_overflowing_its_host(api: AgentAPI) -> int:
+    """**自然サイズのまま**ラベル先からはみ出しているラベルを作る。
+
+    自然サイズであることが要点。「自然サイズにリサイズ」という修正案が
+    no-op になるのはこの条件のときだけで、実機で踏んだのもこの形だった。
+    """
+    label_id = api.create_objects(
+        [{"type": "text", "text": "この注釈は箱より横に長い", "font_size": 26}]
+    )["created"][0]["id"]
+    bbox = api.get_scene(ids=[label_id])["objects"][0]["bbox"]
+    # ラベルの過半が入るが右へはみ出す大きさの箱を、ラベルの背面に置く。
+    api.create_objects(
+        [
+            {
+                "type": "rect",
+                "x": bbox[0],
+                "y": bbox[1] - 10.0,
+                "width": bbox[2] * 0.7,
+                "height": bbox[3] + 20.0,
+                "fill": "#ffffff",
+            }
+        ],
+        insert_at="back",
+    )
+    return label_id
+
+
+def test_a_label_larger_than_its_host_converges(api: AgentAPI) -> None:
+    """ラベル先より大きいラベルも、送り返しを繰り返せば必ず収まる。"""
+    _autosized_label_overflowing_its_host(api)
+    for _ in range(6):
+        findings = api.critique(checks=["text_overflow"])["findings"]
+        if not findings:
+            break
+        for finding in findings:
+            call = finding["corrected_call"]
+            getattr(api, call["tool"])(**call["arguments"])
+    else:
+        pytest.fail("収束しない")
+    assert api.critique(checks=["text_overflow"])["findings"] == []
+
+
 def test_the_critique_fix_loop_converges(api: AgentAPI) -> None:
     """「点検 → 修正案を送り返す」を繰り返すと必ず所見ゼロに収束する。
 

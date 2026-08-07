@@ -271,6 +271,52 @@ def suggest_fix(
             "note": "覆われている側を前面に出します",
         }
     if code == "text_overflow":
+        if finding.get("kind") == "host_shape":
+            # **ここを「自然サイズにリサイズ」にしてはいけない。** ラベルは既に
+            # 自然サイズなことが多く、その場合 no-op になって同じ警告が永久に
+            # 出続ける（実機デモで無限ループを踏んだ）。ラベル先に収まる大きさなら
+            # 中央へ寄せ、収まらないならフォントを縮める — どちらも必ず状況が動く。
+            host = _object(snapshot, finding.get("host_id"))
+            if host is None:
+                return None
+            host_x, host_y, host_w, host_h = host.box
+            _tx, _ty, text_w, text_h = obj.box
+            if text_w <= 0.0 or text_h <= 0.0:
+                return None
+            if text_w <= host_w and text_h <= host_h:
+                return {
+                    "tool": "move_objects",
+                    "arguments": {
+                        "items": [
+                            {
+                                "id": obj.id,
+                                "relative": {"to": host.id, "side": "inside", "align": "center"},
+                            }
+                        ]
+                    },
+                    "note": "ラベルをラベル先の中央へ収めます",
+                }
+            # **箱とフォントを一緒に縮める。** フォントだけ縮めても文字の箱は
+            # 変わらないので host からはみ出したままで直らない。箱だけ縮めると
+            # 今度は own_box のあふれが出て、自然サイズへ戻され、また host から
+            # はみ出す — と振動する。両方を同じ比率で縮めるのが唯一収束する形。
+            scale = min(host_w / text_w, host_h / text_h)
+            new_w = text_w * scale
+            new_h = text_h * scale
+            item: dict[str, Any] = {
+                "id": obj.id,
+                "x": round(host_x + (host_w - new_w) / 2.0, 1),
+                "y": round(host_y + (host_h - new_h) / 2.0, 1),
+                "width": round(new_w, 1),
+                "height": round(new_h, 1),
+            }
+            if obj.font_size > 0.0:
+                item["font_size"] = max(round(obj.font_size * scale, 1), 1.0)
+            return {
+                "tool": "update_objects",
+                "arguments": {"items": [item]},
+                "note": "ラベル先より大きいので、箱とフォントを同じ比率で縮めて中央に収めます",
+            }
         if obj.text_natural_size is not None:
             w, h = obj.text_natural_size
             return {

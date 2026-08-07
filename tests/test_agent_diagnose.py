@@ -187,11 +187,52 @@ def test_a_label_inside_its_box_is_not_an_overlap() -> None:
     assert dx.analyze(snap, ("overlap",)) == []
 
 
-def test_text_never_participates_in_overlap() -> None:
-    """ラベルは重なるのが仕事。text/math は overlap の対象外。"""
+def test_text_over_a_shape_is_not_an_overlap() -> None:
+    """ラベルが図形に重なるのは仕事。ここを警告すると全部のラベルが警告になる。"""
     snap = _snapshot(
-        _obj(1, "text", box=(0.0, 0.0, 100.0, 100.0), text="a"),
-        _obj(2, "text", box=(50.0, 50.0, 100.0, 100.0), text="b"),
+        _obj(1, "rect", box=(0.0, 0.0, 300.0, 200.0), fill="#ffffff"),
+        _obj(2, "text", box=(50.0, 50.0, 200.0, 60.0), color="#000000", text="ラベル"),
+    )
+    assert dx.analyze(snap, ("overlap",)) == []
+
+
+def test_text_over_another_text_is_reported() -> None:
+    """文字同士の重なりは常に破綻（実機デモで見逃していたケース）。
+
+    「ラベルは重なるのが仕事」は**文字が図形にラベルを付ける**場合の話で、
+    キャプションと注釈が重なるのは意図的ではありえない。ここを一律に
+    対象外にすると、実際に読めなくなっている図を「所見なし」と報告してしまう。
+    """
+    snap = _snapshot(
+        _obj(1, "text", box=(0.0, 0.0, 100.0, 100.0), text="注釈"),
+        _obj(2, "text", box=(50.0, 50.0, 100.0, 100.0), text="キャプション"),
+    )
+    findings = dx.analyze(snap, ("overlap",))
+    assert _codes(findings) == ["overlap"]
+    assert findings[0]["other_id"] == 2
+
+
+def test_a_text_contained_in_another_text_is_reported() -> None:
+    """内包の免除は「図形の中のラベル」のための規則。文字同士には効かせない。"""
+    snap = _snapshot(
+        _obj(1, "text", box=(0.0, 0.0, 400.0, 200.0), text="大きい見出し"),
+        _obj(2, "text", box=(100.0, 50.0, 100.0, 50.0), text="小さい注釈"),
+    )
+    assert _codes(dx.analyze(snap, ("overlap",))) == ["overlap"]
+
+
+def test_math_and_text_overlapping_each_other_is_reported() -> None:
+    snap = _snapshot(
+        _obj(1, "math", box=(0.0, 0.0, 200.0, 100.0)),
+        _obj(2, "text", box=(100.0, 20.0, 200.0, 100.0), text="式の説明"),
+    )
+    assert _codes(dx.analyze(snap, ("overlap",))) == ["overlap"]
+
+
+def test_separated_texts_are_not_reported() -> None:
+    snap = _snapshot(
+        _obj(1, "text", box=(0.0, 0.0, 100.0, 50.0), text="a"),
+        _obj(2, "text", box=(0.0, 200.0, 100.0, 50.0), text="b"),
     )
     assert dx.analyze(snap, ("overlap",)) == []
 
@@ -451,6 +492,50 @@ def test_text_spilling_out_of_its_host_shape_is_reported() -> None:
             text="hi",
             color="#000000",
             text_layout_size=(150.0, 15.0),
+            z_index=1,
+        ),
+    )
+    findings = dx.analyze(snap, ("text_overflow",))
+    assert _codes(findings) == ["text_overflow"]
+    assert findings[0]["kind"] == "host_shape"
+    assert findings[0]["host_id"] == 1
+
+
+def test_a_text_merely_drifting_over_a_shape_is_not_its_label() -> None:
+    """中心が乗っているだけでラベル判定すると、嘘の「はみ出し」警告が出る。
+
+    実機デモで踏んだ実際の失敗: 重なり修正で移動した注釈がブロックの上端に
+    かかり、そのブロックのラベルだと誤認され、no-op な修正案とともに
+    無限ループを起こした。面積の過半が入っていることをラベルの条件にする。
+    """
+    snap = _snapshot(
+        _obj(1, "rect", box=(80.0, 260.0, 260.0, 140.0), fill="#ffffff", z_index=0),
+        # 大半がブロックの外（上と右）にある注釈。
+        _obj(
+            2,
+            "text",
+            box=(164.0, 240.0, 252.0, 41.0),
+            text="測定条件は付録Aを参照",
+            color="#000000",
+            text_layout_size=(252.0, 41.0),
+            z_index=1,
+        ),
+    )
+    assert dx.find_host_shape(snap, snap.objects[1]) is None
+    assert dx.analyze(snap, ("text_overflow",)) == []
+
+
+def test_a_label_mostly_inside_a_shape_is_still_its_label() -> None:
+    """過半が入っていれば、少しはみ出していてもラベルとして報告する。"""
+    snap = _snapshot(
+        _obj(1, "rect", box=(0.0, 0.0, 200.0, 100.0), fill="#ffffff", z_index=0),
+        _obj(
+            2,
+            "text",
+            box=(20.0, 20.0, 240.0, 40.0),
+            text="長いラベル",
+            color="#000000",
+            text_layout_size=(240.0, 40.0),
             z_index=1,
         ),
     )

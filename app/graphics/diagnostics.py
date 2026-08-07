@@ -65,6 +65,10 @@ OVERFLOW_TOLERANCE_PX = 1.0
 #: （端にぴったり合わせた配置を「切れている」と言わないため）。
 CLIP_TOLERANCE_PX = 0.5
 
+#: 文字がその図形の「ラベル」だとみなすのに必要な、図形内に入っている面積の比。
+#: 中心が乗っているだけで判定すると、上を流れてきただけの注釈を誤ってラベル扱いする。
+HOST_MIN_INSIDE_RATIO = 0.5
+
 #: はみ出した方向のラベル（メッセージ用）。
 _SIDE_LABELS = {"left": "左", "top": "上", "right": "右", "bottom": "下"}
 
@@ -227,8 +231,10 @@ def check_overlap(snapshot: DocumentSnapshot, *, overlap: bool, occluded: bool) 
     黙る条件（誤警告を避けるため意図的に狭くしてある）:
 
     - 線・矢印・フリーハンド・コネクタ: bbox が斜めの包絡でしかないので対象外。
-    - text / math: ラベルは重なるのが仕事なので `overlap` の対象外
+    - **文字 × 図形**: ラベル付けなので `overlap` の対象外
       （`occluded` には参加する — 完全に覆われたら本当に読めない）。
+      ただし**文字 × 文字は報告する**。ラベルが図形に重なるのは意図的だが、
+      ラベルとキャプションが重なるのは意図的ではありえない（内包も同様）。
     - 同じ `group_id`: 意図的な合成。
     - 完全内包: 「箱の中のラベル」は正常。`occluded` 側で判断する。
     """
@@ -261,12 +267,19 @@ def check_overlap(snapshot: DocumentSnapshot, *, overlap: bool, occluded: bool) 
                 continue
             if not overlap:
                 continue
-            if a.type in _TEXTUAL_TYPES or b.type in _TEXTUAL_TYPES:
-                continue
-            if bx.obb_contains(front.box, front.rotation, back.box, back.rotation) or (
-                bx.obb_contains(back.box, back.rotation, front.box, front.rotation)
-            ):
-                continue  # 内包は重なり警告にしない（`occluded` の担当）
+            both_textual = a.type in _TEXTUAL_TYPES and b.type in _TEXTUAL_TYPES
+            if not both_textual:
+                if a.type in _TEXTUAL_TYPES or b.type in _TEXTUAL_TYPES:
+                    # 文字 × 図形 = ラベル付け。重なるのが仕事なので黙る。
+                    continue
+                if bx.obb_contains(front.box, front.rotation, back.box, back.rotation) or (
+                    bx.obb_contains(back.box, back.rotation, front.box, front.rotation)
+                ):
+                    continue  # 内包は重なり警告にしない（`occluded` の担当）
+            # **文字同士の重なりは常に破綻**（内包も含む）。ラベルが図形に重なるのは
+            # 意図的だが、ラベルとキャプションが重なるのは意図的ではありえない。
+            # ここを「text はすべて対象外」で済ませると、実際に読めなくなっている
+            # 図を「所見なし」と報告してしまう（実機デモで発見）。
             inter_area = bx.obb_overlap_area(a.box, a.rotation, b.box, b.rotation)
             smaller = min(bx.area(a.box), bx.area(b.box))
             if smaller <= 0.0:
@@ -313,14 +326,24 @@ def background_behind(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> tuple[
 
 
 def find_host_shape(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> ObjectSnapshot | None:
-    """`obj`（文字）がラベル付けしている図形＝ z が下で中心を含む最も手前のもの。"""
-    center = bx.box_center(bx.normalized(obj.box))
+    """`obj`（文字）が**ラベル付けしている**図形。無ければ None。
+
+    「中心が入っている」だけでは足りない。図の上を流れてきただけの注釈も
+    たまたま中心がブロックに乗るので、それを「ラベル」と誤認すると
+    「ラベルがはみ出している」という嘘の警告が出る（実機デモで発生）。
+    **面積の過半（`HOST_MIN_INSIDE_RATIO`）がその図形の中にあること**を
+    ラベルである証拠として要求する。
+    """
+    text_area = bx.area(obj.box)
+    if text_area <= 0.0:
+        return None
     for other in sorted(snapshot.objects, key=lambda o: o.z_index, reverse=True):
         if other.z_index >= obj.z_index or not other.visible or other.id == obj.id:
             continue
         if other.type not in ("rect", "ellipse", "image"):
             continue
-        if bx.point_in_obb(center, other.box, other.rotation):
+        inside = bx.obb_overlap_area(other.box, other.rotation, obj.box, obj.rotation)
+        if inside / text_area >= HOST_MIN_INSIDE_RATIO:
             return other
     return None
 
