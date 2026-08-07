@@ -412,15 +412,22 @@ printf '{"jsonrpc":"2.0","id":1,"method":"describe_state","params":{}}\n' \
 
 ### 図の破綻を機械可読に点検する: critique / layout_objects / apply_style / move_objects の relative（2026-08-07 追加）
 
-エージェントが `render_canvas` で目視するしかなかった「画面外・重なり・文字あふれ」等の
+エージェントが `render_canvas` で目視するしかなかった「画面外・切れ・重なり・文字あふれ」等の
 点検と、「座標を計算して並べる」「見た目をまとめて配る」を宣言的 API に落とし込んだ。
 
 **診断層は 2 段構え**（速度とスレッド安全性のための分離）:
 - `app/graphics/diagnostics.py`: Qt 非依存の純関数。`Document` のスナップショット
   （dataclass。bbox・テキスト採寸済みの寸法などを先に確定させたもの）を受け取り、
-  画面外・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・出力実寸で小さすぎる
-  文字（`CHECK_NAMES`）を検出する。`Document` にも Qt にも触れないので、
-  ワーカースレッドへ出しても競合しない。
+  `CHECK_NAMES` の 8 種を検出する: `offscreen`（完全に外で描かれない）/ **`clipped`**
+  （一部がはみ出しており書き出すと切れる。2026-08-07 追加 — 画面上は「端に寄って
+  いる」ようにしか見えないのに論文図では実害がある、最も気づきにくい破綻）/
+  `degenerate` / `overlap` / `occluded` / `text_overflow` / `low_contrast` /
+  `small_text`。`Document` にも Qt にも触れないので、ワーカースレッドへ出しても
+  競合しない。
+- **修正案は「送り返せば直る」ことが要件**。例えば `clipped` でアートボードより
+  大きいオブジェクトに「動かす」案を返すと、送り返しても同じ警告が出続けて往復が
+  終わらない。この場合は縮める案を返す（`fits` フラグで分岐）。収束することを
+  `tests/test_agent_api.py` が固定している。
 - `app/agent/diagnose.py`: GUI スレッドでスナップショットを作る側。`QFontMetricsF`
   でのテキスト採寸など Qt が要る処理はここで行い、`diagnostics.py` の純関数へ渡す。
   遅延評価（要求された検査だけ採寸する）と revision キャッシュ（同じ revision の

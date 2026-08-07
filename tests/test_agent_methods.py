@@ -243,7 +243,7 @@ def test_corrected_calls_bind_to_the_real_signature(api: AgentAPI) -> None:
     # 10) critique が返す修正案（診断コードごとに 1 種類）
     corrected_calls.extend(_critique_corrected_calls())
 
-    assert len(corrected_calls) == 19
+    assert len(corrected_calls) == 21
     for corrected in corrected_calls:
         _assert_corrected_call_is_valid(corrected)
 
@@ -278,6 +278,8 @@ def _critique_corrected_calls() -> list[dict[str, Any]]:
     snapshot = diagnostics.DocumentSnapshot(artboard=artboard, objects=(obj,))
     samples = [
         {"code": "offscreen", "id": 1},
+        # clipped は「収まる大きさか」で修正のしかたが変わるので両方見る。
+        {"code": "clipped", "id": 1, "bbox": [1850.0, 10.0, 100.0, 50.0], "fits": True},
         {"code": "degenerate", "id": 1},
         {"code": "overlap", "id": 1, "other_id": 2},
         {"code": "occluded", "id": 1, "by": 2},
@@ -290,6 +292,13 @@ def _critique_corrected_calls() -> list[dict[str, Any]]:
     ), "診断コードを増やしたら修正案もここも増やすこと"
     calls = [diagnose.suggest_fix(sample, snapshot) for sample in samples]
     assert all(call is not None for call in calls), "全コードに修正案があること"
+    # アートボードより大きくて動かしても直らない clipped は、縮める案を返す。
+    oversized = diagnose.suggest_fix(
+        {"code": "clipped", "id": 1, "bbox": [-100.0, -100.0, 4000.0, 2000.0], "fits": False},
+        snapshot,
+    )
+    assert oversized is not None and oversized["tool"] == "update_objects"
+    calls.append(oversized)
     return calls
 
 

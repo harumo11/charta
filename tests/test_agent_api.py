@@ -550,6 +550,50 @@ def test_critique_small_text_fix_reaches_the_threshold(api: AgentAPI) -> None:
     assert api.critique(checks=["small_text"])["findings"] == []
 
 
+def test_a_clipped_object_is_reported_and_the_fix_moves_it_inside(
+    api: AgentAPI, window: Any
+) -> None:
+    """書き出すと端が切れる、を検出して直せる（offscreen は完全に外だけを見る）。"""
+    artboard = window.scene.document.artboard
+    oid = api.create_objects(
+        [{"type": "rect", "x": artboard.width_px - 60, "y": 100, "width": 200, "height": 100}]
+    )["created"][0]["id"]
+    result = api.critique(checks=["clipped"])
+    assert [f["code"] for f in result["findings"]] == ["clipped"]
+    assert result["findings"][0]["overflow"]["right"] > 0
+
+    api.move_objects(**result["findings"][0]["corrected_call"]["arguments"])
+    assert api.critique(checks=["clipped"])["findings"] == []
+    obj = window.scene.document.object_by_id(oid)
+    assert obj.x + obj.width <= artboard.width_px
+
+
+def test_an_oversized_object_is_shrunk_not_endlessly_nudged(api: AgentAPI, window: Any) -> None:
+    """アートボードより大きい相手に「動かす」案を返すと往復が終わらない。
+
+    修正案は**送り返せば直る**ことが要件なので、この場合は縮める案でなければ
+    ならない。ここが崩れるとエージェントが無限にリトライする。
+    """
+    artboard = window.scene.document.artboard
+    api.create_objects(
+        [
+            {
+                "type": "rect",
+                "x": -100,
+                "y": -100,
+                "width": artboard.width_px * 2,
+                "height": artboard.height_px * 2,
+            }
+        ]
+    )
+    finding = api.critique(checks=["clipped"])["findings"][0]
+    assert finding["fits"] is False
+    corrected = finding["corrected_call"]
+    assert corrected["tool"] == "update_objects", "動かす案では直らない"
+    api.update_objects(**corrected["arguments"])
+    assert api.critique(checks=["clipped"])["findings"] == []
+
+
 def test_the_critique_fix_loop_converges(api: AgentAPI) -> None:
     """「点検 → 修正案を送り返す」を繰り返すと必ず所見ゼロに収束する。
 

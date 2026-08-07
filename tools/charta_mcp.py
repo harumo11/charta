@@ -385,9 +385,10 @@ def render_canvas(
     `view` の変換式と合わせてオーバーレイ無しでもピクセルと id を対応付けられる。
     `include=["all"]` で全部、`include=[]` で最小。
 
-    `warnings` は全診断コードを返す: offscreen（画面外）/ degenerate（退化寸法）/
-    overlap（重なり）/ occluded（遮蔽）/ text_overflow（文字あふれ）/
-    low_contrast（低コントラスト）/ small_text（出力実寸で小さすぎる文字）。
+    `warnings` は全診断コードを返す: offscreen（完全に画面外）/ clipped（一部が
+    はみ出して書き出すと切れる）/ degenerate（退化寸法）/ overlap（重なり）/
+    occluded（遮蔽）/ text_overflow（文字あふれ）/ low_contrast（低コントラスト）/
+    small_text（出力実寸で小さすぎる文字）。
     **診断だけが目的なら `critique` のほうが安い**（PNG を書き出さず、各所見に
     `corrected_call` が付く）。ここの `warnings` は PNG を見るついでに拾う位置づけ。"""
     return _call(
@@ -420,11 +421,12 @@ def critique(
 ) -> dict[str, Any]:
     """図の破綻を**機械可読に**点検する（読み取り専用・PNG を書き出さない）。
 
-    画面外・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・出力実寸で
-    小さすぎる文字を 1 往復でまとめて返す。各所見には `corrected_call`
-    （`move_objects` / `update_objects` / `order_objects` のいずれか、そのまま
-    送れる形）が付く。**描いた直後にこれを 1 回呼ぶ方が `render_canvas` で
-    目視するより安く、判定もぶれない。**
+    完全に画面外・**一部がはみ出して書き出すと切れる**・退化寸法・重なり・遮蔽・
+    文字あふれ・低コントラスト・出力実寸で小さすぎる文字を 1 往復でまとめて返す。
+    各所見には `corrected_call`（`move_objects` / `update_objects` /
+    `order_objects` のいずれか、そのまま送れる形）が付く。
+    **描いた直後にこれを 1 回呼ぶ方が `render_canvas` で目視するより安く、
+    判定もぶれない。**
 
     `checks` を絞ると該当検査だけ（既定は全件）。`ids` を渡すと、その id を
     参照する所見だけに絞れる。

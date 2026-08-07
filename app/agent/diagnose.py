@@ -37,6 +37,9 @@ _CHECKS_NEEDING_TEXT_METRICS = frozenset({"text_overflow"})
 
 _FILL_TYPES = frozenset({"rect", "ellipse"})
 _TEXTUAL_TYPES = frozenset({"text", "math"})
+#: `update_objects` で width/height を直接書ける型（幾何が box のもの）。
+#: line/arrow は p1/p2、connector はアンカーが真実源なので縮められない。
+_RESIZABLE_TYPES = frozenset({"rect", "ellipse", "image", "text", "math", "freehand"})
 
 
 def _text_sizes(obj: BaseObject) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
@@ -201,6 +204,41 @@ def suggest_fix(
             "tool": "move_objects",
             "arguments": {"items": [{"id": obj.id, "to": [round(to_x, 1), round(to_y, 1)]}]},
             "note": "アートボード内へ収まる位置に移動します",
+        }
+    if code == "clipped":
+        x, y, w, h = finding.get("bbox", obj.box)
+        if not finding.get("fits", True):
+            # アートボードより大きいので、動かしても必ずどこかが切れる。
+            # 位置だけ直す案を返すと、送り返しても同じ警告が出続けて往復が
+            # 終わらない（収束しない修正案は嘘と同じ）。幾何が box の型だけ
+            # 縮めて収める案を返し、それ以外は素直に案なしにする。
+            if obj.type in _RESIZABLE_TYPES:
+                scale = min(artboard.width_px / w, artboard.height_px / h)
+                return {
+                    "tool": "update_objects",
+                    "arguments": {
+                        "items": [
+                            {
+                                "id": obj.id,
+                                "x": 0.0,
+                                "y": 0.0,
+                                "width": round(obj.box[2] * scale, 1),
+                                "height": round(obj.box[3] * scale, 1),
+                            }
+                        ]
+                    },
+                    "note": "アートボードより大きいので、縦横比を保って収まる大きさに縮めます",
+                }
+            return None
+        to_x = min(max(x, 0.0), artboard.width_px - w)
+        to_y = min(max(y, 0.0), artboard.height_px - h)
+        # bbox は回転後の外接矩形なので、移動量に直してから元の x/y に足す。
+        return {
+            "tool": "move_objects",
+            "arguments": {
+                "items": [{"id": obj.id, "dx": round(to_x - x, 1), "dy": round(to_y - y, 1)}]
+            },
+            "note": "アートボードに収まる位置へずらします",
         }
     if code == "degenerate":
         return {

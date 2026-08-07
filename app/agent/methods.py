@@ -167,8 +167,9 @@ METHOD_SPECS: dict[str, MethodSpec] = {
         ),
     ),
     "critique": MethodSpec(
-        summary="図の破綻を機械可読に点検する（画面外・退化寸法・重なり・遮蔽・"
-        "文字あふれ・低コントラスト・出力実寸で小さすぎる文字）。読み取り専用。",
+        summary="図の破綻を機械可読に点検する（完全に画面外・一部がはみ出して"
+        "書き出すと切れる・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・"
+        "出力実寸で小さすぎる文字）。読み取り専用。",
         example={"checks": ["overlap", "low_contrast"]},
         notes=(
             "PNG を書き出さないので render より安く、判定もぶれない。"

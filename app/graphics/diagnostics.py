@@ -17,6 +17,7 @@
 | code | 意味 |
 |---|---|
 | `offscreen` | アートボードの外にあり描画されない |
+| `clipped` | 一部がアートボードからはみ出しており、書き出すと切れる |
 | `degenerate` | 幅か高さが 0 で見えない |
 | `overlap` | オブジェクト同士が部分的に重なっている |
 | `occluded` | 不透明なオブジェクトに完全に覆われている |
@@ -42,6 +43,7 @@ Box = tuple[float, float, float, float]
 #: 検査項目の全名称。`collect` / `critique` の `checks` で絞れる。
 CHECK_NAMES: tuple[str, ...] = (
     "offscreen",
+    "clipped",
     "degenerate",
     "overlap",
     "occluded",
@@ -59,6 +61,12 @@ MIN_EFFECTIVE_PT = 6.0
 OPAQUE_THRESHOLD = 0.99
 #: 文字あふれをこの px 未満なら黙る（採寸の丸め誤差を警告にしない）。
 OVERFLOW_TOLERANCE_PX = 1.0
+#: アートボード境界からのはみ出しをこの px 未満なら黙る
+#: （端にぴったり合わせた配置を「切れている」と言わないため）。
+CLIP_TOLERANCE_PX = 0.5
+
+#: はみ出した方向のラベル（メッセージ用）。
+_SIDE_LABELS = {"left": "左", "top": "上", "right": "右", "bottom": "下"}
 
 #: 面を持たず、重なり判定に意味がない型。
 _AREALESS_TYPES = frozenset({"line", "arrow", "freehand", "connector"})
@@ -139,11 +147,18 @@ def _finding(code: str, obj: ObjectSnapshot, message: str, **extra: Any) -> dict
 # --------------------------------------------------------------------------
 
 
-def check_bounds(snapshot: DocumentSnapshot, *, offscreen: bool, degenerate: bool) -> list[dict]:
-    """アートボード外・退化した寸法。
+def check_bounds(
+    snapshot: DocumentSnapshot, *, offscreen: bool, degenerate: bool, clipped: bool
+) -> list[dict]:
+    """アートボード外・部分的なはみ出し・退化した寸法。
 
     回転を考慮する（`rotated_aabb`）。回転した矩形の実際のはみ出しは、回転を
     無視した bbox では判定できない。
+
+    3 つは排他。**完全に外**なら `offscreen`（そもそも描かれない）、
+    **一部が外**なら `clipped`（書き出すと切れる — 論文図では実害のある破綻だが、
+    画面上は「端に寄っている」ようにしか見えず気づきにくい）、
+    幅か高さが 0 なら `degenerate`。
     """
     findings: list[dict[str, Any]] = []
     aw = snapshot.artboard.width_px
@@ -152,17 +167,19 @@ def check_bounds(snapshot: DocumentSnapshot, *, offscreen: bool, degenerate: boo
         if not obj.visible:
             continue
         x, y, w, h = bx.rotated_aabb(obj.box, obj.rotation)
-        if offscreen and (x + w < 0.0 or y + h < 0.0 or x > aw or y > ah):
-            findings.append(
-                _finding(
-                    "offscreen",
-                    obj,
-                    f"オブジェクト {obj.id} ({obj.type}) は bbox "
-                    f"{[x, y, w, h]} でアートボードの外にあり、描画されません",
-                    bbox=[x, y, w, h],
+        if x + w < 0.0 or y + h < 0.0 or x > aw or y > ah:
+            if offscreen:
+                findings.append(
+                    _finding(
+                        "offscreen",
+                        obj,
+                        f"オブジェクト {obj.id} ({obj.type}) は bbox "
+                        f"{[x, y, w, h]} でアートボードの外にあり、描画されません",
+                        bbox=[x, y, w, h],
+                    )
                 )
-            )
-        elif degenerate and obj.areal and (obj.box[2] <= 0.0 or obj.box[3] <= 0.0):
+            continue
+        if degenerate and obj.areal and (obj.box[2] <= 0.0 or obj.box[3] <= 0.0):
             findings.append(
                 _finding(
                     "degenerate",
@@ -173,6 +190,34 @@ def check_bounds(snapshot: DocumentSnapshot, *, offscreen: bool, degenerate: boo
                     height=obj.box[3],
                 )
             )
+            continue
+        if not clipped:
+            continue
+        over = {
+            "left": max(0.0, -x),
+            "top": max(0.0, -y),
+            "right": max(0.0, (x + w) - aw),
+            "bottom": max(0.0, (y + h) - ah),
+        }
+        if max(over.values()) <= CLIP_TOLERANCE_PX:
+            continue  # 端にぴったり接しているだけは切れていない
+        sides = "・".join(
+            f"{_SIDE_LABELS[side]}に {amount:.0f}px"
+            for side, amount in over.items()
+            if amount > CLIP_TOLERANCE_PX
+        )
+        findings.append(
+            _finding(
+                "clipped",
+                obj,
+                f"オブジェクト {obj.id} ({obj.type}) がアートボードから {sides} "
+                f"はみ出しており、書き出すと切れます",
+                overflow={k: round(v, 2) for k, v in over.items()},
+                bbox=[x, y, w, h],
+                # アートボードに収まる大きさかどうかで修正のしかたが変わる。
+                fits=w <= aw + CLIP_TOLERANCE_PX and h <= ah + CLIP_TOLERANCE_PX,
+            )
+        )
     return findings
 
 
@@ -419,6 +464,7 @@ def analyze(
         snapshot,
         offscreen="offscreen" in enabled,
         degenerate="degenerate" in enabled,
+        clipped="clipped" in enabled,
     )
     findings += check_overlap(
         snapshot,

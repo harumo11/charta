@@ -77,6 +77,65 @@ def test_offscreen_accounts_for_rotation() -> None:
     assert _codes(rotated) == ["offscreen"], "回転を無視した bbox なら見逃す配置"
 
 
+def test_a_partially_clipped_object_is_reported() -> None:
+    """書き出すと右半分が切れる、は論文図で実害があるのに画面上は気づきにくい。
+
+    `offscreen`（完全に外）だけを見ていると、この最も厄介な失敗を丸ごと見逃す。
+    """
+    snap = _snapshot(_obj(1, box=(1850.0, 100.0, 200.0, 100.0)))  # 幅 1920 の右端をまたぐ
+    findings = dx.analyze(snap, ("clipped",))
+    assert _codes(findings) == ["clipped"]
+    assert findings[0]["overflow"]["right"] == pytest.approx(130.0)
+    assert findings[0]["overflow"]["left"] == 0.0
+    assert findings[0]["fits"] is True
+
+
+def test_an_object_fully_inside_is_not_clipped() -> None:
+    snap = _snapshot(_obj(1, box=(100.0, 100.0, 200.0, 100.0)))
+    assert dx.analyze(snap, ("clipped",)) == []
+
+
+def test_an_object_flush_with_the_edge_is_not_clipped() -> None:
+    """端にぴったり合わせた配置を「切れている」と言うと、意図した詰めが警告になる。"""
+    snap = _snapshot(_obj(1, box=(1720.0, 980.0, 200.0, 100.0)))  # 右下角にぴったり
+    assert dx.analyze(snap, ("clipped",)) == []
+
+
+def test_clipped_and_offscreen_are_exclusive() -> None:
+    """完全に外なら offscreen だけ。両方出すと修正案が競合する。"""
+    outside = _snapshot(_obj(1, box=(2500.0, 100.0, 200.0, 100.0)))
+    assert _codes(dx.analyze(outside, ("clipped", "offscreen"))) == ["offscreen"]
+
+    partial = _snapshot(_obj(1, box=(1850.0, 100.0, 200.0, 100.0)))
+    assert _codes(dx.analyze(partial, ("clipped", "offscreen"))) == ["clipped"]
+
+
+def test_clipped_accounts_for_rotation() -> None:
+    """回転を無視した bbox では「収まっている」に見える配置。"""
+    # 上端近くに置いた横長の帯。無回転なら y 30..50 で収まるが、90 度回すと
+    # 中心 (800, 40) のまわりで縦 400px に伸び、上へ 160px はみ出す。
+    box = (600.0, 30.0, 400.0, 20.0)
+    assert dx.analyze(_snapshot(_obj(1, box=box)), ("clipped",)) == []
+    rotated = dx.analyze(_snapshot(_obj(1, box=box, rotation=90.0)), ("clipped",))
+    assert _codes(rotated) == ["clipped"], "回転を無視した bbox なら見逃す配置"
+    assert rotated[0]["overflow"]["top"] == pytest.approx(160.0)
+
+
+def test_an_oversized_object_is_marked_as_not_fitting() -> None:
+    """動かしても直らないことを所見自身が持つ（修正案の分岐がこれを見る）。"""
+    snap = _snapshot(_obj(1, box=(-100.0, -100.0, 4000.0, 2000.0)))
+    findings = dx.analyze(snap, ("clipped",))
+    assert findings[0]["fits"] is False
+
+
+def test_clipped_reports_every_side_it_overflows() -> None:
+    snap = _snapshot(_obj(1, box=(-50.0, -30.0, 200.0, 100.0)))
+    over = dx.analyze(snap, ("clipped",))[0]["overflow"]
+    assert over["left"] == pytest.approx(50.0)
+    assert over["top"] == pytest.approx(30.0)
+    assert over["right"] == 0.0 and over["bottom"] == 0.0
+
+
 def test_degenerate_object_is_reported() -> None:
     snap = _snapshot(_obj(1, box=(10.0, 10.0, 0.0, 50.0)))
     assert _codes(dx.analyze(snap, ("degenerate",))) == ["degenerate"]
