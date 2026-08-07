@@ -232,3 +232,30 @@ class SetArtboardCommand(QUndoCommand):
 
     def undo(self) -> None:
         self._document.set_artboard(copy.deepcopy(self._old_artboard))
+
+
+class SetStylesCommand(QUndoCommand):
+    """`Document.styles`（名前付きスタイルの登録簿）を丸ごと差し替える。
+
+    登録簿は小さい（名前 → 見た目キーの束）ので差分は取らず、全体を持つ。
+    `deepcopy` して保持するのは `SetArtboardCommand` と同じ理由
+    （呼び出し側の参照を後から変更されても影響を受けないため）。
+    """
+
+    def __init__(
+        self,
+        document: Document,
+        new_styles: dict[str, dict[str, Any]],
+        old_styles: dict[str, dict[str, Any]],
+        text: str = "スタイル登録",
+    ) -> None:
+        super().__init__(text)
+        self._document = document
+        self._new_styles = copy.deepcopy(new_styles)
+        self._old_styles = copy.deepcopy(old_styles)
+
+    def redo(self) -> None:
+        self._document.set_styles(copy.deepcopy(self._new_styles))
+
+    def undo(self) -> None:
+        self._document.set_styles(copy.deepcopy(self._old_styles))

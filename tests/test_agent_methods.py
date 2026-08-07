@@ -220,10 +220,15 @@ def test_corrected_calls_bind_to_the_real_signature(api: AgentAPI) -> None:
         api.create_objects([{"type": "connector"}])
     corrected_calls.append(excinfo.value.to_dict()["errors"][0]["corrected_call"])
 
-    # 6) critique が返す修正案（診断コードごとに 1 種類）
+    # 6) layout_objects の grid で columns を忘れた場合
+    with pytest.raises(AgentError) as excinfo:
+        api.layout_objects(ids=[oid], mode="grid")
+    corrected_calls.append(excinfo.value.to_dict()["corrected_call"])
+
+    # 7) critique が返す修正案（診断コードごとに 1 種類）
     corrected_calls.extend(_critique_corrected_calls())
 
-    assert len(corrected_calls) == 15
+    assert len(corrected_calls) == 16
     for corrected in corrected_calls:
         _assert_corrected_call_is_valid(corrected)
 

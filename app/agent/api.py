@@ -45,6 +45,7 @@ from app.commands.commands import (
     SetArtboardCommand,
     SetGeometryCommand,
     SetPropertyCommand,
+    SetStylesCommand,
 )
 from app.export.pdf_exporter import export_pdf
 from app.export.png_exporter import export_png
@@ -55,10 +56,12 @@ from app.graphics.routing import (
     compute_endpoints,
     resolved_bounding_box,
 )
+from app.model import styles
 from app.model.document import Artboard, Document, Physical
 from app.model.geometry import bounding_box, translate_geom
 from app.model.objects import OBJECT_REGISTRY, BaseObject, new_object
 from app.model.serialize import PROJECT_JSON_NAME, load_document, save_document
+from app.scene import arrange
 
 if TYPE_CHECKING:
     from app.ui.main_window import MainWindow
@@ -289,6 +292,7 @@ class AgentAPI:
             saved=window._project_dir is not None,
             artboard=schema.artboard_info(doc),
             object_count=len(doc.objects),
+            styles={"names": sorted(doc.styles), "count": len(doc.styles)},
             tool=window.tool_manager.current_tool(),
             selection=[o.id for o in self._scene.selected_objects()],
             busy=busy_state(window),
@@ -1508,6 +1512,279 @@ class AgentAPI:
                 None
                 if moved
                 else f"対象が {required} 個未満か、既に整列済みのため何も動きませんでした"
+            ),
+        )
+
+    def _resolve_style_bundle(
+        self, style: Any, from_id: int | None, keys: list[str] | None
+    ) -> dict[str, Any]:
+        """`style`（dict か登録名）か `from_id` から見た目キーの束を作る。"""
+        document = self._document
+        sources = [s for s in (style, from_id) if s is not None]
+        if len(sources) != 1:
+            forms = (
+                "指定は 3 形のいずれか 1 つです: "
+                'style={"stroke": "#333333"} / style="登録名" / from_id=7'
+            )
+            raise AgentError(
+                "ambiguous_argument" if len(sources) > 1 else "missing_argument",
+                ("style と from_id は同時に指定できません。" if len(sources) > 1 else "") + forms,
+                corrected_call={
+                    "tool": "apply_style",
+                    "arguments": {"ids": [], "style": {"stroke": "#333333"}},
+                    "note": "その場限りの束を配る形。登録名なら style='名前'、"
+                    "既存オブジェクトからのコピーなら from_id=対象の id",
+                },
+            )
+        if from_id is not None:
+            bundle = styles.extract_style(self._resolve(from_id))
+        elif isinstance(style, str):
+            if style not in document.styles:
+                raise AgentError(
+                    "unknown_style",
+                    f"スタイル {style!r} は登録されていません",
+                    available=sorted(document.styles),
+                    suggestion=_suggest(style, tuple(sorted(document.styles))),
+                )
+            bundle = dict(document.styles[style])
+        elif isinstance(style, dict):
+            bundle = dict(style)
+        else:
+            raise AgentError(
+                "type_mismatch", "style は辞書（その場限りの束）か文字列（登録名）です"
+            )
+
+        if keys is not None:
+            unknown = [k for k in keys if k not in bundle]
+            if unknown:
+                raise AgentError(
+                    "unknown_key",
+                    f"keys の {unknown} は束に含まれていません",
+                    allowed=sorted(bundle),
+                )
+            bundle = {k: v for k, v in bundle.items() if k in keys}
+        if not bundle:
+            raise AgentError("type_mismatch", "スタイルが空です（見た目キーが 1 つも要りません）")
+        return bundle
+
+    def _check_style_vocabulary(self, bundle: dict[str, Any]) -> None:
+        """束のキーが「見た目キー」であることを確かめる（3 段の判定）。
+
+        どの型のスタイルキーでもないものは、単なる打ち間違いか、そもそも
+        `update_objects` の仕事。ここで通すと `apply_style` が検証の緩い
+        `update_objects` になってしまう。
+        """
+        errors: list[FieldError] = []
+        for key in bundle:
+            if styles.is_style_key(key):
+                continue
+            if schema.types_with_key(key):
+                errors.append(
+                    FieldError(
+                        "not_a_style_key",
+                        f"{key!r} は見た目のキーではありません（幾何・内容・識別のキー）。"
+                        "update_objects で変更してください",
+                        key=key,
+                        extra={
+                            "corrected_call": {
+                                "tool": "update_objects",
+                                "arguments": {"items": [{"id": 0, key: bundle[key]}]},
+                                "note": "id を対象のものに差し替えて送ってください",
+                            }
+                        },
+                    )
+                )
+            else:
+                errors.append(
+                    FieldError(
+                        "unknown_key",
+                        f"{key!r} というスタイルキーはありません",
+                        key=key,
+                        extra={
+                            "allowed": list(styles.STYLE_KEYS),
+                            "suggestion": _suggest(key, styles.STYLE_KEYS),
+                        },
+                    )
+                )
+        if errors:
+            raise batch_error(errors)
+
+    def apply_style(
+        self,
+        ids: list[int],
+        style: dict[str, Any] | str | None = None,
+        from_id: int | None = None,
+        keys: list[str] | None = None,
+        save_as: str | None = None,
+        force: bool = False,
+        undo_label: str | None = None,
+        expect_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """見た目キーの束を複数オブジェクトへ 1 undo ステップで配る。
+
+        束の指定は 3 形のいずれか 1 つ:
+
+        - `style={"stroke": "#333333", "stroke_width": 2}` — その場限りの束
+        - `style="node"` — `save_as` で登録済みの名前（project.json に保存される）
+        - `from_id=7` — 既存オブジェクトの見た目をコピーする
+
+        `save_as="node"` を付けると、その束を名前付きで登録する。`ids=[]` と
+        併せれば「配らずに定義だけ」もできる。
+
+        **混在した型に配ったときの挙動**: text/math は `fill`/`stroke` ではなく
+        `color` を使うなど、型によって持つキーが違う。持たないキーは黙って
+        捨てず `skipped` として報告する（`update_objects` は同じ状況を
+        `key_not_on_type` でエラーにするので、混在配布にはこちらを使う）。
+        1 件も適用先が無い束はエラーにする（バッチ丸ごとの no-op を作らない）。
+        """
+        self._require_revision(expect_revision)
+        if not isinstance(ids, list | tuple):
+            raise AgentError("type_mismatch", "ids は配列です（定義だけなら ids=[]）")
+        if not ids and save_as is None:
+            raise AgentError(
+                "type_mismatch",
+                "ids が空です。配らずに登録だけしたい場合は save_as を指定してください",
+            )
+        bundle = self._resolve_style_bundle(style, from_id, keys)
+        self._check_style_vocabulary(bundle)
+
+        document = self._document
+        errors: list[FieldError] = []
+        planned: list[tuple[BaseObject, dict[str, Any], list[str]]] = []
+        for index, oid in enumerate(ids):
+            obj = self._resolve(oid, index=index)
+            locked_error = check_locked(obj, force, index=index)
+            if locked_error is not None:
+                errors.append(locked_error)
+                continue
+            own = set(styles.style_keys_for(obj.type))
+            applicable = {k: v for k, v in bundle.items() if k in own}
+            skipped = sorted(k for k in bundle if k not in own)
+            if applicable:
+                coerced, value_errors = _validate_values(
+                    obj.type, applicable, obj_id=obj.id, index=index
+                )
+                if value_errors:
+                    errors.extend(value_errors)
+                    continue
+                planned.append((obj, coerced, skipped))
+            else:
+                planned.append((obj, {}, skipped))
+        if errors:
+            raise batch_error(errors)
+        if ids and not any(values for _obj, values, _skipped in planned):
+            raise AgentError(
+                "style_not_applicable",
+                "そのスタイルのキーを持つオブジェクトが 1 つもありません",
+                style_keys_by_type={
+                    key: styles.types_with_style_key(key) for key in sorted(bundle)
+                },
+            )
+
+        with self._macro(self._label(undo_label, f"スタイル適用 ({len(planned)} 件)")) as macro:
+            if save_as is not None:
+                old_styles = {n: dict(v) for n, v in document.styles.items()}
+                macro.push(
+                    SetStylesCommand(
+                        document,
+                        {**old_styles, str(save_as): dict(bundle)},
+                        old_styles,
+                        text=UNDO_PREFIX + f"スタイル登録 ({save_as})",
+                    )
+                )
+            for obj, values, _skipped in planned:
+                for key, value in values.items():
+                    macro.push(
+                        SetPropertyCommand(
+                            document,
+                            obj,
+                            key,
+                            value,
+                            _copy_value(getattr(obj, key)),
+                            text=UNDO_PREFIX + f"スタイル {key}",
+                        )
+                    )
+        return self._ok(
+            styled=[
+                {"id": obj.id, "applied": sorted(values), "skipped": skipped}
+                for obj, values, skipped in planned
+            ],
+            style=bundle,
+            saved_as=save_as,
+            styles=sorted(document.styles),
+        )
+
+    def layout_objects(
+        self,
+        ids: list[int],
+        mode: str = "row",
+        gap: float = 40.0,
+        gap_y: float | None = None,
+        columns: int | None = None,
+        align: str = "start",
+        origin: list[float] | None = None,
+        force: bool = False,
+        undo_label: str | None = None,
+        expect_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """行/列/グリッドに**座標を計算して**並べる。
+
+        `arrange_objects` は既に置かれている箱を揃えるだけで座標を作らない。
+        「3 つのブロックを等間隔で横並び」はこちらを使うと 1 往復で済む。
+
+        - 並ぶ順は `ids` に渡した順（空間順ではない）。
+        - `mode="grid"` には `columns` が必須。列幅は各列の最大幅、行高は各行の最大高。
+        - `origin` 省略時は対象全体の現在の外接矩形の左上から並べ直す。
+        - **サイズは変えない**（位置だけ）。コネクタは対象外（独立した位置を持たない）。
+        """
+        self._require_revision(expect_revision)
+        if mode not in arrange.LAYOUT_MODES:
+            raise AgentError(
+                "invalid_enum",
+                f"mode は {list(arrange.LAYOUT_MODES)} のいずれかです",
+                allowed=list(arrange.LAYOUT_MODES),
+                suggestion=_suggest(mode, arrange.LAYOUT_MODES),
+            )
+        if align not in arrange.LAYOUT_ALIGNS:
+            raise AgentError(
+                "invalid_enum",
+                f"align は {list(arrange.LAYOUT_ALIGNS)} のいずれかです",
+                allowed=list(arrange.LAYOUT_ALIGNS),
+                suggestion=_suggest(align, arrange.LAYOUT_ALIGNS),
+            )
+        if mode == "grid" and (columns is None or int(columns) < 1):
+            raise AgentError(
+                "invalid_value",
+                "mode='grid' には 1 以上の columns が必要です",
+                corrected_call={
+                    "tool": "layout_objects",
+                    "arguments": {"ids": list(ids), "mode": "grid", "columns": 3},
+                    "note": "3 列で並べます（列数は図に合わせて変えてください）",
+                },
+            )
+        if origin is not None and (not isinstance(origin, list | tuple) or len(origin) != 2):
+            raise AgentError("type_mismatch", "origin は [x, y] です")
+
+        objs = self._resolve_many(ids)
+        moved = self._edit.layout_objects(
+            objs,
+            mode,
+            gap=float(gap),
+            gap_y=None if gap_y is None else float(gap_y),
+            columns=None if columns is None else int(columns),
+            align=align,
+            origin=(float(origin[0]), float(origin[1])) if origin is not None else None,
+            text=UNDO_PREFIX + self._label(undo_label, f"レイアウト ({mode})"),
+            force=force,
+        )
+        return self._ok(
+            moved=[
+                {"id": o.id, "bbox": list(resolved_bounding_box(self._document, o))} for o in moved
+            ],
+            note=(
+                None
+                if moved
+                else "対象が無いか（コネクタ・ロック済みは除外）、既にその配置になっています"
             ),
         )
 

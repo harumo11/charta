@@ -163,6 +163,312 @@ def test_render_rejects_unknown_include(api: AgentAPI) -> None:
 
 
 # --------------------------------------------------------------------------
+# apply_style（見た目キーの束をまとめて配る）
+# --------------------------------------------------------------------------
+
+
+def test_apply_style_is_one_undo_entry(api: AgentAPI, window: Any) -> None:
+    ids = _make_rects(api, 3)
+    before = window.undo_stack.index()
+    api.apply_style(ids=ids, style={"fill": "#112233", "stroke_width": 4.0})
+    assert window.undo_stack.index() == before + 1
+    document = window.scene.document
+    assert all(document.object_by_id(i).fill == "#112233" for i in ids)
+    window.undo_stack.undo()
+    assert all(document.object_by_id(i).fill is None for i in ids)
+
+
+def test_apply_style_reports_skipped_keys_on_mixed_types(api: AgentAPI, window: Any) -> None:
+    """text は fill/stroke を持たない。黙って捨てず skipped で報告する。"""
+    created = api.create_objects(
+        [
+            {"type": "rect", "width": 100, "height": 50},
+            {"type": "text", "text": "ラベル", "x": 0, "y": 0},
+        ]
+    )
+    rect_id, text_id = (e["id"] for e in created["created"])
+    result = api.apply_style(ids=[rect_id, text_id], style={"stroke": "#ff0000", "opacity": 0.5})
+    by_id = {entry["id"]: entry for entry in result["styled"]}
+    assert by_id[rect_id]["applied"] == ["opacity", "stroke"]
+    assert by_id[rect_id]["skipped"] == []
+    assert by_id[text_id]["applied"] == ["opacity"]
+    assert by_id[text_id]["skipped"] == ["stroke"]
+    assert window.scene.document.object_by_id(text_id).opacity == 0.5
+
+
+def test_apply_style_copies_from_another_object(api: AgentAPI, window: Any) -> None:
+    created = api.create_objects(
+        [
+            {
+                "type": "rect",
+                "width": 10,
+                "height": 10,
+                "fill": "#abcdef",
+                "stroke_width": 5.0,
+                "dash": "dash",
+            },
+            {"type": "rect", "width": 10, "height": 10},
+        ]
+    )
+    source_id, target_id = (e["id"] for e in created["created"])
+    api.apply_style(ids=[target_id], from_id=source_id)
+    target = window.scene.document.object_by_id(target_id)
+    assert (target.fill, target.stroke_width, target.dash) == ("#abcdef", 5.0, "dash")
+
+
+def test_apply_style_does_not_copy_geometry(api: AgentAPI, window: Any) -> None:
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 500, "y": 500, "width": 300, "height": 300, "fill": "#abcdef"},
+            {"type": "rect", "x": 0, "y": 0, "width": 10, "height": 10},
+        ]
+    )
+    source_id, target_id = (e["id"] for e in created["created"])
+    api.apply_style(ids=[target_id], from_id=source_id)
+    target = window.scene.document.object_by_id(target_id)
+    assert (target.x, target.width) == (0.0, 10.0), "見た目だけをコピーする"
+
+
+def test_named_style_is_saved_applied_and_listed(api: AgentAPI, window: Any) -> None:
+    ids = _make_rects(api, 2)
+    api.apply_style(ids=[ids[0]], style={"fill": "#001122"}, save_as="node")
+    assert window.scene.document.styles == {"node": {"fill": "#001122"}}
+    assert api.describe_state()["styles"]["names"] == ["node"]
+
+    api.apply_style(ids=[ids[1]], style="node")
+    assert window.scene.document.object_by_id(ids[1]).fill == "#001122"
+    assert api.describe_schema()["styles"] == {"node": {"fill": "#001122"}}
+
+
+def test_a_style_can_be_defined_without_applying_it(api: AgentAPI, window: Any) -> None:
+    oid = _make_rects(api, 1)[0]
+    result = api.apply_style(ids=[], from_id=oid, save_as="base")
+    assert result["styled"] == []
+    assert "base" in window.scene.document.styles
+
+
+def test_empty_ids_without_save_as_is_an_error(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[], style={"fill": "#000000"})
+    assert excinfo.value.code == "type_mismatch"
+
+
+def test_unknown_named_style_lists_what_exists(api: AgentAPI) -> None:
+    oid = _make_rects(api, 1)[0]
+    api.apply_style(ids=[oid], style={"fill": "#000000"}, save_as="node")
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid], style="nodes")
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "unknown_style"
+    assert payload["available"] == ["node"]
+    assert payload["suggestion"] == "node"
+
+
+def test_specifying_both_or_neither_source_offers_a_sendable_form(api: AgentAPI) -> None:
+    oid = _make_rects(api, 1)[0]
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid], style={"fill": "#000000"}, from_id=oid)
+    assert excinfo.value.code == "ambiguous_argument"
+    assert excinfo.value.to_dict()["corrected_call"]["tool"] == "apply_style"
+
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid])
+    assert excinfo.value.code == "missing_argument"
+
+
+def test_geometry_keys_are_refused_and_point_at_update_objects(api: AgentAPI) -> None:
+    """これを通すと apply_style が検証の緩い update_objects になってしまう。"""
+    oid = _make_rects(api, 1)[0]
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid], style={"x": 10})
+    error = excinfo.value.to_dict()["errors"][0]
+    assert error["code"] == "not_a_style_key"
+    assert error["corrected_call"]["tool"] == "update_objects"
+
+
+def test_a_misspelled_style_key_suggests_the_real_one(api: AgentAPI, window: Any) -> None:
+    oid = _make_rects(api, 1)[0]
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[oid], style={"strok_width": 3.0})
+    error = excinfo.value.to_dict()["errors"][0]
+    assert error["code"] == "unknown_key"
+    assert error["suggestion"] == "stroke_width"
+    assert window.scene.document.object_by_id(oid).stroke_width == 2.0, "何も適用しない"
+
+
+def test_an_invalid_value_applies_nothing(api: AgentAPI, window: Any) -> None:
+    ids = _make_rects(api, 2)
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=ids, style={"fill": "not a colour"})
+    assert excinfo.value.code == "validation_failed"
+    assert all(window.scene.document.object_by_id(i).fill is None for i in ids)
+
+
+def test_a_style_applicable_to_nothing_is_an_error(api: AgentAPI) -> None:
+    """バッチ丸ごとの黙った no-op が最悪の失敗モード。"""
+    text_id = api.create_objects([{"type": "text", "text": "x", "x": 0, "y": 0}])["created"][0][
+        "id"
+    ]
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=[text_id], style={"fill": "#ffffff"})
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "style_not_applicable"
+    assert "rect" in payload["style_keys_by_type"]["fill"]
+
+
+def test_locked_objects_need_force_and_nothing_is_partially_applied(
+    api: AgentAPI, window: Any
+) -> None:
+    ids = _make_rects(api, 2)
+    api.update_objects([{"id": ids[1], "locked": True}])
+    with pytest.raises(AgentError) as excinfo:
+        api.apply_style(ids=ids, style={"fill": "#010203"})
+    assert excinfo.value.to_dict()["errors"][0]["code"] == "locked"
+    assert window.scene.document.object_by_id(ids[0]).fill is None
+
+    api.apply_style(ids=ids, style={"fill": "#010203"}, force=True)
+    assert window.scene.document.object_by_id(ids[1]).fill == "#010203"
+
+
+def test_keys_narrows_the_bundle(api: AgentAPI, window: Any) -> None:
+    created = api.create_objects(
+        [
+            {"type": "rect", "width": 10, "height": 10, "fill": "#abcdef", "stroke_width": 6.0},
+            {"type": "rect", "width": 10, "height": 10},
+        ]
+    )
+    source_id, target_id = (e["id"] for e in created["created"])
+    api.apply_style(ids=[target_id], from_id=source_id, keys=["fill"])
+    target = window.scene.document.object_by_id(target_id)
+    assert target.fill == "#abcdef"
+    assert target.stroke_width == 2.0, "keys に無いものは配らない"
+
+
+def test_save_as_alone_bumps_the_revision_so_optimistic_locking_holds(
+    api: AgentAPI, window: Any
+) -> None:
+    _make_rects(api, 1)
+    revision = window.scene.document.revision
+    api.apply_style(ids=[], style={"fill": "#000000"}, save_as="node")
+    assert window.scene.document.revision > revision
+
+
+def test_style_keys_are_discoverable_per_type(api: AgentAPI) -> None:
+    types = api.describe_schema()["object_types"]
+    assert "fill" in types["rect"]["style_keys"]
+    assert "color" in types["text"]["style_keys"]
+    assert "x" not in types["rect"]["style_keys"]
+
+
+# --------------------------------------------------------------------------
+# layout_objects（座標を作って並べる）
+# --------------------------------------------------------------------------
+
+
+def _scattered(api: AgentAPI) -> list[int]:
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 700, "y": 500, "width": 100, "height": 60},
+            {"type": "rect", "x": 100, "y": 900, "width": 140, "height": 40},
+            {"type": "rect", "x": 400, "y": 20, "width": 80, "height": 100},
+        ]
+    )
+    return [e["id"] for e in created["created"]]
+
+
+def test_layout_row_spaces_by_width_plus_gap_in_id_order(api: AgentAPI, window: Any) -> None:
+    ids = _scattered(api)
+    api.layout_objects(ids=ids, mode="row", gap=20, origin=[0, 0])
+    document = window.scene.document
+    xs = [document.object_by_id(i).x for i in ids]
+    assert xs == [0.0, 120.0, 280.0], "渡した ids の順に、幅 + gap で並ぶ"
+
+
+def test_layout_column_and_align_center(api: AgentAPI, window: Any) -> None:
+    ids = _scattered(api)
+    api.layout_objects(ids=ids, mode="column", gap=10, align="center", origin=[0, 0])
+    document = window.scene.document
+    ys = [document.object_by_id(i).y for i in ids]
+    assert ys == [0.0, 70.0, 120.0]
+    # 最大幅 140 の中で中央寄せ。
+    assert document.object_by_id(ids[0]).x == 20.0
+
+
+def test_layout_grid_uses_per_column_maxima(api: AgentAPI, window: Any) -> None:
+    ids = _scattered(api)
+    api.layout_objects(ids=ids, mode="grid", columns=2, gap=10, origin=[0, 0])
+    document = window.scene.document
+    assert document.object_by_id(ids[0]).x == 0.0
+    assert document.object_by_id(ids[1]).x == 110.0
+    assert document.object_by_id(ids[2]).x == 0.0, "2 行目の 1 列目"
+
+
+def test_layout_is_one_undo_entry(api: AgentAPI, window: Any) -> None:
+    ids = _scattered(api)
+    before = window.undo_stack.index()
+    api.layout_objects(ids=ids, mode="row")
+    assert window.undo_stack.index() == before + 1
+    window.undo_stack.undo()
+    assert window.scene.document.object_by_id(ids[0]).x == 700.0
+
+
+def test_layout_is_a_no_op_when_already_laid_out(api: AgentAPI) -> None:
+    ids = _scattered(api)
+    api.layout_objects(ids=ids, mode="row", gap=20)
+    again = api.layout_objects(ids=ids, mode="row", gap=20)
+    assert again["moved"] == []
+    assert again["note"] is not None, "サイレント no-op を作らない"
+
+
+def test_layout_grid_without_columns_offers_a_sendable_fix(api: AgentAPI, window: Any) -> None:
+    ids = _scattered(api)
+    before = [window.scene.document.object_by_id(i).x for i in ids]
+    with pytest.raises(AgentError) as excinfo:
+        api.layout_objects(ids=ids, mode="grid")
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "invalid_value"
+    assert [window.scene.document.object_by_id(i).x for i in ids] == before, "何も動かさない"
+    api.layout_objects(**payload["corrected_call"]["arguments"])
+    assert [window.scene.document.object_by_id(i).x for i in ids] != before
+
+
+def test_layout_rejects_unknown_mode_with_a_suggestion(api: AgentAPI) -> None:
+    ids = _scattered(api)
+    with pytest.raises(AgentError) as excinfo:
+        api.layout_objects(ids=ids, mode="rows")
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "invalid_enum"
+    assert payload["suggestion"] == "row"
+
+
+def test_layout_excludes_connectors(api: AgentAPI, window: Any) -> None:
+    created = api.create_objects(
+        [
+            {"ref": "A", "type": "rect", "x": 0, "y": 0, "width": 100, "height": 100},
+            {"ref": "B", "type": "rect", "x": 400, "y": 0, "width": 100, "height": 100},
+        ],
+        connections=[{"source_ref": "A", "target_ref": "B"}],
+    )
+    ids = [e["id"] for e in created["created"]]
+    connector_id = created["connectors"][0]["id"]
+    result = api.layout_objects(ids=[*ids, connector_id], mode="row", gap=10)
+    assert connector_id not in [m["id"] for m in result["moved"]]
+
+
+def test_layout_does_not_change_sizes(api: AgentAPI, window: Any) -> None:
+    ids = _scattered(api)
+    sizes = [
+        (window.scene.document.object_by_id(i).width, window.scene.document.object_by_id(i).height)
+        for i in ids
+    ]
+    api.layout_objects(ids=ids, mode="grid", columns=2)
+    assert [
+        (window.scene.document.object_by_id(i).width, window.scene.document.object_by_id(i).height)
+        for i in ids
+    ] == sizes
+
+
+# --------------------------------------------------------------------------
 # critique（機械可読な点検）
 # --------------------------------------------------------------------------
 

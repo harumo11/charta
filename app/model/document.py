@@ -84,6 +84,10 @@ class Document:
         self.artboard: Artboard = artboard if artboard is not None else Artboard()
         self.objects: list[BaseObject] = []
         self.next_id: int = 1
+        # 名前付きスタイル（見た目キーの束）。project.json に保存する。
+        # 描画には一切影響しないので、`DocumentListener` への通知は行わない
+        # （リスナーに新しいコールバックを足すと既存の実装が壊れる）。
+        self.styles: dict[str, dict[str, Any]] = {}
         # このインスタンスの一意 ID。プロジェクトを開き直すと別値になる。
         # 外部クライアント（エージェント）が「別ドキュメントに差し替わった」を検知するために使う。
         # シリアライズしない。
@@ -189,14 +193,30 @@ class Document:
         for i, obj in enumerate(self.objects):
             obj.z = i
 
+    def set_styles(self, styles: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """名前付きスタイルの登録簿を丸ごと差し替え、旧値を返す。
+
+        `revision` を進めるので `expect_revision` の楽観ロックが正しく効く。
+        描画に影響しないためリスナーへの通知はしない（`DocumentListener` の
+        プロトコルを増やすと `CanvasScene` 等の既存実装が全部壊れる）。
+        """
+        old = {name: dict(values) for name, values in self.styles.items()}
+        self._begin_change()
+        self.styles = {name: dict(values) for name, values in styles.items()}
+        return old
+
     def to_dict(self) -> dict[str, Any]:
         """§6 の project.json スキーマに従って辞書化する。"""
-        return {
+        payload: dict[str, Any] = {
             "version": self.version,
             "artboard": self.artboard.to_dict(),
             "objects": [obj.to_dict() for obj in self.objects],
             "next_id": self.next_id,
         }
+        if self.styles:
+            # 空なら書かない（既存プロジェクトの diff を汚さない）。
+            payload["styles"] = {name: dict(values) for name, values in self.styles.items()}
+        return payload
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Document:
@@ -206,5 +226,13 @@ class Document:
         doc.version = d.get("version", 1)
         doc.objects = [BaseObject.from_dict(od) for od in d.get("objects", [])]
         doc.next_id = d.get("next_id", 1)
+        # 壊れた値には寛容にする（styles を知らない版が書いた project.json も読める）。
+        raw_styles = d.get("styles")
+        if isinstance(raw_styles, dict):
+            doc.styles = {
+                str(name): dict(values)
+                for name, values in raw_styles.items()
+                if isinstance(values, dict)
+            }
         doc.normalize_z()
         return doc

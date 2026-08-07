@@ -299,6 +299,34 @@ METHOD_SPECS: dict[str, MethodSpec] = {
             "（基準自身は動かない）。distribute_* との併用はエラー",
         ),
     ),
+    "apply_style": MethodSpec(
+        summary="見た目キーの束を複数オブジェクトへ 1 undo ステップで配る"
+        "（名前を付けて project.json に登録もできる）。",
+        example={"ids": [7, 8], "style": {"stroke": "#1a2b3c", "stroke_width": 2.0}},
+        notes=(
+            "束の指定は 3 形のいずれか 1 つ: "
+            'style={...}（その場限り）/ style="登録名" / from_id=7（コピー）',
+            'save_as="node" で登録する。ids=[] と併せれば「配らずに定義だけ」もできる',
+            "型によって持つキーが違う（text/math は fill/stroke ではなく color）。"
+            "持たないキーは skipped として報告して捨てる — "
+            "update_objects は同じ状況を key_not_on_type でエラーにするので、"
+            "混在した型に同じ見た目を配るならこちらを使う",
+            "幾何・内容・識別のキー（x / latex / src 等）は受け付けない"
+            "（それらは update_objects の仕事）",
+            "v1 ではスタイルの削除は提供しない（charta_exec が逃げ道）",
+        ),
+    ),
+    "layout_objects": MethodSpec(
+        summary="行/列/グリッドに**座標を計算して**並べる"
+        "（arrange_objects は既にある箱を揃えるだけで座標を作らない）。",
+        example={"ids": [3, 4, 5], "mode": "row", "gap": 60, "align": "center"},
+        notes=(
+            "並ぶ順は ids に渡した順（空間順ではない）",
+            "mode='grid' には columns が必須。列幅は各列の最大幅、行高は各行の最大高",
+            "origin 省略時は対象全体の現在の外接矩形の左上から並べ直す",
+            "位置だけを変える（サイズは変えない）。コネクタとロック済みは対象外",
+        ),
+    ),
     "order_objects": MethodSpec(
         summary="z 順の変更（front/back/forward/backward）とグループ化/解除。",
     ),

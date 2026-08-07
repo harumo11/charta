@@ -323,6 +323,44 @@ class EditController:
         new_xy = arrange.distribute_positions(boxes, axis)
         return self._apply_box_moves(targets, boxes, new_xy, text=text)
 
+    def layout_objects(
+        self,
+        objs: list[BaseObject],
+        mode: str,
+        *,
+        gap: float = 40.0,
+        gap_y: float | None = None,
+        columns: int | None = None,
+        align: str = "start",
+        origin: tuple[float, float] | None = None,
+        text: str = "レイアウト",
+        force: bool = False,
+    ) -> list[BaseObject]:
+        """`objs` を行/列/グリッドに並べ直す。実際に動いたオブジェクトを返す。
+
+        `align_objects` が「既に置かれている箱を揃える」のに対し、こちらは
+        サイズと `gap` から**座標を作る**。並ぶ順は `objs` の順（呼び出し側が
+        意図した順）で、空間順ではない。
+
+        不正な `mode` / `align` / `columns` は `arrange.layout_positions` が
+        `ValueError` を投げる（API 層で `AgentError` に変換する）。
+        """
+        targets = self._arrangeable(objs, force)
+        if not targets:
+            return []
+        boxes = {o.id: bounding_box(o) for o in targets}
+        new_xy = arrange.layout_positions(
+            boxes,
+            [o.id for o in targets],
+            mode,
+            gap=gap,
+            gap_y=gap_y,
+            columns=columns,
+            align=align,
+            origin=origin,
+        )
+        return self._apply_box_moves(targets, boxes, new_xy, text=text)
+
     # ------------------------------------------------------------------
     # オブジェクト: グループ化/解除（M7契約 §2・§9）
     # ------------------------------------------------------------------

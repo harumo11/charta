@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import MISSING, fields
 from typing import Any
 
+from app.model import styles
 from app.model.document import Document
 from app.model.objects import OBJECT_REGISTRY, BaseObject
 from app.model.properties import PROPERTIES, PropSpec
@@ -333,6 +334,10 @@ def describe_schema(document: Document, type_name: str | None = None) -> dict[st
             "geometry": geometry,
             "geometry_keys": list(GEOMETRY_TRUTH_KEYS.get(geometry, ())),
             "creatable": name not in _CREATE_TOOLS,
+            # `apply_style` で配れるキー。型ごとに違う（text/math は color、
+            # rect/ellipse は fill/stroke）ので、混在配布の前にここを見ると
+            # skipped になるキーが事前に判る。
+            "style_keys": list(styles.style_keys_for(name)),
             "properties": properties_for(name),
         }
         if name in _CREATE_TOOLS:
@@ -343,6 +348,7 @@ def describe_schema(document: Document, type_name: str | None = None) -> dict[st
         "charta_schema_version": SCHEMA_VERSION,
         "doc_uid": document.uid,
         "revision": document.revision,
+        "styles": {name: dict(values) for name, values in document.styles.items()},
         "units": UNITS,
         "artboard": artboard_info(document),
         "geometry_kinds": {
