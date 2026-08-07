@@ -776,7 +776,9 @@ class ToolManager(QObject):
             target_point=[scene_pos.x(), scene_pos.y()],
             source_anchor="nearest",
             target_anchor="nearest",
-            routing="straight",
+            # routing は指定しない = モデルの既定（"orthogonal"）を使う。
+            # ここで固定すると「エージェントが作った線は避けるが人間が引いた線は
+            # 避けない」という分裂が生まれる。
             arrow_end="triangle",
         )
         return self._finish_creation(obj)

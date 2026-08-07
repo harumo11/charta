@@ -71,6 +71,77 @@ def test_unknown_routing_still_raises() -> None:
 
 
 # --------------------------------------------------------------------------
+# 既定のルーティング（2026-08-07 にユーザー判断で straight → orthogonal）
+# --------------------------------------------------------------------------
+
+
+def test_new_connectors_default_to_orthogonal() -> None:
+    """既定が straight だと、線が図形を貫通しても**診断も何も言わない**
+    （コネクタは重なり判定の対象外なので）。既定で正しい図になるほうを採る。
+    """
+    assert new_object("connector", 1).routing == "orthogonal"
+
+
+def test_the_connector_tool_inherits_the_model_default(qapp) -> None:
+    """**人間が引いた線とエージェントが引いた線で挙動が割れないこと。**
+
+    `tool_manager` はかつて `routing="straight"` を明示的に渡していたので、
+    モデルの既定だけ変えても人間の操作経路は古い挙動のまま、という分裂が
+    起きうる配線だった。実際にツールで引いて確かめる（ソースの grep では
+    「別の場所で上書きされている」を見逃す）。
+    """
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtWidgets import QApplication
+
+    from app.model.objects import RectObject
+    from app.ui.main_window import MainWindow
+
+    class _FakeEvent:
+        def modifiers(self) -> Qt.KeyboardModifier:
+            return Qt.KeyboardModifier.NoModifier
+
+        def button(self) -> Qt.MouseButton:
+            return Qt.MouseButton.LeftButton
+
+    window = MainWindow()
+    try:
+        document = window.scene.document
+        for x in (0.0, 300.0):
+            document.add_object(
+                RectObject(id=document.new_id(), x=x, y=x, width=100.0, height=100.0)
+            )
+        window.tool_manager.set_tool("connector")
+        window.tool_manager.handle_mouse_press(_FakeEvent(), QPointF(50.0, 50.0))
+        window.tool_manager.handle_mouse_move(_FakeEvent(), QPointF(350.0, 350.0))
+        window.tool_manager.handle_mouse_release(_FakeEvent(), QPointF(350.0, 350.0))
+        conn = next(o for o in document.objects if o.type == "connector")
+        assert conn.routing == "orthogonal"
+    finally:
+        import shiboken6
+
+        if shiboken6.isValid(window):
+            window.close()
+        QApplication.processEvents()
+
+
+def test_an_existing_project_keeps_its_stored_routing(tmp_path) -> None:
+    """既定を変えても、保存済みプロジェクトの見た目は変わらない。
+
+    `to_dict` が routing を明示的に書き出すので、読み込み時に既定は使われない。
+    """
+    import json
+
+    from app.model.serialize import load_document, save_document
+
+    document = Document()
+    document.add_object(new_object("connector", 1, routing="straight"))
+    save_document(document, str(tmp_path))
+    payload = json.loads((tmp_path / "project.json").read_text())
+    assert payload["objects"][0]["routing"] == "straight"
+    assert load_document(str(tmp_path)).objects[0].routing == "straight"
+
+
+# --------------------------------------------------------------------------
 # 回避そのもの
 # --------------------------------------------------------------------------
 

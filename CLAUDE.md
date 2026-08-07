@@ -188,7 +188,7 @@ myproject/
 | `source_id`, `target_id` | int or null | 接続先オブジェクト ID。null なら固定端点 |
 | `source_anchor`, `target_anchor` | str | "top"/"bottom"/"left"/"right"/"center"/"nearest" |
 | `source_point`, `target_point` | [x,y] | 固定端点の座標（`*_id` が null のとき有効） |
-| `routing` | str | "straight"（直線・何も避けない） / "orthogonal"（直角折れ線。間にある図形を避ける） |
+| `routing` | str | **既定 "orthogonal"**（直角折れ線。間にある図形を避ける） / "straight"（直線・何も避けない） |
 | `stroke`, `stroke_width`, `dash`, `arrow_end` | — | 線・矢じりプロパティ |
 
 用語定義: **アンカー（接続点）** = コネクタが図形の縁のどこに接続するかを示す定義済み点。
@@ -237,7 +237,17 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - 接続先の `itemChange`（`ItemPositionHasChanged`/ジオメトリ変更）を**シグナル/スロット**で購読し、コネクタの `connector_item` が再計算・再描画する。
   - 用語定義: **シグナル/スロット** = Qt のオブジェクト間イベント通知機構。あるオブジェクトの変化を別オブジェクトが受け取る。
 - 接続先削除時の既定挙動: **その端点を最後の座標で固定化**（`*_id` を null にし `*_point` に座標を焼き込む）。孤立させない。
-- ルーティングは `straight`（直線）と `orthogonal`（直角折れ線）の 2 つ。
+- ルーティングは `orthogonal`（直角折れ線・**既定**）と `straight`（直線）の 2 つ。
+  **既定を `straight` から `orthogonal` に変えた**（2026-08-07 ユーザー判断）。
+  `straight` は設計上どの図形も避けないので、既定のままだと線が図形を貫通し、
+  しかも**コネクタは重なり判定の対象外**（bbox が斜めの包絡なので意図的に除外）
+  なので診断も何も言わない、という穴があった。「既定で正しい図になる」を優先した。
+  - モデルの既定（`ConnectorObject.routing`）**と** `tool_manager` の両方を直すこと。
+    後者が `routing=` を固定していると「エージェントが引いた線は避けるが人間が
+    引いた線は避けない」という分裂が生まれる（`tests/test_routing_avoid.py` が
+    実際にツールで線を引いて両方を守る）。
+  - 保存済み project.json は `routing` を明示的に書き出すので**既存プロジェクトの
+    見た目は変わらない**（読み込み時に既定は使われない）。
   **`orthogonal` は間にある図形を避ける**（2026-08-07。それまでは中点で 1 回折れるだけで
   図形を平気で貫通していた）。実装は `app/graphics/avoid.py`（Qt 非依存の純関数）。
   - **後方互換の要件**: 素の肘曲がり経路がどの障害物とも交差しないなら、

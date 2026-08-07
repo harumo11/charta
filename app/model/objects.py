@@ -195,7 +195,12 @@ class ConnectorObject(BaseObject):
     target_anchor: str = "center"
     source_point: list[float] = field(default_factory=lambda: [0.0, 0.0])
     target_point: list[float] = field(default_factory=lambda: [0.0, 0.0])
-    routing: str = "straight"
+    # 既定は "orthogonal"（2026-08-07 にユーザー判断で "straight" から変更）。
+    # "straight" は設計上どの図形も避けないので、既定のままだと線が図形を貫通し、
+    # しかもコネクタは重なり判定の対象外（bbox が斜めの包絡なので意図的に除外）
+    # なので診断も何も言わない。「既定で正しい図になる」を優先した。
+    # 既存の project.json は routing を明示的に保存しているので影響を受けない。
+    routing: str = "orthogonal"
     stroke: str = "#000000"
     stroke_width: float = 2.0
     dash: str = "solid"
