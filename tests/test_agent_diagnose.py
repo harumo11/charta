@@ -158,7 +158,9 @@ def test_partial_overlap_is_reported() -> None:
     )
     findings = dx.analyze(snap, ("overlap",))
     assert _codes(findings) == ["overlap"]
-    assert findings[0]["other_id"] == 2
+    # `id` は**動かすべき方**。後から重ねた側（z が手前）を動かす。
+    assert findings[0]["id"] == 2
+    assert findings[0]["other_id"] == 1
     assert findings[0]["ratio"] == pytest.approx(0.25)
 
 
@@ -196,6 +198,86 @@ def test_text_over_a_shape_is_not_an_overlap() -> None:
     assert dx.analyze(snap, ("overlap",)) == []
 
 
+def test_an_annotation_merely_colliding_with_a_block_is_reported() -> None:
+    """実機で見つけた見逃し。**免除はラベルであるときだけ**成り立つ。
+
+    ブロックの上に流れてきただけの注釈（文字の 36% しか中に無い）は
+    そのブロックのラベルではないので、重なりは単なる衝突として報告する。
+    「文字 × 図形は一律免除」にすると、この図が「所見なし」になる。
+    """
+    snap = _snapshot(
+        _obj(1, "rect", box=(80.0, 260.0, 260.0, 140.0), fill="#e8efff", z_index=0),
+        _obj(
+            2,
+            "text",
+            box=(164.0, 240.0, 252.0, 41.0),
+            text="測定条件は付録Aを参照",
+            color="#000000",
+            z_index=1,
+        ),
+    )
+    assert not dx.labels_shape(snap.objects[1], snap.objects[0])
+    findings = dx.analyze(snap, ("overlap",))
+    assert _codes(findings) == ["overlap"]
+
+
+def test_a_stray_annotation_moves_not_the_laid_out_block() -> None:
+    """**動かす側を間違えると図が壊れる。**
+
+    実機で発生: 並べたブロックの上に注釈が流れてきたとき、所見の `id` が
+    「作成順で先の方」= ブロックだったため、修正案がブロックを列から
+    追い出してレイアウトを破壊した。図形は骨格、文字は後から載せた注釈なので、
+    衝突したら**文字が動く**のが正しい。
+    """
+    block = _obj(1, "rect", box=(80.0, 260.0, 260.0, 140.0), fill="#e8efff", z_index=0)
+    note = _obj(2, "text", box=(164.0, 240.0, 252.0, 41.0), text="注釈", color="#000000", z_index=1)
+    findings = dx.analyze(_snapshot(block, note), ("overlap",))
+    assert findings[0]["id"] == note.id, "動かすのは注釈のほう"
+    assert findings[0]["other_id"] == block.id, "ブロックは基準として動かさない"
+
+
+def test_overlap_mover_prefers_the_text_regardless_of_creation_order() -> None:
+    """文字が先に作られていても、動かすのは文字（作成順は骨格かどうかと無関係）。"""
+    note = _obj(1, "text", box=(0.0, 0.0, 200.0, 60.0), text="注釈", color="#000000", z_index=1)
+    block = _obj(2, "rect", box=(50.0, 0.0, 260.0, 140.0), fill="#e8efff", z_index=0)
+    mover, anchor = dx.overlap_mover(note, block)
+    assert (mover.id, anchor.id) == (note.id, block.id)
+    assert dx.overlap_mover(block, note)[0].id == note.id, "引数の順で結果が変わらない"
+
+
+def test_the_overlap_exemption_and_the_host_rule_use_the_same_test() -> None:
+    """「ラベルか？」の判定が 2 か所に分かれると、片方だけ免除される矛盾が出る。
+
+    実際にそうなっていた（`find_host_shape` は面積の過半を要求するのに、
+    重なりの免除は無条件だった）ので、一致を機械的に守る。
+    """
+    for ratio, expected in ((1.0, True), (0.6, True), (0.36, False), (0.05, False)):
+        width = 200.0
+        # 幅 `width` の文字のうち `ratio` ぶんだけが図形に重なるように置く。
+        shape = _obj(1, "rect", box=(0.0, 0.0, width * ratio, 100.0), fill="#ffffff", z_index=0)
+        text = _obj(2, "text", box=(0.0, 20.0, width, 40.0), text="x", color="#000000", z_index=1)
+        snap = _snapshot(shape, text)
+
+        is_label = dx.labels_shape(text, shape)
+        assert is_label is expected, f"ratio={ratio}"
+        # 重なり判定の免除も、あふれ判定の host も、同じ答えでなければならない。
+        exempted = dx.analyze(snap, ("overlap",)) == []
+        hosted = dx.find_host_shape(snap, text) is not None
+        assert exempted is is_label, f"ratio={ratio}: 重なりの免除が labels_shape と食い違う"
+        assert hosted is is_label, f"ratio={ratio}: host 判定が labels_shape と食い違う"
+
+
+def test_a_shape_in_front_of_a_text_is_not_its_host() -> None:
+    """図形のほうが手前なら、それは文字を載せる器ではない（文字が隠される側）。"""
+    snap = _snapshot(
+        _obj(
+            1, "text", box=(0.0, 0.0, 200.0, 100.0), text="下敷きの文字", color="#000000", z_index=0
+        ),
+        _obj(2, "rect", box=(0.0, 0.0, 200.0, 100.0), fill="#ffffff", z_index=1),
+    )
+    assert not dx.labels_shape(snap.objects[0], snap.objects[1])
+
+
 def test_text_over_another_text_is_reported() -> None:
     """文字同士の重なりは常に破綻（実機デモで見逃していたケース）。
 
@@ -209,7 +291,8 @@ def test_text_over_another_text_is_reported() -> None:
     )
     findings = dx.analyze(snap, ("overlap",))
     assert _codes(findings) == ["overlap"]
-    assert findings[0]["other_id"] == 2
+    assert findings[0]["id"] == 2, "後から重ねた方を動かす"
+    assert findings[0]["other_id"] == 1
 
 
 def test_a_text_contained_in_another_text_is_reported() -> None:

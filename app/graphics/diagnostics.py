@@ -146,6 +146,35 @@ def _finding(code: str, obj: ObjectSnapshot, message: str, **extra: Any) -> dict
     return {"code": code, "id": obj.id, "severity": "warn", "message": message, **extra}
 
 
+#: `labels_shape` の対象になる図形の型（面を持ち、ラベルを載せる器になりうるもの）。
+_LABELABLE_TYPES = frozenset({"rect", "ellipse", "image"})
+
+
+def labels_shape(text: ObjectSnapshot, shape: ObjectSnapshot) -> bool:
+    """`text` が `shape` に**ラベル付けしている**か。
+
+    「文字が図形に重なるのは意図的（ラベルだから）」という免除は、本当に
+    ラベルであるときだけ成り立つ。図の上を流れてきただけの注釈まで免除すると、
+    実際に衝突している図を「所見なし」と報告してしまう（実機で発見）。
+
+    **この判定は 1 か所にまとめること。** 重なり判定（`check_overlap`）と
+    あふれ判定（`find_host_shape`）が別々の基準を持つと、同じ「ラベルか？」
+    という問いに 2 つの答えが出て、一方だけ免除される矛盾が生まれる
+    （`tests/test_agent_diagnose.py` が両者の一致を守る）。
+
+    条件: 文字が図形より手前にあり、**文字の面積の過半**が図形の中にあること。
+    """
+    if text.type not in _TEXTUAL_TYPES or shape.type not in _LABELABLE_TYPES:
+        return False
+    if shape.z_index >= text.z_index:
+        return False  # 図形のほうが手前なら、それは載せる器ではない
+    text_area = bx.area(text.box)
+    if text_area <= 0.0:
+        return False
+    inside = bx.obb_overlap_area(shape.box, shape.rotation, text.box, text.rotation)
+    return inside / text_area >= HOST_MIN_INSIDE_RATIO
+
+
 # --------------------------------------------------------------------------
 # 個別の検査
 # --------------------------------------------------------------------------
@@ -267,19 +296,23 @@ def check_overlap(snapshot: DocumentSnapshot, *, overlap: bool, occluded: bool) 
                 continue
             if not overlap:
                 continue
-            both_textual = a.type in _TEXTUAL_TYPES and b.type in _TEXTUAL_TYPES
-            if not both_textual:
-                if a.type in _TEXTUAL_TYPES or b.type in _TEXTUAL_TYPES:
-                    # 文字 × 図形 = ラベル付け。重なるのが仕事なので黙る。
+            a_textual = a.type in _TEXTUAL_TYPES
+            b_textual = b.type in _TEXTUAL_TYPES
+            if a_textual != b_textual:
+                # 文字 × 図形。**本当にラベルであるときだけ**免除する。
+                # 「文字が図形に重なるのは仕事」は、その図形のラベルである場合の
+                # 話であって、上を流れてきただけの注釈には当てはまらない。
+                text_obj, shape_obj = (a, b) if a_textual else (b, a)
+                if labels_shape(text_obj, shape_obj):
                     continue
+            elif not a_textual:
+                # 図形 × 図形。内包は重なり警告にしない（`occluded` の担当）。
                 if bx.obb_contains(front.box, front.rotation, back.box, back.rotation) or (
                     bx.obb_contains(back.box, back.rotation, front.box, front.rotation)
                 ):
-                    continue  # 内包は重なり警告にしない（`occluded` の担当）
-            # **文字同士の重なりは常に破綻**（内包も含む）。ラベルが図形に重なるのは
-            # 意図的だが、ラベルとキャプションが重なるのは意図的ではありえない。
-            # ここを「text はすべて対象外」で済ませると、実際に読めなくなっている
-            # 図を「所見なし」と報告してしまう（実機デモで発見）。
+                    continue
+            # 文字 × 文字はここまで素通しする。**文字同士の重なりは常に破綻**
+            # （内包も含む）。ラベルとキャプションが重なるのは意図的ではありえない。
             inter_area = bx.obb_overlap_area(a.box, a.rotation, b.box, b.rotation)
             smaller = min(bx.area(a.box), bx.area(b.box))
             if smaller <= 0.0:
@@ -287,18 +320,40 @@ def check_overlap(snapshot: DocumentSnapshot, *, overlap: bool, occluded: bool) 
             ratio = inter_area / smaller
             if ratio < OVERLAP_MIN_RATIO:
                 continue
+            mover, anchor = overlap_mover(a, b)
             findings.append(
                 _finding(
                     "overlap",
-                    a,
-                    f"オブジェクト {a.id} ({a.type}) と {b.id} ({b.type}) が"
+                    mover,
+                    f"オブジェクト {mover.id} ({mover.type}) と {anchor.id} ({anchor.type}) が"
                     f" 面積比 {ratio:.0%} で重なっています",
-                    other_id=b.id,
+                    other_id=anchor.id,
                     ratio=round(ratio, 4),
                     area=round(inter_area, 2),
                 )
             )
     return findings
+
+
+def overlap_mover(a: ObjectSnapshot, b: ObjectSnapshot) -> tuple[ObjectSnapshot, ObjectSnapshot]:
+    """重なっている 2 つのうち、**動かすべき方**と基準にする方を返す。
+
+    所見の `id` はこの「動かすべき方」にする。`corrected_call` は `id` を
+    `other_id` の下へずらすので、ここを取り違えると**整列済みの図のほうが動いて
+    レイアウトが壊れる**（実機で発生: 流れてきた注釈ではなく、並べたブロックが
+    列から外された）。
+
+    規則:
+
+    - 文字 × 図形: **文字を動かす**。図形は図の骨格で、文字は後から載せた注釈。
+    - それ以外: 後から作られた（z が手前の）方を動かす。先にあったものが
+      その図の意図で、後から重ねた方が侵入者、とみなすのが自然。
+    """
+    a_textual = a.type in _TEXTUAL_TYPES
+    b_textual = b.type in _TEXTUAL_TYPES
+    if a_textual != b_textual:
+        return (a, b) if a_textual else (b, a)
+    return (a, b) if a.z_index > b.z_index else (b, a)
 
 
 def background_behind(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> tuple[str | None, str]:
@@ -334,16 +389,11 @@ def find_host_shape(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> ObjectSn
     **面積の過半（`HOST_MIN_INSIDE_RATIO`）がその図形の中にあること**を
     ラベルである証拠として要求する。
     """
-    text_area = bx.area(obj.box)
-    if text_area <= 0.0:
-        return None
     for other in sorted(snapshot.objects, key=lambda o: o.z_index, reverse=True):
-        if other.z_index >= obj.z_index or not other.visible or other.id == obj.id:
+        if not other.visible or other.id == obj.id:
             continue
-        if other.type not in ("rect", "ellipse", "image"):
-            continue
-        inside = bx.obb_overlap_area(other.box, other.rotation, obj.box, obj.rotation)
-        if inside / text_area >= HOST_MIN_INSIDE_RATIO:
+        # 判定は `labels_shape` に一本化する（`check_overlap` の免除と同じ基準）。
+        if labels_shape(obj, other):
             return other
     return None
 
