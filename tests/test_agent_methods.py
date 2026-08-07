@@ -220,9 +220,57 @@ def test_corrected_calls_bind_to_the_real_signature(api: AgentAPI) -> None:
         api.create_objects([{"type": "connector"}])
     corrected_calls.append(excinfo.value.to_dict()["errors"][0]["corrected_call"])
 
-    assert len(corrected_calls) == 8
+    # 6) critique が返す修正案（診断コードごとに 1 種類）
+    corrected_calls.extend(_critique_corrected_calls())
+
+    assert len(corrected_calls) == 15
     for corrected in corrected_calls:
         _assert_corrected_call_is_valid(corrected)
+
+
+def _critique_corrected_calls() -> list[dict[str, Any]]:
+    """`diagnose.suggest_fix` が生成しうる全 corrected_call を、診断コードごとに集める。
+
+    `critique` の価値は「そのまま送り返せば直る呼び出し」を返すことなので、
+    ここが古くなると機能そのものが嘘になる。全コードを網羅していることも
+    同時に確かめる。
+    """
+    from app.agent import diagnose
+    from app.graphics import diagnostics
+
+    artboard = diagnostics.ArtboardSnapshot(
+        width_px=1920.0, height_px=1080.0, width_mm=170.0, target_dpi=300, background="#ffffff"
+    )
+    obj = diagnostics.ObjectSnapshot(
+        id=1,
+        type="text",
+        name="t",
+        box=(0.0, 0.0, 100.0, 50.0),
+        rotation=0.0,
+        opacity=1.0,
+        visible=True,
+        z_index=0,
+        color="#777777",
+        font_size=4.0,
+        text="x",
+        text_natural_size=(200.0, 80.0),
+    )
+    snapshot = diagnostics.DocumentSnapshot(artboard=artboard, objects=(obj,))
+    samples = [
+        {"code": "offscreen", "id": 1},
+        {"code": "degenerate", "id": 1},
+        {"code": "overlap", "id": 1, "other_id": 2},
+        {"code": "occluded", "id": 1, "by": 2},
+        {"code": "text_overflow", "id": 1},
+        {"code": "low_contrast", "id": 1, "background": "#ffffff"},
+        {"code": "small_text", "id": 1},
+    ]
+    assert {s["code"] for s in samples} == set(
+        diagnostics.CHECK_NAMES
+    ), "診断コードを増やしたら修正案もここも増やすこと"
+    calls = [diagnose.suggest_fix(sample, snapshot) for sample in samples]
+    assert all(call is not None for call in calls), "全コードに修正案があること"
+    return calls
 
 
 # --------------------------------------------------------------------------

@@ -163,6 +163,144 @@ def test_render_rejects_unknown_include(api: AgentAPI) -> None:
 
 
 # --------------------------------------------------------------------------
+# critique（機械可読な点検）
+# --------------------------------------------------------------------------
+
+
+def test_critique_finds_an_overlap_and_offers_a_sendable_fix(api: AgentAPI) -> None:
+    api.create_objects(
+        [
+            {"type": "rect", "x": 100, "y": 100, "width": 200, "height": 200, "fill": "#eeeeee"},
+            {"type": "rect", "x": 200, "y": 200, "width": 200, "height": 200, "fill": "#dddddd"},
+        ]
+    )
+    result = api.critique(checks=["overlap"])
+    assert result["summary"]["by_code"] == {"overlap": 1}
+    finding = result["findings"][0]
+    assert finding["code"] == "overlap"
+    # そのまま送り返せば直る形であること。
+    corrected = finding["corrected_call"]
+    assert corrected["tool"] == "move_objects"
+    api.move_objects(**corrected["arguments"])
+    assert api.critique(checks=["overlap"])["findings"] == []
+
+
+def test_critique_reports_nothing_for_a_clean_figure(api: AgentAPI) -> None:
+    api.create_objects(
+        [
+            {"type": "rect", "x": 100, "y": 100, "width": 100, "height": 100},
+            {"type": "rect", "x": 400, "y": 100, "width": 100, "height": 100},
+        ]
+    )
+    result = api.critique()
+    assert result["findings"] == []
+    assert result["summary"] == {"total": 0, "by_code": {}}
+
+
+def test_critique_low_contrast_fix_actually_fixes_it(api: AgentAPI) -> None:
+    api.create_objects(
+        [
+            {
+                "type": "text",
+                "x": 50,
+                "y": 50,
+                "text": "薄い文字",
+                "color": "#dddddd",
+                "font_size": 60,
+            }
+        ]
+    )
+    result = api.critique(checks=["low_contrast"])
+    assert result["findings"][0]["code"] == "low_contrast"
+    api.update_objects(**result["findings"][0]["corrected_call"]["arguments"])
+    assert api.critique(checks=["low_contrast"])["findings"] == []
+
+
+def test_critique_small_text_fix_reaches_the_threshold(api: AgentAPI) -> None:
+    api.create_objects([{"type": "text", "x": 50, "y": 50, "text": "小", "font_size": 6}])
+    result = api.critique(checks=["small_text"])
+    assert result["findings"][0]["code"] == "small_text"
+    api.update_objects(**result["findings"][0]["corrected_call"]["arguments"])
+    assert api.critique(checks=["small_text"])["findings"] == []
+
+
+def test_critique_can_omit_suggestions(api: AgentAPI) -> None:
+    api.create_objects([{"type": "text", "x": 50, "y": 50, "text": "小", "font_size": 6}])
+    result = api.critique(checks=["small_text"], include_suggestions=False)
+    assert "corrected_call" not in result["findings"][0]
+
+
+def test_critique_narrows_by_checks_and_ids(api: AgentAPI) -> None:
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 100, "y": 100, "width": 200, "height": 200, "fill": "#eeeeee"},
+            {"type": "rect", "x": 200, "y": 200, "width": 200, "height": 200, "fill": "#dddddd"},
+            {"type": "text", "x": 50, "y": 50, "text": "小", "font_size": 6},
+        ]
+    )
+    assert set(f["code"] for f in api.critique()["findings"]) >= {"overlap", "small_text"}
+    assert [f["code"] for f in api.critique(checks=["small_text"])["findings"]] == ["small_text"]
+    text_id = created["created"][2]["id"]
+    only_text = api.critique(ids=[text_id])["findings"]
+    assert all(f["id"] == text_id for f in only_text)
+
+
+def test_critique_rejects_a_bare_string_and_unknown_checks(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.critique(checks="overlap")
+    assert excinfo.value.code == "type_mismatch"
+
+    with pytest.raises(AgentError) as excinfo:
+        api.critique(checks=["overlaps"])
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "invalid_enum"
+    assert payload["suggestion"] == "overlap"
+
+
+def test_critique_changes_nothing(api: AgentAPI, window: Any) -> None:
+    """読み取り専用: revision も undo スタックも動かさない。"""
+    _make_rects(api, 3)
+    revision = window.scene.document.revision
+    undo_index = window.undo_stack.index()
+    api.critique()
+    assert window.scene.document.revision == revision
+    assert window.undo_stack.index() == undo_index
+
+
+def test_critique_async_returns_a_job_and_completes(api: AgentAPI) -> None:
+    """解析はワーカースレッドで走る（GUI を固めない）。"""
+    api.create_objects(
+        [
+            {"type": "rect", "x": 100, "y": 100, "width": 200, "height": 200, "fill": "#eeeeee"},
+            {"type": "rect", "x": 200, "y": 200, "width": 200, "height": 200, "fill": "#dddddd"},
+        ]
+    )
+    started = api.critique(checks=["overlap"], async_=True)
+    job_id = started["job"]["job_id"]
+    assert started["job"]["state"] == "running"
+    job: dict[str, Any] = started["job"]
+
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        qapp_process_events()
+        job = api.get_job(job_id)
+        if job["state"] != "running":
+            break
+    assert job["state"] == "done", job
+    assert job["result"]["summary"]["by_code"] == {"overlap": 1}
+    assert job["result"]["findings"][0]["corrected_call"]["tool"] == "move_objects"
+
+
+def qapp_process_events() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is not None:
+        app.processEvents()
+    time.sleep(0.01)
+
+
+# --------------------------------------------------------------------------
 # 生成
 # --------------------------------------------------------------------------
 
@@ -378,6 +516,165 @@ def test_move_objects_absolute_with_center_anchor(api: AgentAPI, window: Any) ->
     api.move_objects([{"id": oid, "to": [500.0, 300.0], "anchor": "center"}])
     obj = window.scene.document.object_by_id(oid)
     assert (obj.x, obj.y) == (450.0, 275.0)
+
+
+# --------------------------------------------------------------------------
+# move_objects の relative（他オブジェクト基準の配置）
+# --------------------------------------------------------------------------
+
+
+def _two_rects(api: AgentAPI) -> tuple[int, int]:
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 100, "y": 100, "width": 200, "height": 100},
+            {"type": "rect", "x": 900, "y": 900, "width": 80, "height": 40},
+        ]
+    )
+    return (created["created"][0]["id"], created["created"][1]["id"])
+
+
+@pytest.mark.parametrize(
+    ("side", "expected"),
+    [
+        ("below", (160.0, 240.0)),  # ref の下端 200 + gap 40、中央揃え
+        ("above", (160.0, 20.0)),  # ref の上端 100 - gap 40 - 高さ 40
+        ("right_of", (340.0, 130.0)),  # ref の右端 300 + gap 40、中央揃え
+        ("left_of", (-20.0, 130.0)),  # ref の左端 100 - gap 40 - 幅 80
+        ("inside", (160.0, 130.0)),  # ref の中央
+    ],
+)
+def test_relative_placement_for_each_side(
+    api: AgentAPI, window: Any, side: str, expected: tuple[float, float]
+) -> None:
+    ref_id, moved_id = _two_rects(api)
+    api.move_objects([{"id": moved_id, "relative": {"to": ref_id, "side": side, "gap": 40}}])
+    obj = window.scene.document.object_by_id(moved_id)
+    assert (obj.x, obj.y) == expected
+
+
+@pytest.mark.parametrize(
+    ("align", "expected_x"),
+    [("start", 100.0), ("center", 160.0), ("end", 220.0)],
+)
+def test_relative_align_on_the_cross_axis(
+    api: AgentAPI, window: Any, align: str, expected_x: float
+) -> None:
+    ref_id, moved_id = _two_rects(api)
+    api.move_objects(
+        [{"id": moved_id, "relative": {"to": ref_id, "side": "below", "align": align}}]
+    )
+    assert window.scene.document.object_by_id(moved_id).x == expected_x
+
+
+def test_relative_uses_the_default_gap_when_omitted(api: AgentAPI, window: Any) -> None:
+    ref_id, moved_id = _two_rects(api)
+    api.move_objects([{"id": moved_id, "relative": {"to": ref_id, "side": "below"}}])
+    assert window.scene.document.object_by_id(moved_id).y == 224.0  # 200 + 既定 gap 24
+
+
+def test_relative_chains_within_one_call(api: AgentAPI, window: Any) -> None:
+    """同じ呼び出しの中で先に動かした相手を基準にできる（鎖状レイアウトが 1 往復）。"""
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 0, "y": 0, "width": 100, "height": 50},
+            {"type": "rect", "x": 900, "y": 900, "width": 100, "height": 50},
+            {"type": "rect", "x": 800, "y": 800, "width": 100, "height": 50},
+        ]
+    )
+    a, b, c = (e["id"] for e in created["created"])
+    result = api.move_objects(
+        [
+            {"id": b, "relative": {"to": a, "side": "below", "gap": 10}},
+            {"id": c, "relative": {"to": b, "side": "below", "gap": 10}},
+        ]
+    )
+    document = window.scene.document
+    assert document.object_by_id(b).y == 60.0
+    assert document.object_by_id(c).y == 120.0, "b の**移動後**の位置を基準にしている"
+    assert len(result["moved"]) == 2
+
+
+def test_relative_chain_is_one_undo_step(api: AgentAPI, window: Any) -> None:
+    created = api.create_objects(
+        [
+            {"type": "rect", "x": 0, "y": 0, "width": 100, "height": 50},
+            {"type": "rect", "x": 900, "y": 900, "width": 100, "height": 50},
+        ]
+    )
+    a, b = (e["id"] for e in created["created"])
+    before = window.undo_stack.index()
+    api.move_objects([{"id": b, "relative": {"to": a, "side": "right_of"}}])
+    assert window.undo_stack.index() == before + 1
+    window.undo_stack.undo()
+    assert (window.scene.document.object_by_id(b).x) == 900.0
+
+
+def test_relative_can_reference_a_connector(api: AgentAPI, window: Any) -> None:
+    """基準側は解決済み bbox なので、接続中のコネクタも基準にできる。"""
+    created = api.create_objects(
+        [
+            {"ref": "A", "type": "rect", "x": 0, "y": 0, "width": 100, "height": 100},
+            {"ref": "B", "type": "rect", "x": 400, "y": 0, "width": 100, "height": 100},
+            {"type": "rect", "x": 900, "y": 900, "width": 50, "height": 20},
+        ],
+        connections=[
+            {
+                "source_ref": "A",
+                "target_ref": "B",
+                "source_anchor": "right",
+                "target_anchor": "left",
+            }
+        ],
+    )
+    label_id = created["created"][2]["id"]
+    connector_id = created["connectors"][0]["id"]
+    api.move_objects(
+        [{"id": label_id, "relative": {"to": connector_id, "side": "above", "gap": 10}}]
+    )
+    label = window.scene.document.object_by_id(label_id)
+    assert label.x == 225.0  # コネクタは x 100..400、その中央に 50 幅を置く
+    assert label.y == 20.0  # コネクタは y=50 の水平線、その 10px 上に高さ 20
+
+
+def test_relative_rejects_combining_with_to_or_dx(api: AgentAPI) -> None:
+    ref_id, moved_id = _two_rects(api)
+    for extra in ({"to": [0.0, 0.0]}, {"dx": 5.0}, {"dy": 5.0}):
+        with pytest.raises(AgentError) as excinfo:
+            api.move_objects([{"id": moved_id, "relative": {"to": ref_id}, **extra}])
+        assert excinfo.value.code == "invalid_value"
+
+
+def test_relative_rejects_unknown_side_with_a_suggestion(api: AgentAPI) -> None:
+    ref_id, moved_id = _two_rects(api)
+    with pytest.raises(AgentError) as excinfo:
+        api.move_objects([{"id": moved_id, "relative": {"to": ref_id, "side": "bellow"}}])
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "invalid_enum"
+    assert payload["suggestion"] == "below"
+    assert "below" in payload["allowed"]
+
+
+def test_relative_rejects_self_reference(api: AgentAPI) -> None:
+    _ref_id, moved_id = _two_rects(api)
+    with pytest.raises(AgentError) as excinfo:
+        api.move_objects([{"id": moved_id, "relative": {"to": moved_id}}])
+    assert excinfo.value.code == "self_reference"
+
+
+def test_relative_validation_failure_moves_nothing(api: AgentAPI, window: Any) -> None:
+    """全件検証してから適用する（2 件目が不正なら 1 件目も動かさない）。"""
+    ref_id, moved_id = _two_rects(api)
+    before = window.scene.document.object_by_id(moved_id).y
+    undo_before = window.undo_stack.index()
+    with pytest.raises(AgentError):
+        api.move_objects(
+            [
+                {"id": moved_id, "relative": {"to": ref_id, "side": "below"}},
+                {"id": moved_id, "relative": {"to": ref_id, "side": "sideways"}},
+            ]
+        )
+    assert window.scene.document.object_by_id(moved_id).y == before
+    assert window.undo_stack.index() == undo_before
 
 
 def test_writing_x_on_an_arrow_returns_a_corrected_call(api: AgentAPI) -> None:

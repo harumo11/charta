@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from PySide6.QtCore import QBuffer, QByteArray, QRectF, QTimer
 from PySide6.QtGui import QFont, QUndoCommand
 
-from app.agent import exec_env, paths, render, schema
+from app.agent import diagnose, exec_env, paths, render, schema
 from app.agent import methods as agent_methods
 from app.agent.validate import (
     AgentError,
@@ -49,6 +49,7 @@ from app.commands.commands import (
 from app.export.pdf_exporter import export_pdf
 from app.export.png_exporter import export_png
 from app.export.svg_exporter import document_to_svg, export_svg
+from app.graphics import diagnostics
 from app.graphics.routing import (
     anchor_set_for_object,
     compute_endpoints,
@@ -87,6 +88,28 @@ _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 #: `create_objects` では作れず専用ツールが要る型 -> ツール名。
 _TOOL_CREATED_TYPES: dict[str, str] = {"image": "place_image", "connector": "connect_objects"}
+
+#: `move_objects` の `relative` の語彙。
+_RELATIVE_SIDES = ("above", "below", "left_of", "right_of", "inside")
+_RELATIVE_ALIGNS = ("start", "center", "end")
+_RELATIVE_DEFAULT_GAP = 24.0
+
+
+def _suggest(value: Any, candidates: tuple[str, ...]) -> str | None:
+    """入力に近い候補名（enum の打ち間違いを 1 往復で直せるようにする）。"""
+    if not isinstance(value, str):
+        return None
+    matches = difflib.get_close_matches(value, list(candidates), n=1, cutoff=0.5)
+    return matches[0] if matches else None
+
+
+def _aligned(extent: float, cell: float, align: str) -> float:
+    """`cell` の中で `extent` を `align` に従って置いたときのオフセット。"""
+    if align == "start":
+        return 0.0
+    if align == "end":
+        return cell - extent
+    return (cell - extent) / 2.0
 
 
 class _LazyMacro:
@@ -549,6 +572,66 @@ class AgentAPI:
             payload["path"] = render.save_render(image, document, tag=f"{source}:{overlay}")
             payload["read_hint"] = "この path を読み取りツールで開いてください（base64 より安い）"
         return self._ok(**payload)
+
+    def critique(
+        self,
+        checks: list[str] | None = None,
+        ids: list[int] | None = None,
+        include_suggestions: bool = True,
+        async_: bool = False,
+    ) -> dict[str, Any]:
+        """図の破綻を**機械可読に**点検する（読み取り専用・PNG を書き出さない）。
+
+        画面外・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・出力実寸で
+        小さすぎる文字を 1 往復でまとめて返す。各所見には `corrected_call`
+        （`move_objects` / `update_objects` / `order_objects` のいずれか、
+        そのまま送れる形）が付く。
+
+        描いた直後に 1 回呼ぶのが想定用途。`render` で PNG を目視するより安く、
+        判定もぶれない。
+
+        `async_=True` にするとワーカースレッドで解析して即座に `job_id` を返す
+        （オブジェクトが数百ある図で GUI を固めないため）。結果は `get_job` で拾う。
+        解析は `Document` に触らない純関数なので、スレッドに出しても競合しない。
+        """
+        checks_tuple = self._validate_checks(checks)
+        ids_tuple = tuple(int(i) for i in ids) if ids else None
+        document = self._document
+
+        if async_:
+            job = self.jobs.start_critique(document, checks_tuple, ids_tuple, include_suggestions)
+            return self._ok(job=job.to_dict(), poll_hint="get_job(job_id) で結果を取得します")
+
+        findings, snapshot = diagnose.collect_detailed(document, checks_tuple, ids_tuple)
+        if include_suggestions:
+            findings = diagnose.with_suggestions(findings, snapshot)
+        return self._ok(
+            findings=findings,
+            summary=diagnostics.summarize(findings),
+            checks=sorted(checks_tuple or diagnose.CHECK_NAMES),
+            artboard=schema.artboard_info(document),
+        )
+
+    def _validate_checks(self, checks: list[str] | None) -> tuple[str, ...] | None:
+        """`checks` の語彙を検証する（`render(include=...)` と同じ流儀）。"""
+        if checks is None:
+            return None
+        if not isinstance(checks, list | tuple):
+            # 文字列を渡すと set() が 1 文字ずつに割れ、意味不明な invalid_enum になる。
+            raise AgentError(
+                "type_mismatch",
+                'checks は文字列の配列です（例 ["overlap"]）',
+                allowed=list(diagnose.CHECK_NAMES),
+            )
+        unknown = sorted(set(checks) - set(diagnose.CHECK_NAMES))
+        if unknown:
+            raise AgentError(
+                "invalid_enum",
+                f"checks に未知の値 {unknown} があります",
+                allowed=list(diagnose.CHECK_NAMES),
+                suggestion=_suggest(unknown[0], diagnose.CHECK_NAMES),
+            )
+        return tuple(checks)
 
     # ------------------------------------------------------------------
     # 生成
@@ -1177,6 +1260,69 @@ class AgentAPI:
                 applied.append({"id": obj.id, "changed": sorted(values)})
         return self._ok(updated=applied)
 
+    def _relative_delta(
+        self,
+        spec: Any,
+        obj: BaseObject,
+        box: tuple[float, float, float, float],
+        planned_boxes: dict[int, tuple[float, float, float, float]],
+        index: int,
+    ) -> tuple[float, float]:
+        """`{"to": 3, "side": "below", "gap": 40, "align": "center"}` を移動量に変換する。
+
+        基準側は `resolved_bounding_box`（コネクタも基準にできる）を使い、
+        同じ呼び出しで既に動かした相手は `planned_boxes` の予定位置を優先する。
+        動かされる側は生の bbox のまま（`move_objects` の他の分岐と揃える）。
+        """
+        if not isinstance(spec, dict) or "to" not in spec:
+            raise AgentError(
+                "type_mismatch",
+                "relative は {to: 基準の id, side, gap, align} です",
+                index=index,
+                allowed=list(_RELATIVE_SIDES),
+            )
+        ref = self._resolve(spec["to"], index=index)
+        if ref.id == obj.id:
+            raise AgentError(
+                "self_reference", "自分自身を基準にはできません", index=index, id=obj.id
+            )
+        side = spec.get("side", "below")
+        if side not in _RELATIVE_SIDES:
+            raise AgentError(
+                "invalid_enum",
+                f"side は {list(_RELATIVE_SIDES)} のいずれかです",
+                allowed=list(_RELATIVE_SIDES),
+                index=index,
+                suggestion=_suggest(side, _RELATIVE_SIDES),
+            )
+        align = spec.get("align", "center")
+        if align not in _RELATIVE_ALIGNS:
+            raise AgentError(
+                "invalid_enum",
+                f"align は {list(_RELATIVE_ALIGNS)} のいずれかです",
+                allowed=list(_RELATIVE_ALIGNS),
+                index=index,
+                suggestion=_suggest(align, _RELATIVE_ALIGNS),
+            )
+        try:
+            gap = float(spec.get("gap", _RELATIVE_DEFAULT_GAP))
+        except (TypeError, ValueError):
+            raise AgentError("type_mismatch", "gap は数値です", index=index) from None
+
+        rx, ry, rw, rh = planned_boxes.get(ref.id) or resolved_bounding_box(self._document, ref)
+        _x, _y, w, h = box
+
+        if side == "inside":
+            target_x = rx + _aligned(w, rw, align)
+            target_y = ry + _aligned(h, rh, align)
+        elif side in ("above", "below"):
+            target_x = rx + _aligned(w, rw, align)
+            target_y = ry - gap - h if side == "above" else ry + rh + gap
+        else:  # left_of / right_of
+            target_x = rx - gap - w if side == "left_of" else rx + rw + gap
+            target_y = ry + _aligned(h, rh, align)
+        return (target_x - box[0], target_y - box[1])
+
     def move_objects(
         self,
         items: list[dict[str, Any]] | None = None,
@@ -1188,7 +1334,16 @@ class AgentAPI:
         """オブジェクトを移動する。**幾何種別を問わず動く**唯一の移動手段。
 
         box 型は x/y、line/arrow は p1 と p2 を一緒に、コネクタは固定端点を動かす。
-        各要素はフラット: `{"id": 5, "dx": 10, "dy": 0}` か `{"id": 5, "to": [x, y]}`。
+        各要素はフラットで、3 つの形のいずれか:
+
+        - `{"id": 5, "dx": 10, "dy": 0}` — 相対移動量
+        - `{"id": 5, "to": [x, y]}` — 絶対座標（`anchor` は "top_left"（既定）か "center"）
+        - `{"id": 5, "relative": {"to": 3, "side": "below", "gap": 40, "align": "center"}}`
+          — **他オブジェクト基準の配置**
+
+        `relative` を使うと、呼び出し側が bbox を取って算術する往復が要らなくなる。
+        要素は**配列順に解決する**ので、同じ呼び出しの中で先に動かしたオブジェクトを
+        後の要素の基準にできる（鎖状のレイアウトが 1 往復で書ける）。
         """
         if moves is not None:
             raise renamed_argument("move_objects", "moves", "items")
@@ -1198,16 +1353,31 @@ class AgentAPI:
 
         document = self._document
         planned: list[tuple[BaseObject, dict[str, Any], dict[str, Any]]] = []
+        # 同じ呼び出しの中で先に動かした結果を、後の要素が基準にできるようにする。
+        # 「A の下に B、B の下に C」を 1 往復で書けるかどうかがここで決まる。
+        planned_boxes: dict[int, tuple[float, float, float, float]] = {}
         for index, spec in enumerate(items):
             if not isinstance(spec, dict) or "id" not in spec:
                 raise AgentError(
-                    "type_mismatch", "各要素は {id, dx, dy} か {id, to} です", index=index
+                    "type_mismatch",
+                    "各要素は {id, dx, dy} / {id, to} / {id, relative} のいずれかです",
+                    index=index,
                 )
             obj = self._resolve(spec["id"], index=index)
             # ここは意図的に生の bbox を使う（`translate_geom` が動かすのと同じ
             # フィールドを基準にしないと `to` の計算がずれるため）。
             box = bounding_box(obj)
-            if "to" in spec and spec["to"] is not None:
+            if spec.get("relative") is not None:
+                if spec.get("to") is not None or "dx" in spec or "dy" in spec:
+                    raise AgentError(
+                        "invalid_value",
+                        "relative は to / dx / dy と併用できません。"
+                        "1 要素につき {dx, dy} / {to} / {relative} のどれか 1 つです",
+                        index=index,
+                        id=obj.id,
+                    )
+                dx, dy = self._relative_delta(spec["relative"], obj, box, planned_boxes, index)
+            elif "to" in spec and spec["to"] is not None:
                 to = spec["to"]
                 if not isinstance(to, list | tuple) or len(to) != 2:
                     raise AgentError("type_mismatch", "to は [x, y] です", index=index)
@@ -1227,6 +1397,7 @@ class AgentAPI:
             else:
                 dx = float(spec.get("dx", 0.0))
                 dy = float(spec.get("dy", 0.0))
+            planned_boxes[obj.id] = (box[0] + dx, box[1] + dy, box[2], box[3])
             if abs(dx) < 1e-9 and abs(dy) < 1e-9:
                 continue
             old_geom, new_geom = translate_geom(obj, dx, dy)

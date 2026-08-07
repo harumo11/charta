@@ -49,7 +49,7 @@ RESERVED_KEYS: dict[str, frozenset[str]] = {
     # source_id / target_id は connector の実プロパティなので予約しない
     # （そのまま validate_values に流れるべき）。予約するのは *_ref だけ。
     "connection_item": frozenset({"source_ref", "target_ref"}),
-    "move_item": frozenset({"id", "dx", "dy", "to", "anchor"}),
+    "move_item": frozenset({"id", "dx", "dy", "to", "anchor", "relative"}),
 }
 
 #: 幾何種別 -> 幾何の真実源となるキー。

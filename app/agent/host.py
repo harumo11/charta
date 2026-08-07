@@ -38,6 +38,9 @@ READ_ONLY_METHODS: frozenset[str] = frozenset(
         "get_scene",
         "get_svg",
         "render",
+        # 人間がドラッグしている最中こそエージェントは「今どうなっているか」を
+        # 見たい。読み取りしかしないので busy ゲートを通さない。
+        "critique",
         "export_file",
         "get_job",
     }

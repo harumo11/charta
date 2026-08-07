@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 from app.graphics import diagnostics
@@ -118,15 +119,15 @@ def build_snapshot(
 
 #: 直近 1 件の結果キャッシュ。キーは (doc_uid, revision, checks)。
 #: `revision` はモデル変更のたびに進むので、古い結果が返ることはない。
-_cache: tuple[tuple[Any, ...], list[dict[str, Any]]] | None = None
+_cache: tuple[tuple[Any, ...], list[dict[str, Any]], diagnostics.DocumentSnapshot] | None = None
 
 
-def collect(
+def collect_detailed(
     document: Document,
     checks: tuple[str, ...] | None = None,
     ids: tuple[int, ...] | None = None,
-) -> list[dict[str, Any]]:
-    """診断を実行して所見の一覧を返す（GUI スレッド用の同期経路）。
+) -> tuple[list[dict[str, Any]], diagnostics.DocumentSnapshot]:
+    """所見とスナップショットを返す（GUI スレッド用の同期経路）。
 
     同じ `revision` に対する同じ検査の 2 度目以降はキャッシュを返す
     （`render(include=["warnings"])` の直後に `critique` を呼ぶ、という
@@ -135,17 +136,152 @@ def collect(
     global _cache
     key = (document.uid, document.revision, tuple(sorted(checks)) if checks else None)
     if _cache is not None and _cache[0] == key:
-        findings = _cache[1]
+        _key, findings, snapshot = _cache
     else:
-        findings = diagnostics.analyze(build_snapshot(document, checks), checks)
-        _cache = (key, findings)
+        snapshot = build_snapshot(document, checks)
+        findings = diagnostics.analyze(snapshot, checks)
+        _cache = (key, findings, snapshot)
+    return (filter_by_ids(findings, ids), snapshot)
+
+
+def collect(
+    document: Document,
+    checks: tuple[str, ...] | None = None,
+    ids: tuple[int, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """診断を実行して所見の一覧を返す。"""
+    return collect_detailed(document, checks, ids)[0]
+
+
+def filter_by_ids(
+    findings: list[dict[str, Any]], ids: tuple[int, ...] | None
+) -> list[dict[str, Any]]:
     if ids is None:
         return list(findings)
     wanted = set(ids)
-    return [f for f in findings if wanted & diagnostics._referenced_ids(f)]
+    return [f for f in findings if wanted & diagnostics.referenced_ids(f)]
 
 
 def invalidate_cache() -> None:
     """キャッシュを捨てる（テストと、ドキュメント差し替え時のため）。"""
     global _cache
     _cache = None
+
+
+# --------------------------------------------------------------------------
+# 修正案（そのまま送れる corrected_call）
+# --------------------------------------------------------------------------
+
+
+def _object(snapshot: diagnostics.DocumentSnapshot, oid: Any) -> diagnostics.ObjectSnapshot | None:
+    return next((o for o in snapshot.objects if o.id == oid), None)
+
+
+def suggest_fix(
+    finding: dict[str, Any], snapshot: diagnostics.DocumentSnapshot
+) -> dict[str, Any] | None:
+    """所見 1 件に対する `{tool, arguments, note}`。作れなければ None。
+
+    ここで返すものは**そのまま送れる呼び出し**であること。`tests/test_agent_methods.py`
+    の `test_corrected_calls_bind_to_the_real_signature` が実シグネチャに束縛できる
+    ことを恒久的に守る（提示した修正案が古くなる、が潰したかった失敗そのもの）。
+    """
+    code = finding.get("code")
+    obj = _object(snapshot, finding.get("id"))
+    if obj is None:
+        return None
+    artboard = snapshot.artboard
+
+    if code == "offscreen":
+        x, y, w, h = obj.box
+        # アートボード内へ収まる位置へクランプする。
+        to_x = min(max(x, 0.0), max(artboard.width_px - w, 0.0))
+        to_y = min(max(y, 0.0), max(artboard.height_px - h, 0.0))
+        return {
+            "tool": "move_objects",
+            "arguments": {"items": [{"id": obj.id, "to": [round(to_x, 1), round(to_y, 1)]}]},
+            "note": "アートボード内へ収まる位置に移動します",
+        }
+    if code == "degenerate":
+        return {
+            "tool": "update_objects",
+            "arguments": {"items": [{"id": obj.id, "width": 120.0, "height": 80.0}]},
+            "note": "幅・高さを正の値にします（値は目安なので図に合わせて変えてください）",
+        }
+    if code == "overlap":
+        return {
+            "tool": "move_objects",
+            "arguments": {
+                "items": [
+                    {
+                        "id": obj.id,
+                        "relative": {
+                            "to": finding["other_id"],
+                            "side": "below",
+                            "gap": 40,
+                            "align": "center",
+                        },
+                    }
+                ]
+            },
+            "note": "相手の下へずらします（side を変えれば別の方向にも寄せられます）",
+        }
+    if code == "occluded":
+        return {
+            "tool": "order_objects",
+            "arguments": {"ids": [obj.id], "action": "front"},
+            "note": "覆われている側を前面に出します",
+        }
+    if code == "text_overflow":
+        if obj.text_natural_size is not None:
+            w, h = obj.text_natural_size
+            return {
+                "tool": "update_objects",
+                "arguments": {
+                    "items": [{"id": obj.id, "width": round(w, 1), "height": round(h, 1)}]
+                },
+                "note": "文字がちょうど収まる寸法に広げます",
+            }
+        return {
+            "tool": "update_objects",
+            "arguments": {"items": [{"id": obj.id, "font_size": max(obj.font_size - 2.0, 1.0)}]},
+            "note": "箱を変えずに収めるならフォントを小さくします",
+        }
+    if code == "low_contrast":
+        from app.graphics import legibility
+
+        return {
+            "tool": "update_objects",
+            "arguments": {
+                "items": [{"id": obj.id, "color": legibility.readable_color(finding["background"])}]
+            },
+            "note": "背景に対してコントラストの取れる文字色にします",
+        }
+    if code == "small_text":
+        from app.graphics import legibility
+
+        target_px = legibility.point_size_to_px(
+            diagnostics.MIN_EFFECTIVE_PT, artboard.width_px, artboard.width_mm
+        )
+        if target_px <= 0.0:
+            return None
+        # 切り上げる。丸めで下振れすると、修正案を送っても同じ警告がもう一度出る
+        # （エージェントが往復し続ける最悪の失敗モード）。
+        font_size = math.ceil(max(target_px, obj.font_size) * 10.0) / 10.0
+        return {
+            "tool": "update_objects",
+            "arguments": {"items": [{"id": obj.id, "font_size": font_size}]},
+            "note": f"出力実寸で {diagnostics.MIN_EFFECTIVE_PT}pt になる font_size にします",
+        }
+    return None
+
+
+def with_suggestions(
+    findings: list[dict[str, Any]], snapshot: diagnostics.DocumentSnapshot
+) -> list[dict[str, Any]]:
+    """各所見に `corrected_call` を添えて返す（元の所見は書き換えない）。"""
+    enriched: list[dict[str, Any]] = []
+    for finding in findings:
+        corrected = suggest_fix(finding, snapshot)
+        enriched.append(finding if corrected is None else {**finding, "corrected_call": corrected})
+    return enriched

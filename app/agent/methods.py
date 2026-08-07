@@ -110,10 +110,19 @@ _CONNECTION_ITEM_FIELDS = (
 
 _MOVE_ITEM_FIELDS = (
     FieldSpec("id", "int", True, "対象オブジェクト"),
-    FieldSpec("dx", "number", False, "x 方向の移動量（to と併用不可）"),
-    FieldSpec("dy", "number", False, "y 方向の移動量（to と併用不可）"),
-    FieldSpec("to", "point", False, "絶対座標 [x, y]（dx/dy と併用不可）"),
+    FieldSpec("dx", "number", False, "x 方向の移動量（to / relative と併用不可）"),
+    FieldSpec("dy", "number", False, "y 方向の移動量（to / relative と併用不可）"),
+    FieldSpec("to", "point", False, "絶対座標 [x, y]（dx/dy / relative と併用不可）"),
     FieldSpec("anchor", "enum", False, "'top_left'（既定）か 'center'。to の基準点"),
+    FieldSpec(
+        "relative",
+        "unknown",
+        False,
+        "他オブジェクト基準の配置 {to: 基準の id, "
+        "side: above/below/left_of/right_of/inside, gap: 数値(既定 24), "
+        "align: start/center/end(既定 center)}。dx/dy/to と併用不可。"
+        "bbox を取って自分で算術する往復が要らなくなる",
+    ),
 )
 
 _EXEC_NOTES: tuple[str, ...] = (
@@ -155,6 +164,21 @@ METHOD_SPECS: dict[str, MethodSpec] = {
         notes=(
             "既定の include は ['warnings'] のみ。id とピクセルの対応が要るときだけ "
             "include=['objects'] を足す（件数に比例して肥大するため既定では返さない）",
+        ),
+    ),
+    "critique": MethodSpec(
+        summary="図の破綻を機械可読に点検する（画面外・退化寸法・重なり・遮蔽・"
+        "文字あふれ・低コントラスト・出力実寸で小さすぎる文字）。読み取り専用。",
+        example={"checks": ["overlap", "low_contrast"]},
+        notes=(
+            "PNG を書き出さないので render より安く、判定もぶれない。"
+            "描いた直後に 1 回呼ぶと「見えているつもり」の失敗をまとめて潰せる",
+            "各所見の corrected_call はそのまま送れる"
+            "（move_objects / update_objects / order_objects のいずれか）",
+            "checks 省略で全件。ids を渡すと、その id を参照する所見だけに絞る",
+            "async_=True で即座に job_id を返しワーカースレッドで解析する"
+            "（オブジェクトが数百ある図向け）。結果は get_job で拾う",
+            "render(include=['warnings']) も同じ検査を返すが、suggestion は付かない",
         ),
     ),
     "create_objects": MethodSpec(
@@ -246,10 +270,20 @@ METHOD_SPECS: dict[str, MethodSpec] = {
             param="items",
             element=_MOVE_ITEM_FIELDS,
             reserved=_reserved("move_item"),
-            note="{id, dx, dy} か {id, to, anchor} のどちらか",
+            note="{id, dx, dy} / {id, to, anchor} / {id, relative} のいずれか 1 つ",
         ),
-        example={"items": [{"id": 7, "dx": 40, "dy": 0}]},
+        example={
+            "items": [
+                {"id": 7, "relative": {"to": 6, "side": "below", "gap": 40, "align": "center"}}
+            ]
+        },
         deprecated_aliases={"moves": "items"},
+        notes=(
+            "relative を使えば bbox を取って自分で座標計算する往復が要らない",
+            "要素は配列順に解決するので、同じ呼び出しの中で先に動かした相手も"
+            "relative の基準にできる（A の下に B、B の下に C が 1 往復）",
+            "基準側は解決済み bbox を見るのでコネクタも基準にできる",
+        ),
     ),
     "delete_objects": MethodSpec(
         summary="オブジェクトを削除する（接続していたコネクタの端点は自動で固定化される）。",

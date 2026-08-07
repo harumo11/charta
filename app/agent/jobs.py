@@ -165,6 +165,53 @@ class JobManager(QObject):
         return job
 
     # ------------------------------------------------------------------
+    # 診断（critique の非同期経路）
+    # ------------------------------------------------------------------
+
+    def start_critique(
+        self,
+        document: Any,
+        checks: tuple[str, ...] | None,
+        ids: tuple[int, ...] | None,
+        include_suggestions: bool,
+    ) -> Job:
+        """診断をワーカースレッドで走らせる。
+
+        **スナップショットは GUI スレッドで作る**（文字採寸に Qt が要り、
+        `Document` を読むため）。ワーカーが受け取るのは frozen dataclass だけなので、
+        `Document` / `QUndoStack` / `QGraphicsItem` への同時アクセスは起きない。
+        SAM3 と同じく `QThread` ではなく plain `threading.Thread` を使う
+        （このモジュールの docstring 参照）。
+        """
+        from app.agent import diagnose
+        from app.graphics import diagnostics
+
+        snapshot = diagnose.build_snapshot(document, checks)
+        job = self._register(
+            Job("critique", {"checks": list(checks) if checks else None, "ids": list(ids or ())})
+        )
+        job.status = "解析中"
+
+        def worker() -> None:
+            try:
+                findings = diagnostics.analyze(snapshot, checks, ids)
+                if include_suggestions:
+                    findings = diagnose.with_suggestions(findings, snapshot)
+                payload = {
+                    "findings": findings,
+                    "summary": diagnostics.summarize(findings),
+                    "checks": sorted(checks or diagnostics.CHECK_NAMES),
+                    "revision": snapshot.revision,
+                }
+            except Exception as exc:  # noqa: BLE001 - ワーカーの例外はシグナルで伝える
+                self._failed.emit(job.id, f"{type(exc).__name__}: {exc}")
+                return
+            self._finished.emit(job.id, payload)
+
+        threading.Thread(target=worker, name=f"charta-{job.id}", daemon=True).start()
+        return job
+
+    # ------------------------------------------------------------------
     # GUI スレッド側のスロット
     # ------------------------------------------------------------------
 
@@ -182,15 +229,25 @@ class JobManager(QObject):
         job.state = "error"
         job.status = "失敗しました"
         job.finished_at = time.time()
-        job.error = {"code": "sam3_failed", "message": message}
+        job.error = {
+            "code": "sam3_failed" if job.kind == "mask_image" else "internal_error",
+            "message": message,
+        }
 
     @Slot(str, object)
     def _on_finished(self, job_id: str, payload: object) -> None:
-        """推論結果を **GUI スレッドで** モデルへ適用する。"""
+        """ワーカーの結果を **GUI スレッドで** 受け取る（モデル変更もここでのみ行う）。"""
         job = self._jobs.get(job_id)
         if job is None:
             return
         assert isinstance(payload, dict)
+        if job.kind == "critique":
+            # 解析結果を持ち帰るだけ。モデルには一切触らない。
+            job.state = "done"
+            job.status = "完了しました"
+            job.finished_at = time.time()
+            job.result = payload
+            return
         mask = payload.get("mask")
         job.finished_at = time.time()
         if mask is None:

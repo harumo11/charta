@@ -433,11 +433,11 @@ def analyze(
     )
     if ids is not None:
         wanted = set(ids)
-        findings = [f for f in findings if wanted & _referenced_ids(f)]
+        findings = [f for f in findings if wanted & referenced_ids(f)]
     return findings
 
 
-def _referenced_ids(finding: dict[str, Any]) -> set[int]:
+def referenced_ids(finding: dict[str, Any]) -> set[int]:
     """所見が言及している全 id（`ids` フィルタ用）。"""
     return {
         int(finding[key])
