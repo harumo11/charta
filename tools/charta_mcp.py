@@ -60,7 +60,9 @@ charta は研究図用の単ページ・ベクター作図アプリ（ローカ�
    並べる。`{"id":.., "set": {...}}` 形は廃止された）。
    引数形を忘れたら `describe_schema(method="create_objects")` のように引くこと
    （バッチ要素の形・実例・廃止された引数名まで機械可読で返る）。
-4. `render_canvas` で確認する。**思った通りに描けたと仮定しないこと。**
+4. `critique` で機械可読に点検する（診断だけなら目視より安く、判定もぶれない）。
+   崩れた図を直すだけの往復が要るなら `render_canvas` で目視すること。
+   **思った通りに描けたと仮定しないこと。**
 
 ## 作る → つなぐは 1 往復で
 `create_objects` の `items` に `"ref": "A"` を付け、同じ呼び出しの `connections` から
@@ -381,7 +383,13 @@ def render_canvas(
     戻り値には既定で `path` / `view` / `warnings` しか入らない（レスポンスを小さく保つため）。
     可視オブジェクト全件の **画像 px の bbox** が要るときだけ `include=["objects"]` を渡すと、
     `view` の変換式と合わせてオーバーレイ無しでもピクセルと id を対応付けられる。
-    `include=["all"]` で全部、`include=[]` で最小。"""
+    `include=["all"]` で全部、`include=[]` で最小。
+
+    `warnings` は全診断コードを返す: offscreen（画面外）/ degenerate（退化寸法）/
+    overlap（重なり）/ occluded（遮蔽）/ text_overflow（文字あふれ）/
+    low_contrast（低コントラスト）/ small_text（出力実寸で小さすぎる文字）。
+    **診断だけが目的なら `critique` のほうが安い**（PNG を書き出さず、各所見に
+    `corrected_call` が付く）。ここの `warnings` は PNG を見るついでに拾う位置づけ。"""
     return _call(
         "render",
         source=source,
@@ -401,6 +409,37 @@ def get_svg(outline_text: bool = False, max_bytes: int = 100_000) -> dict[str, A
     画像を含む図では Base64 で非常に大きくなるため上限で弾かれる。通常は
     `render_canvas` のほうが安い。"""
     return _call("get_svg", outline_text=outline_text, max_bytes=max_bytes)
+
+
+@mcp.tool()
+def critique(
+    checks: list[str] | None = None,
+    ids: list[int] | None = None,
+    include_suggestions: bool = True,
+    run_async: bool = False,
+) -> dict[str, Any]:
+    """図の破綻を**機械可読に**点検する（読み取り専用・PNG を書き出さない）。
+
+    画面外・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・出力実寸で
+    小さすぎる文字を 1 往復でまとめて返す。各所見には `corrected_call`
+    （`move_objects` / `update_objects` / `order_objects` のいずれか、そのまま
+    送れる形）が付く。**描いた直後にこれを 1 回呼ぶ方が `render_canvas` で
+    目視するより安く、判定もぶれない。**
+
+    `checks` を絞ると該当検査だけ（既定は全件）。`ids` を渡すと、その id を
+    参照する所見だけに絞れる。
+
+    `run_async=True`（RPC 側の引数名は `async_`）にするとワーカースレッドで
+    解析して即座に `job_id` を返す（オブジェクトが数百ある図で画面を固めない
+    ため）。結果は `get_job` で拾う。解析は `Document` に触らない純関数なので
+    スレッドに出しても競合しない。"""
+    return _call(
+        "critique",
+        checks=checks,
+        ids=ids,
+        include_suggestions=include_suggestions,
+        async_=run_async,
+    )
 
 
 @mcp.tool()
@@ -479,9 +518,22 @@ def move_objects(
 ) -> dict[str, Any]:
     """オブジェクトを移動する。**幾何種別を問わず正しく動く唯一の移動手段。**
 
-    各要素は `{"id": 7, "dx": 40, "dy": 0}` か
-    `{"id": 7, "to": [x, y], "anchor": "top_left"|"center"}`。
-    box 型は x/y、line/arrow は p1 と p2 を一緒に、connector は固定端点を動かす。"""
+    各要素はフラットで、3 つの形のいずれか 1 つ:
+    - `{"id": 7, "dx": 40, "dy": 0}` — 相対移動量
+    - `{"id": 7, "to": [x, y], "anchor": "top_left"|"center"}` — 絶対座標
+    - `{"id": 7, "relative": {"to": 3, "side": "below", "gap": 40, "align": "center"}}`
+      — 他オブジェクト基準の配置（`side`: above/below/left_of/right_of/inside、
+      `align`: start/center/end、`gap` 既定 24）。呼び出し側で bbox を取って
+      算術する往復が要らなくなる。
+
+    box 型は x/y、line/arrow は p1 と p2 を一緒に、connector は固定端点を動かす。
+    要素は**配列順に解決する**ので、同じ呼び出しの中で先に動かした相手を後の
+    要素の `relative.to` に指定できる（「A の下に B、B の下に C」が 1 往復）:
+
+        move_objects(items=[
+            {"id": B, "relative": {"to": A, "side": "below", "gap": 40}},
+            {"id": C, "relative": {"to": B, "side": "below", "gap": 40}},
+        ])"""
     return _call(
         "move_objects", items=items, undo_label=undo_label, expect_revision=expect_revision
     )
@@ -506,7 +558,8 @@ def duplicate_objects(
 def arrange_objects(
     ids: list[int], action: str, force: bool = False, relative_to: int | None = None
 ) -> dict[str, Any]:
-    """整列と等間隔分布。
+    """整列と等間隔分布。**既に置かれている箱を揃えるだけで座標は作らない。**
+    座標を作って並べたいなら `layout_objects` を使う。
 
     `action`: left | right | top | bottom | center_h | center_v（2 個以上必要）/
     distribute_h | distribute_v（3 個以上必要）。コネクタは独立した位置を持たないので対象外。
@@ -520,12 +573,91 @@ def arrange_objects(
 
 
 @mcp.tool()
+def layout_objects(
+    ids: list[int],
+    mode: str = "row",
+    gap: float = 40.0,
+    gap_y: float | None = None,
+    columns: int | None = None,
+    align: str = "start",
+    origin: list[float] | None = None,
+    force: bool = False,
+    undo_label: str | None = None,
+    expect_revision: int | None = None,
+) -> dict[str, Any]:
+    """行/列/グリッドに**座標を計算して**並べる。
+
+    `arrange_objects` は既に置かれている箱を揃えるだけで座標を作らない。
+    「3 つのブロックを等間隔で横並び」はこちらを使うと 1 往復で済む。
+
+    - `mode`: row | column | grid。並ぶ順は `ids` に渡した順（空間順ではない）。
+    - `mode="grid"` には `columns` が必須。列幅は各列の最大幅、行高は各行の最大高。
+    - `gap` が主軸方向の間隔、`gap_y` を省くと grid の行間にも `gap` を使う。
+    - `align`: start | center | end（交差軸方向の揃え）。
+    - `origin` 省略時は対象全体の現在の外接矩形の左上から並べ直す。
+    - **サイズは変えない（位置だけ）。** コネクタとロック済みは対象外。"""
+    return _call(
+        "layout_objects",
+        ids=ids,
+        mode=mode,
+        gap=gap,
+        gap_y=gap_y,
+        columns=columns,
+        align=align,
+        origin=origin,
+        force=force,
+        undo_label=undo_label,
+        expect_revision=expect_revision,
+    )
+
+
+@mcp.tool()
 def order_objects(ids: list[int], action: str, force: bool = False) -> dict[str, Any]:
     """重なり順の変更とグループ化。
 
     `action`: front | back | forward | backward | group | ungroup。
     z 順は `get_scene` の配列順が真実源で、`z` フィールドを直接書いてはいけない。"""
     return _call("order_objects", ids=ids, action=action, force=force)
+
+
+@mcp.tool()
+def apply_style(
+    ids: list[int],
+    style: dict[str, Any] | str | None = None,
+    from_id: int | None = None,
+    keys: list[str] | None = None,
+    save_as: str | None = None,
+    force: bool = False,
+    undo_label: str | None = None,
+    expect_revision: int | None = None,
+) -> dict[str, Any]:
+    """見た目キーの束を複数オブジェクトへ 1 undo ステップで配る。
+
+    束の指定は 3 形のいずれか 1 つ:
+    - `style={"stroke": "#333333", "stroke_width": 2}` — その場限りの束
+    - `style="node"` — `save_as` で登録済みの名前（`project.json` に保存される）
+    - `from_id=7` — 既存オブジェクトの見た目をコピーする
+
+    `save_as="node"` を付けるとその束を名前付きで登録する。`ids=[]` と併せれば
+    「配らずに定義だけ」もできる。
+
+    **混在した型に配ったときの挙動**: text/math は `fill`/`stroke` ではなく
+    `color` を使うなど、型によって持つキーが違う。持たないキーは黙って捨てず
+    `skipped` として報告する（`update_objects` は同じ状況を `key_not_on_type`
+    でエラーにするので、混在配布にはこちらを使う）。1 件も適用先が無い束は
+    エラーにする。幾何・内容・識別のキー（x / latex / src 等）は受け付けない
+    （それらは `update_objects` の仕事）。"""
+    return _call(
+        "apply_style",
+        ids=ids,
+        style=style,
+        from_id=from_id,
+        keys=keys,
+        save_as=save_as,
+        force=force,
+        undo_label=undo_label,
+        expect_revision=expect_revision,
+    )
 
 
 @mcp.tool()

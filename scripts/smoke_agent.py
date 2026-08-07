@@ -369,6 +369,95 @@ async def run(socket_path: str) -> None:
         check(state["object_count"] == len(after["objects"]), "オブジェクト数が一致")
         check(state["undo"]["can_redo"] is True, "redo できる状態が見える")
 
+        print("\n[18] critique（読み取り専用の機械可読診断）")
+        report = payload(await session.call_tool("critique", {}))
+        check(report["ok"] is True, "critique が成功")
+        check("findings" in report and "summary" in report, "findings/summary が返る")
+        overlapping = payload(
+            await session.call_tool(
+                "create_objects",
+                {
+                    "items": [
+                        {
+                            "type": "rect",
+                            "x": 120,
+                            "y": 1000,
+                            "width": 200,
+                            "height": 120,
+                            "name": "重なりA",
+                        },
+                        {
+                            "type": "rect",
+                            "x": 220,
+                            "y": 1040,
+                            "width": 200,
+                            "height": 120,
+                            "name": "重なりB",
+                        },
+                    ]
+                },
+            )
+        )
+        overlap_ids = [entry["id"] for entry in overlapping["created"]]
+        overlap_report = payload(
+            await session.call_tool("critique", {"checks": ["overlap"], "ids": overlap_ids})
+        )
+        check(overlap_report["ok"] is True, "checks/ids で絞った critique が成功")
+        check(
+            any(f.get("code") == "overlap" for f in overlap_report["findings"]),
+            "重なりが overlap として検出される",
+        )
+        first_finding = overlap_report["findings"][0]
+        check("corrected_call" in first_finding, "所見に corrected_call が付く")
+
+        print("\n[19] layout_objects（座標を計算して並べる）")
+        layout_ids = overlap_ids + [
+            payload(
+                await session.call_tool(
+                    "create_objects",
+                    {
+                        "items": [
+                            {
+                                "type": "rect",
+                                "x": 0,
+                                "y": 0,
+                                "width": 150,
+                                "height": 90,
+                                "name": "レイアウトC",
+                            }
+                        ]
+                    },
+                )
+            )["created"][0]["id"]
+        ]
+        layout_result = payload(
+            await session.call_tool(
+                "layout_objects", {"ids": layout_ids, "mode": "row", "gap": 60, "align": "center"}
+            )
+        )
+        check(layout_result["ok"] is True, "layout_objects が成功")
+        check(len(layout_result["moved"]) == len(layout_ids), "対象全件が並べ替えられた")
+        xs = [entry["bbox"][0] for entry in layout_result["moved"]]
+        check(xs == sorted(xs), "ids の順に横並びになっている")
+
+        print("\n[20] apply_style（見た目キーの束を配る・登録する）")
+        styled = payload(
+            await session.call_tool(
+                "apply_style",
+                {
+                    "ids": layout_ids,
+                    "style": {"stroke": "#1a2b3c", "stroke_width": 3},
+                    "save_as": "smoke_style",
+                },
+            )
+        )
+        check(styled["ok"] is True, "apply_style が成功")
+        check("smoke_style" in styled["styles"], "save_as で名前付き登録された")
+        restyled = payload(
+            await session.call_tool("apply_style", {"ids": [layout_ids[0]], "style": "smoke_style"})
+        )
+        check(restyled["ok"] is True, "登録名からの apply_style が成功")
+
 
 def main() -> int:
     runtime = Path(tempfile.mkdtemp(prefix="charta_smoke_rt_"))
