@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import MISSING
 from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -33,6 +34,7 @@ from app.model.objects import (
     TextObject,
     geometry_kind,
 )
+from app.prefs import Preferences
 
 if TYPE_CHECKING:
     from app.scene.canvas_scene import CanvasScene
@@ -89,6 +91,15 @@ _STYLE_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _dataclass_field_default(f: Any) -> Any:
+    """`dataclasses.Field` の既定値を返す（`default`/`default_factory` のどちらでも）。"""
+    if f.default is not MISSING:
+        return f.default
+    if f.default_factory is not MISSING:  # type: ignore[misc]
+        return f.default_factory()
+    return None
+
+
 class _ToolHandlers(NamedTuple):
     """1 ツール分の press/move/release/double ハンドラ束。`ToolManager._handlers` の値型。
 
@@ -107,9 +118,12 @@ class ToolManager(QObject):
 
     tool_changed = Signal(str)
 
-    def __init__(self, scene: CanvasScene) -> None:
+    def __init__(self, scene: CanvasScene, *, prefs: Preferences | None = None) -> None:
         super().__init__()
         self.scene = scene
+        # 環境設定(C契約 §C-1)。None なら新規オブジェクトの既定は全て従来どおり
+        # (dataclass 既定値のまま)で、既存の呼び出し元・テストへの回帰は無い。
+        self.prefs = prefs
         self._tool: str = "select"
         # select ツール: press 時に記録する選択群の旧幾何 {obj.id: geom_dict}
         self._select_start: dict[int, dict[str, Any]] = {}
@@ -213,6 +227,48 @@ class ToolManager(QObject):
         for key, value in self._style_memory.get(obj.type, {}).items():
             if hasattr(obj, key):
                 setattr(obj, key, value)
+
+    def _apply_pref_defaults(self, obj: Any) -> None:
+        """環境設定(`self.prefs`)の既定値を新規オブジェクトへ適用する(C契約 §C-1)。
+
+        `_push_creation` 内で `_apply_style_memory` の**直前**に呼ぶ（同種を
+        一度でも作っていれば、そのあと `_apply_style_memory` が上書きしスタイル
+        記憶が勝つ）。`self.prefs` が `None`（未配線・多くの既存テスト）なら
+        何もせず、全フィールドが dataclass 既定値のまま生成される（回帰なし）。
+
+        適用規則（フィールドを持つ型にのみ・現在値が **dataclass 既定値**の
+        ときのみ上書き。ユーザーがダイアログ等で明示的に値を変えていた場合は
+        触らない）:
+        - font_family / font_size: `prefs.default_font_family` / `default_font_size`
+        - stroke_width: `prefs.default_stroke_width`
+        - routing: `prefs.default_connector_routing`
+        - `prefs.initial_color` が `None` でなければ、stroke（図形系）と
+          color（text/math）を `initial_color` に（fill は触らない。塗りなしの
+          既定を維持する）。
+
+        「dataclass 既定値のときのみ」の判定は `dataclasses.fields(obj)` の
+        `default`/`default_factory` と比較する（text/math ダイアログ側の
+        既定値には介入しない、という `_finish_creation` の既存方針を守る）。
+        """
+        prefs = self.prefs
+        if prefs is None:
+            return
+        overrides: dict[str, Any] = {
+            "font_family": prefs.default_font_family,
+            "font_size": prefs.default_font_size,
+            "stroke_width": prefs.default_stroke_width,
+            "routing": prefs.default_connector_routing,
+        }
+        if prefs.initial_color is not None:
+            overrides["stroke"] = prefs.initial_color
+            overrides["color"] = prefs.initial_color
+        fields_by_name = {f.name: f for f in dataclass_fields(obj)}
+        for name, value in overrides.items():
+            field = fields_by_name.get(name)
+            if field is None:
+                continue
+            if getattr(obj, name) == _dataclass_field_default(field):
+                setattr(obj, name, value)
 
     def set_tool(self, name: str) -> None:
         if name not in _TOOLS:
@@ -623,8 +679,10 @@ class ToolManager(QObject):
     def _push_creation(self, obj: Any) -> bool:
         """AddObjectCommand を push し新規オブジェクトを選択する（ツール切替はしない）。
 
-        undo_stack 未設定時はモデルを変更しない(§13 と同じ方針)。push 前に sticky defaults
-        (P3契約 §4.2)を適用する。curve の「ツール切替時に下書きを確定する」経路
+        undo_stack 未設定時はモデルを変更しない(§13 と同じ方針)。push 前に環境設定の既定
+        (`_apply_pref_defaults`、C契約 §C-1)、続けて sticky defaults(P3契約 §4.2)を
+        この順で適用する（同種を一度でも作っていればスタイル記憶が勝つ）。curve の
+        「ツール切替時に下書きを確定する」経路
         （`_finish_curve_draft_on_tool_change`）は `set_tool` の途中から呼ばれるため、
         ここで `set_tool` を呼ぶと再入することになる。そのため選択までを行う
         この段と、続けて select ツールへ戻す `_finish_creation` とに分けてある。
@@ -632,6 +690,7 @@ class ToolManager(QObject):
         undo_stack = self.scene.undo_stack
         if undo_stack is None:
             return True
+        self._apply_pref_defaults(obj)
         self._apply_style_memory(obj)
         undo_stack.push(AddObjectCommand(self.scene.document, obj))
         new_item = self.scene.item_for(obj)

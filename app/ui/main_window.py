@@ -7,20 +7,24 @@ select/rect/ellipse/line/arrow/freehand/text/math/connector の9択排他）を�
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
+    QColor,
     QGuiApplication,
     QKeySequence,
     QShortcut,
     QUndoStack,
 )
 from PySide6.QtWidgets import (
+    QColorDialog,
+    QDialog,
     QDockWidget,
     QLabel,
     QMainWindow,
@@ -31,10 +35,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.commands.commands import SetStylesCommand
 from app.model.document import Artboard, Document, Physical
 from app.model.objects import BaseObject
+from app.model.palettes import Palette, palette_by_id, palette_style_bundles
 from app.panels.layer_panel import LayerPanel
 from app.panels.property_panel import PropertyPanel
+from app.prefs import Preferences, load_prefs, save_prefs
 from app.scene.canvas_scene import CanvasScene
 from app.scene.canvas_view import CanvasView
 from app.tools.tool_manager import ToolManager
@@ -46,11 +53,11 @@ from app.ui.controllers.sam3_masking import Sam3MaskController
 from app.ui.header_bar import HeaderBar
 from app.ui.mask_edit_panel import MaskEditPanel
 from app.ui.overlays import ZoomPill
+from app.ui.prefs_dialog import PrefsDialog
 from app.ui.theme import icons
 
 _LOGGER = logging.getLogger(__name__)
 
-_AUTOSAVE_INTERVAL_MS = 30_000
 # エージェント操作をステータスバーに残す時間（§15: UI は最小限）。
 _AGENT_MESSAGE_MS = 4_000
 # 画像取り込み時のウィンドウ自動リサイズの最小サイズ。
@@ -87,12 +94,19 @@ _TOOL_SHORTCUTS: dict[str, str] = {
 
 
 def _default_document() -> Document:
-    """既定の空 Document（Artboard 1920x1080, Physical(170,300), 白背景）を生成する。"""
+    """既定の空 Document を生成する（環境設定のアートボード既定値を使う。B契約 §B-2）。
+
+    引数なしの現シグネチャを維持する（`app/ui/controllers/project_io.py` や
+    `app/agent/api.py` が引数なしの callable として保持しているため）。呼ぶたびに
+    `load_prefs()` するので、環境設定ダイアログでの変更後に呼ばれる「新規」操作は
+    常に最新の既定値を反映する。
+    """
+    prefs = load_prefs()
     artboard = Artboard(
-        width_px=1920,
-        height_px=1080,
-        physical=Physical(width_mm=170.0, target_dpi=300),
-        background="#FFFFFF",
+        width_px=int(round(prefs.artboard_width_px)),
+        height_px=int(round(prefs.artboard_height_px)),
+        physical=Physical(width_mm=prefs.artboard_width_mm, target_dpi=prefs.artboard_dpi),
+        background=prefs.artboard_background,
     )
     return Document(artboard=artboard)
 
@@ -103,6 +117,9 @@ class MainWindow(QMainWindow):
     def __init__(self, document: Document | None = None) -> None:
         super().__init__()
         self.setWindowTitle("charta")
+        # 環境設定（B契約 §B-2）。ウィンドウジオメトリの復元がこの直後に続くため、
+        # 他の何より先に読み込む。
+        self.prefs: Preferences = load_prefs()
         self._apply_initial_window_size()
 
         self.undo_stack: QUndoStack = QUndoStack(self)
@@ -118,6 +135,7 @@ class MainWindow(QMainWindow):
             lambda: self._project_dir,
             # 成功通知はステータスバーのみ（成功ダイアログは出さない方針）。
             notify=lambda msg: self.statusBar().showMessage(msg, 4000),
+            prefs=self.prefs,
         )
         self._edit = EditController(self.scene, self.undo_stack)
         self._image_import = ImageImportController(
@@ -127,7 +145,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self._zoom_pill = ZoomPill(self.view)
 
-        self.tool_manager: ToolManager = ToolManager(self.scene)
+        self.tool_manager: ToolManager = ToolManager(self.scene, prefs=self.prefs)
         self.view.set_tool_manager(self.tool_manager)
         # QueuedConnection: dropEvent の同期スタック内でモーダル（保存ダイアログ/
         # エラー表示）を開くと、DnD セッション完了を待つドラッグ元アプリを
@@ -192,12 +210,12 @@ class MainWindow(QMainWindow):
         # (shiboken6.isValid) で防ぐ（例外を握りつぶすのではなく事前回避する）。
         self.undo_stack.indexChanged.connect(self._on_undo_index_changed)
 
-        # 自動保存(§9.6/§9): 30秒間隔＋closeEvent。project_dir があれば project.json
-        # も保存し、常に project.autosave.json（クラッシュ復旧用）を書き出す。
+        # 自動保存(§9.6/§9): 環境設定の間隔(既定30秒、0=OFF)＋closeEvent。project_dir
+        # があれば project.json も保存し、常に project.autosave.json（クラッシュ
+        # 復旧用）を書き出す。
         self._autosave_timer = QTimer(self)
-        self._autosave_timer.setInterval(_AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._autosave)
-        self._autosave_timer.start()
+        self._configure_autosave_timer()
 
         # ステータスバー恒常ウィジェット: カーソル座標 / アートボード寸法（P3契約 §3.2）。
         # 左から順に カーソル座標 → アートボード寸法 → エージェントインジケータ（最後尾）。
@@ -221,6 +239,9 @@ class MainWindow(QMainWindow):
         self._agent_message_timer.setSingleShot(True)
         self._agent_message_timer.setInterval(_AGENT_MESSAGE_MS)
         self._agent_message_timer.timeout.connect(self._clear_agent_message)
+
+        # 環境設定のパレットを QColorDialog のカスタムスウォッチへ反映（B契約 §B-2）。
+        self._apply_palette_swatches()
 
     # ------------------------------------------------------------------
     # ProjectIOController の状態への委譲プロパティ（テスト互換: `window._project_dir`
@@ -257,12 +278,26 @@ class MainWindow(QMainWindow):
         self._edit._clipboard = value
 
     def _apply_initial_window_size(self) -> None:
-        """起動時のウィンドウを横長基調の妥当なサイズにする。
+        """起動時のウィンドウジオメトリを決める。
 
-        明示的に resize しないと右ドック（プロパティ/レイヤー縦積み）の sizeHint に
-        引きずられて縦長になるため、アートボード(16:9)に合わせた横長を既定とし、
-        画面からはみ出さないよう利用可能領域の 85% でクランプする。
+        `prefs.window_geometry`（前回終了時に保存したもの）が有効（4要素・幅高さが
+        正）かつ、いずれかのスクリーンと交差する（マルチモニタ構成の変更等で完全に
+        画面外になっていない）なら、それをそのまま復元する。それ以外は従来の
+        既定ロジック（横長基調・利用可能領域の85%でクランプ）にフォールバックする
+        （B契約 §B-2）。
         """
+        geometry = self.prefs.window_geometry
+        if geometry is not None and len(geometry) == 4:
+            x, y, w, h = geometry
+            if w > 0 and h > 0:
+                rect = QRect(x, y, w, h)
+                if self._rect_intersects_any_screen(rect):
+                    self.setGeometry(rect)
+                    return
+
+        # 明示的に resize しないと右ドック（プロパティ/レイヤー縦積み）の sizeHint に
+        # 引きずられて縦長になるため、アートボード(16:9)に合わせた横長を既定とし、
+        # 画面からはみ出さないよう利用可能領域の 85% でクランプする。
         width, height = 1440, 900
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is not None:
@@ -270,6 +305,13 @@ class MainWindow(QMainWindow):
             width = min(width, int(avail.width() * 0.85))
             height = min(height, int(avail.height() * 0.85))
         self.resize(width, height)
+
+    @staticmethod
+    def _rect_intersects_any_screen(rect: QRect) -> bool:
+        """`rect` がいずれかのスクリーンの利用可能領域と交差するか。"""
+        return any(
+            screen.availableGeometry().intersects(rect) for screen in QGuiApplication.screens()
+        )
 
     def _resize_window_to_fit(self, rect: QRectF) -> None:
         """取り込んだ画像（の外接矩形）がビューポートを余白なく満たすようリサイズする。
@@ -385,6 +427,9 @@ class MainWindow(QMainWindow):
         re_export_action.setShortcut(QKeySequence("Ctrl+E"))
         file_menu.addSeparator()
         file_menu.addAction("アートボード設定…", self.open_artboard_settings)
+        file_menu.addSeparator()
+        prefs_action = file_menu.addAction("環境設定…", self.open_preferences)
+        prefs_action.setShortcut(QKeySequence("Ctrl+,"))
 
         edit_menu = menu_bar.addMenu("編集")
         self._undo_action = self.undo_stack.createUndoAction(self, "元に戻す")
@@ -448,14 +493,21 @@ class MainWindow(QMainWindow):
         fit_action = view_menu.addAction("全体表示", lambda: self.view.fit_to_artboard())
         fit_action.setShortcut(QKeySequence("Ctrl+0"))
         view_menu.addSeparator()
+        # 初期状態は環境設定から復元する（B契約 §B-2）。scene の実体制御は
+        # `self._edit.toggle_grid/toggle_snap` に委譲するので、setChecked() 前に
+        # 直接呼んでおき、以後のトグルでは QAction.toggled → 下記ハンドラで
+        # scene と prefs の両方を更新する（setChecked 自体は初期値と同じなら
+        # toggled を発火しないため、ここで明示的に一度合わせる）。
+        self._edit.toggle_grid(self.prefs.grid_visible)
+        self._edit.toggle_snap(self.prefs.snap_enabled)
         self._grid_action = view_menu.addAction("グリッド表示")
         self._grid_action.setCheckable(True)
-        self._grid_action.setChecked(False)
-        self._grid_action.toggled.connect(self._edit.toggle_grid)
+        self._grid_action.setChecked(self.prefs.grid_visible)
+        self._grid_action.toggled.connect(self._on_grid_toggled)
         self._snap_action = view_menu.addAction("スナップ")
         self._snap_action.setCheckable(True)
-        self._snap_action.setChecked(True)
-        self._snap_action.toggled.connect(self._edit.toggle_snap)
+        self._snap_action.setChecked(self.prefs.snap_enabled)
+        self._snap_action.toggled.connect(self._on_snap_toggled)
 
         return menu_bar
 
@@ -659,8 +711,84 @@ class MainWindow(QMainWindow):
         self.scene.clearSelection()
 
     # ------------------------------------------------------------------
-    # 自動保存（§9.6・M7契約 §9）
+    # 環境設定（B契約 §B-2）
     # ------------------------------------------------------------------
+
+    def open_preferences(self) -> None:
+        """環境設定ダイアログを開き、OK なら保存して実行時反映を行う。
+
+        `self.prefs` は `ToolManager`/`ExportController` が同一オブジェクトの
+        参照を保持しているため、差し替えず中身だけ更新する（`_update_prefs_in_place`）。
+        アートボード既定・新規オブジェクト既定は次回作成分から効くだけで、
+        現在のドキュメントには一切触れない。
+        """
+        dialog = PrefsDialog(self.prefs, on_register_styles=self._register_palette_styles)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._update_prefs_in_place(dialog.edited_prefs())
+        save_prefs(self.prefs)
+        self._apply_palette_swatches()
+        self._configure_autosave_timer()
+
+    def _update_prefs_in_place(self, new_prefs: Preferences) -> None:
+        """`self.prefs` の中身を `new_prefs` の値で丸ごと置き換える（参照は保つ）。
+
+        `ToolManager.prefs` / `ExportController._prefs` はコンストラクタで
+        `self.prefs` と同じオブジェクトを受け取っているため、参照自体を
+        差し替えると配線し直しが要る。フィールドを書き換えるだけなら、
+        既存の参照経由で即座に新しい値が見える。
+        """
+        for field in dataclasses.fields(Preferences):
+            setattr(self.prefs, field.name, getattr(new_prefs, field.name))
+
+    def _apply_palette_swatches(self) -> None:
+        """`prefs.palette_id` のパレットを `QColorDialog` のカスタム色 0..7 に載せる。
+
+        `QColorDialog.setCustomColor` はプロセス全体の static な状態に効くため、
+        `property_panel.py`/`mask_edit_panel.py` の全ての色選択ボタンに反映される。
+        パレット未選択なら何もしない（既存のカスタム色を消さない）。
+        """
+        palette = palette_by_id(self.prefs.palette_id)
+        if palette is None:
+            return
+        for i, color in enumerate(palette.colors):
+            QColorDialog.setCustomColor(i, QColor(color))
+
+    def _register_palette_styles(self, palette: Palette) -> None:
+        """`palette_style_bundles` を `document.styles` にマージし、1 undo ステップで push する。
+
+        `PrefsDialog` の「このプロジェクトに styles として登録」ボタンから呼ばれる
+        コールバック。既存の同名キー（同じパレットを登録し直した場合等）は上書きする。
+        """
+        document = self.scene.document
+        old_styles = {name: dict(values) for name, values in document.styles.items()}
+        new_styles = dict(old_styles)
+        new_styles.update(palette_style_bundles(palette))
+        text = f"パレット登録 ({palette.name})"
+        self.undo_stack.push(SetStylesCommand(document, new_styles, old_styles, text=text))
+
+    def _on_grid_toggled(self, checked: bool) -> None:
+        self._edit.toggle_grid(checked)
+        self.prefs.grid_visible = checked
+        save_prefs(self.prefs)
+
+    def _on_snap_toggled(self, checked: bool) -> None:
+        self._edit.toggle_snap(checked)
+        self.prefs.snap_enabled = checked
+        save_prefs(self.prefs)
+
+    # ------------------------------------------------------------------
+    # 自動保存（§9.6・M7契約 §9、間隔は環境設定 B契約 §B-2）
+    # ------------------------------------------------------------------
+
+    def _configure_autosave_timer(self) -> None:
+        """`prefs.autosave_interval_s` に合わせてタイマーを設定する（0 なら停止）。"""
+        interval_s = self.prefs.autosave_interval_s
+        if interval_s <= 0:
+            self._autosave_timer.stop()
+            return
+        self._autosave_timer.setInterval(interval_s * 1000)
+        self._autosave_timer.start()
 
     def _temp_autosave_path(self) -> str:
         """project_dir 未設定時の一時領域(§9)。同一プロセス内で使い回す。
@@ -681,6 +809,10 @@ class MainWindow(QMainWindow):
         # リクエストが走らないようにするため。
         self.stop_agent_server()
         self._autosave()
+        # ウィンドウジオメトリを環境設定へ記憶する（B契約 §B-2、自動記憶）。
+        geo = self.geometry()
+        self.prefs.window_geometry = [geo.x(), geo.y(), geo.width(), geo.height()]
+        save_prefs(self.prefs)
         super().closeEvent(event)
 
     # ------------------------------------------------------------------

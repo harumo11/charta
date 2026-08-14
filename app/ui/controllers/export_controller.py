@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 from app.export.pdf_exporter import export_pdf
 from app.export.png_exporter import export_png, render_artboard_image
 from app.export.svg_exporter import export_svg
+from app.prefs import Preferences
 from app.scene.canvas_scene import CanvasScene
 
 ExportKind = Literal["png", "pdf", "svg"]
@@ -50,12 +51,17 @@ class ExportController:
         scene: CanvasScene,
         default_dir: Callable[[], str | None],
         notify: Callable[[str], None] | None = None,
+        *,
+        prefs: Preferences | None = None,
     ) -> None:
         self._window = window
         self._scene = scene
         self._default_dir = default_dir
         # 成功通知（ステータスバー等）。成功ダイアログは出さない方針（UI 最小主義）。
         self._notify = notify
+        # 環境設定(C契約 §C-2)。None なら書き出しは全て従来どおり（毎回確認ダイアログ、
+        # 既定ボタンは No）で、既存の呼び出し元・テストへの回帰は無い。
+        self.prefs = prefs
         # 直近に成功したエクスポートの (kind, path, kwargs)。Ctrl+E での再書き出しに使う。
         self._last_export: tuple[ExportKind, str, dict[str, Any]] | None = None
 
@@ -69,7 +75,21 @@ class ExportController:
         return filename
 
     def _ask_outline_text(self) -> bool:
-        """テキストのアウトライン化確認（既定 OFF、§8。2026-08-02 に反転）。"""
+        """テキストのアウトライン化確認（既定 OFF、§8。2026-08-02 に反転）。
+
+        `prefs.export_confirm` が False なら確認ダイアログを出さず
+        `prefs.export_outline_text` をそのまま返す（C契約 §C-2）。確認する
+        場合も、既定ボタンは `prefs.export_outline_text`（未配線時は従来どおり
+        「しない」）に合わせる。
+        """
+        prefs = self.prefs
+        if prefs is not None and not prefs.export_confirm:
+            return prefs.export_outline_text
+        default_button = (
+            QMessageBox.StandardButton.Yes
+            if prefs is not None and prefs.export_outline_text
+            else QMessageBox.StandardButton.No
+        )
         return (
             QMessageBox.question(
                 self._window,
@@ -78,20 +98,33 @@ class ExportController:
                 "（既定: しない — Nature 等の投稿規定は編集可能なテキストを要求します。\n"
                 "アウトライン化は、提出先がフォント埋め込みを受け付けない場合のみ推奨）",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                default_button,
             )
             == QMessageBox.StandardButton.Yes
         )
 
     def _ask_transparent(self) -> bool:
-        """PNG 背景の透過確認（既定 OFF）。"""
+        """PNG 背景の透過確認（既定 OFF）。
+
+        `_ask_outline_text` と同じ方針（C契約 §C-2）: `prefs.export_confirm`
+        が False なら確認レスで `prefs.export_transparent_png` を返し、確認
+        する場合は既定ボタンをその値に合わせる。
+        """
+        prefs = self.prefs
+        if prefs is not None and not prefs.export_confirm:
+            return prefs.export_transparent_png
+        default_button = (
+            QMessageBox.StandardButton.Yes
+            if prefs is not None and prefs.export_transparent_png
+            else QMessageBox.StandardButton.No
+        )
         return (
             QMessageBox.question(
                 self._window,
                 "背景の透過",
                 "背景を透過にしますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                default_button,
             )
             == QMessageBox.StandardButton.Yes
         )
