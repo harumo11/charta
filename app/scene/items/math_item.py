@@ -76,6 +76,56 @@ def natural_math_size(
     return (max(float(size.width()), minimum), max(float(size.height()), minimum))
 
 
+def follow_math_box(
+    old_latex: str,
+    old_font_size: float,
+    new_latex: str,
+    new_font_size: float,
+    color: str,
+    old_width: float,
+    old_height: float,
+) -> dict[str, float] | None:
+    """`latex`/`font_size` の変更に box 寸法を追従させた新しい寸法を返す。
+
+    規則は `MathItem.commit_latex` と同一: 現在の高さを「旧式の自然高さに対する
+    表示倍率」とみなし、新しい自然サイズにその倍率を掛ける（高さ基準）。math の
+    box は「自然サイズ × 表示倍率」の派生値なので、`latex`/`font_size` をどの経路
+    （プロパティパネル・`update_objects`・`apply_style`）から書き換えても、この
+    関数の結果を同一 undo マクロの `SetGeometryCommand` として添えること。
+    さもないと表示は `_natural_fit_rect` で旧 box に閉じ込められたままになり、
+    「フォントを変えたのにサイズが変わらない」ように見える。
+
+    返り値は `{"width": ..., "height": ...}`。追従が不要（キーが実質不変・新値が
+    レンダリング不能・寸法変化が `_RESIZE_EPS` 以下）なら `None`。旧値が
+    レンダリング不能な場合は倍率 1.0 とみなし新しい自然寸法をそのまま返す。
+    `color` は寸法に影響しないため新旧共通でよい。
+    """
+    old_key = _cache_key_for(old_latex, old_font_size, color)
+    new_key = _cache_key_for(new_latex, new_font_size, color)
+    if old_key == new_key:
+        return None
+    try:
+        renderer, _svg = _build_renderer(new_latex, new_font_size, color)
+    except MathRenderError:
+        return None
+    size = renderer.defaultSize()
+    new_default_w, new_default_h = float(size.width()), float(size.height())
+    if new_default_w <= 0.0 or new_default_h <= 0.0:
+        return None
+    scale = 1.0
+    try:
+        old_renderer, _svg = _build_renderer(old_latex, old_font_size, color)
+        old_default_h = float(old_renderer.defaultSize().height())
+        if old_default_h > 0.0 and old_height > 0.0:
+            scale = old_height / old_default_h
+    except MathRenderError:
+        pass
+    target_w, target_h = new_default_w * scale, new_default_h * scale
+    if abs(target_w - old_width) <= _RESIZE_EPS and abs(target_h - old_height) <= _RESIZE_EPS:
+        return None
+    return {"width": target_w, "height": target_h}
+
+
 @register_item("math")
 class MathItem(BoxItem):
     """math オブジェクトを描画するアイテム。`BoxHandleSet`（8リサイズ+回転）で変形する。

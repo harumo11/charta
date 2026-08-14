@@ -836,7 +836,8 @@ class PropertyPanel(QWidget):
             new_value = le.text()
             if new_value == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
+            # _commit_scalar 経由にすることで math の latex 編集に box 追従が付く。
+            self._commit_scalar(obj, spec.key, new_value, old_value)
 
         line_edit.editingFinished.connect(on_finished)
 
@@ -954,6 +955,10 @@ class PropertyPanel(QWidget):
                     cmds.append(
                         SetPropertyCommand(self.scene.document, o, spec.key, value, old_value)
                     )
+                    # math の font_size は box 追従を同一マクロに添える（_commit_scalar と対称）。
+                    follow = self._math_follow_command(o, spec.key, value)
+                    if follow is not None:
+                        cmds.append(follow)
             self._push_macro(f"{spec.label}を変更", cmds)
 
         spin.valueChanged.connect(on_changed)
@@ -1316,9 +1321,41 @@ class PropertyPanel(QWidget):
             cmd = SetGeometryCommand(
                 self.scene.document, obj, {key: new_value}, {key: old_value}, mergeable=True
             )
-        else:
-            cmd = SetPropertyCommand(self.scene.document, obj, key, new_value, old_value)
+            self._push(cmd)
+            return
+        cmd = SetPropertyCommand(self.scene.document, obj, key, new_value, old_value)
+        follow = self._math_follow_command(obj, key, new_value)
+        if follow is not None:
+            # math の box は自然サイズ×表示倍率の派生値なので、latex/font_size の
+            # 変更には寸法追従を同一マクロで添える（math_item.follow_math_box 参照）。
+            self._push_macro("数式を変更", [cmd, follow])
+            return
         self._push(cmd)
+
+    def _math_follow_command(self, obj: BaseObject, key: str, new_value: Any) -> Any | None:
+        """math の latex/font_size 変更に伴う box 追従の SetGeometryCommand を返す。
+
+        追従が不要（math 以外・寸法に効かないキー・変化が微小・不正 latex）なら None。
+        """
+        if obj.type != "math" or key not in ("latex", "font_size"):
+            return None
+        from app.scene.items.math_item import follow_math_box
+
+        new_latex = str(new_value) if key == "latex" else obj.latex
+        new_font_size = float(new_value) if key == "font_size" else float(obj.font_size)
+        follow = follow_math_box(
+            obj.latex,
+            float(obj.font_size),
+            new_latex,
+            new_font_size,
+            obj.color,
+            float(obj.width),
+            float(obj.height),
+        )
+        if follow is None:
+            return None
+        old_geom = {k: getattr(obj, k) for k in follow}
+        return SetGeometryCommand(self.scene.document, obj, follow, old_geom)
 
     def _push(self, cmd: Any) -> None:
         if self.scene.undo_stack is None:

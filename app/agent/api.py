@@ -1250,6 +1250,10 @@ class AgentAPI:
             for obj, values in planned:
                 geom = {k: v for k, v in values.items() if k in geometry_keys}
                 scalars = {k: v for k, v in values.items() if k not in geometry_keys}
+                follow = _math_follow_geometry(obj, scalars)
+                if follow is not None and not ({"width", "height"} & geom.keys()):
+                    # width/height を明示指定されたときはそちらを尊重する。
+                    geom.update(follow)
                 if geom:
                     old = {k: _copy_value(getattr(obj, k)) for k in geom}
                     macro.push(
@@ -1713,6 +1717,8 @@ class AgentAPI:
                     )
                 )
             for obj, values, _skipped in planned:
+                # font_size が寸法に効く math は、push 前（旧値のうち）に追従寸法を計算する。
+                follow = _math_follow_geometry(obj, values)
                 for key, value in values.items():
                     macro.push(
                         SetPropertyCommand(
@@ -1722,6 +1728,13 @@ class AgentAPI:
                             value,
                             _copy_value(getattr(obj, key)),
                             text=UNDO_PREFIX + f"スタイル {key}",
+                        )
+                    )
+                if follow is not None:
+                    old_geom = {k: _copy_value(getattr(obj, k)) for k in follow}
+                    macro.push(
+                        SetGeometryCommand(
+                            document, obj, follow, old_geom, text=UNDO_PREFIX + "数式サイズ追従"
                         )
                     )
         return self._ok(
@@ -2132,6 +2145,30 @@ def _check_math_renderable(
             id=obj_id,
         )
     return None
+
+
+def _math_follow_geometry(obj: BaseObject, new_values: dict[str, Any]) -> dict[str, float] | None:
+    """math の `latex`/`font_size` 変更に伴う box 追従寸法を返す（無関係なら None）。
+
+    math の box は「自然サイズ × 表示倍率」の派生値（`follow_math_box` の docstring
+    参照）。`update_objects` と `apply_style` の両方がこの関数を通ることで、どの
+    経路で `font_size` を書いても表示サイズが追従する。
+    """
+    if getattr(obj, "type", None) != "math":
+        return None
+    if not ({"latex", "font_size"} & new_values.keys()):
+        return None
+    from app.scene.items.math_item import follow_math_box
+
+    return follow_math_box(
+        obj.latex,
+        float(obj.font_size),
+        str(new_values.get("latex", obj.latex)),
+        float(new_values.get("font_size", obj.font_size)),
+        str(new_values.get("color", obj.color)),
+        float(obj.width),
+        float(obj.height),
+    )
 
 
 def _copy_value(value: Any) -> Any:

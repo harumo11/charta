@@ -373,6 +373,84 @@ def test_math_object_number_edit(env: dict[str, Any]) -> None:
     assert math_obj.font_size == pytest.approx(18.0)
 
 
+def test_math_font_size_edit_resizes_box_in_one_undo(env: dict[str, Any]) -> None:
+    """パネルの font_size 編集で math の box が表示倍率を保って追従する（1 マクロ）。
+
+    回帰: かつては SetPropertyCommand 単発で box が変わらず、SVG は旧 box 内に
+    アスペクト維持で収まるため「サイズを変えたのに見た目が変わらない」だった。
+    """
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    math_obj = _add(
+        env, MathObject(id=scene.document.new_id(), x=0, y=0, width=100, height=20, latex="x^2")
+    )
+    _select_only(env, math_obj)
+    w0, h0 = math_obj.width, math_obj.height
+
+    spin = _field_widget(panel, "math", "font_size")
+    index_before = stack.index()
+    spin.setValue(36.0)  # 18 → 36 で自然サイズ 2 倍
+    assert stack.index() == index_before + 1, "プロパティ＋寸法追従で 1 undo ステップ"
+    assert math_obj.height == pytest.approx(h0 * 2.0, rel=0.1)
+
+    stack.undo()
+    assert math_obj.font_size == pytest.approx(18.0)
+    assert math_obj.width == pytest.approx(w0)
+    assert math_obj.height == pytest.approx(h0)
+
+
+def test_math_latex_edit_via_panel_resizes_box(env: dict[str, Any]) -> None:
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    math_obj = _add(
+        env, MathObject(id=scene.document.new_id(), x=0, y=0, width=60, height=20, latex="x^2")
+    )
+    _select_only(env, math_obj)
+    w0 = math_obj.width
+
+    line_edit = _field_widget(panel, "math", "latex")
+    assert isinstance(line_edit, QLineEdit)
+    index_before = stack.index()
+    line_edit.setText(r"x^2 + y^2 + z^2 + \alpha")
+    line_edit.editingFinished.emit()
+    assert stack.index() == index_before + 1
+    assert math_obj.latex == r"x^2 + y^2 + z^2 + \alpha"
+    assert math_obj.width > w0 * 1.5, "長い式に box 幅が追従する"
+
+    stack.undo()
+    assert math_obj.latex == "x^2"
+    assert math_obj.width == pytest.approx(w0)
+
+
+def test_multi_math_font_size_edit_resizes_both_boxes(env: dict[str, Any]) -> None:
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    m1 = _add(
+        env, MathObject(id=scene.document.new_id(), x=0, y=0, width=100, height=20, latex="x^2")
+    )
+    m2 = _add(
+        env, MathObject(id=scene.document.new_id(), x=0, y=50, width=100, height=40, latex="y^3")
+    )
+    for obj in (m1, m2):
+        item = scene.item_for(obj)
+        item.setSelected(True)
+    heights = (m1.height, m2.height)
+
+    specs = panel._multi_common_specs([m1, m2])
+    row = next(i for i, s in enumerate(specs) if s.key == "font_size")
+    item = panel._form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+    assert item is not None and item.widget() is not None
+    spin = item.widget()
+    assert isinstance(spin, QDoubleSpinBox)
+
+    index_before = stack.index()
+    spin.setValue(36.0)
+    assert stack.index() == index_before + 1, "全対象の追従込みで 1 マクロ"
+    assert m1.height == pytest.approx(heights[0] * 2.0, rel=0.1)
+    assert m2.height == pytest.approx(heights[1] * 2.0, rel=0.1)
+
+    stack.undo()
+    assert (m1.height, m2.height) == pytest.approx(heights)
+    assert m1.font_size == pytest.approx(18.0)
+
+
 def test_image_object_number_edit_brightness(env: dict[str, Any]) -> None:
     scene, stack, panel = env["scene"], env["stack"], env["panel"]
     image_obj = _add(

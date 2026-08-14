@@ -1766,3 +1766,63 @@ def test_export_file_keeps_text_editable_by_default(api: AgentAPI) -> None:
     svg = written.read_text(encoding="utf-8")
     written.unlink()
     assert "<text" in svg, "既定でテキストが <text> として残る（アウトライン化されない）"
+
+
+# --------------------------------------------------------------------------
+# math の box 追従（latex/font_size を変えたら表示サイズも変わる）
+# --------------------------------------------------------------------------
+
+
+def _make_math(api: AgentAPI, window: Any, font_size: float = 20.0) -> Any:
+    result = api.create_objects(
+        [{"type": "math", "latex": "E = mc^2", "x": 10, "y": 10, "font_size": font_size}]
+    )
+    return window.scene.document.object_by_id(result["created"][0]["id"])
+
+
+def test_math_font_size_update_resizes_box_in_one_undo_step(api: AgentAPI, window: Any) -> None:
+    """update_objects で font_size を変えると box が表示倍率を保って追従する。
+
+    回帰: かつては SetPropertyCommand だけが積まれ、SVG は旧 box 内に
+    アスペクト維持で収まるため「フォントを変えたのにサイズが変わらない」だった。
+    """
+    obj = _make_math(api, window, font_size=20.0)
+    w0, h0 = obj.width, obj.height
+    before = window.undo_stack.index()
+    api.update_objects(items=[{"id": obj.id, "font_size": 40.0}])
+    assert window.undo_stack.index() == before + 1, "追従込みで 1 undo ステップ"
+    assert obj.width == pytest.approx(w0 * 2.0, rel=0.1)
+    assert obj.height == pytest.approx(h0 * 2.0, rel=0.1)
+    window.undo_stack.undo()
+    assert obj.font_size == pytest.approx(20.0)
+    assert obj.width == pytest.approx(w0)
+    assert obj.height == pytest.approx(h0)
+
+
+def test_math_latex_update_resizes_box(api: AgentAPI, window: Any) -> None:
+    obj = _make_math(api, window)
+    w0 = obj.width
+    api.update_objects(items=[{"id": obj.id, "latex": r"E = mc^2 + \frac{p^2}{2m} + V(x)"}])
+    assert obj.width > w0 * 1.5, "長い式に box 幅が追従する"
+
+
+def test_math_explicit_size_wins_over_follow(api: AgentAPI, window: Any) -> None:
+    obj = _make_math(api, window, font_size=20.0)
+    h0 = obj.height
+    api.update_objects(items=[{"id": obj.id, "font_size": 40.0, "width": 123.0}])
+    assert obj.width == pytest.approx(123.0), "明示指定した width が自動追従に勝つ"
+    assert obj.height == pytest.approx(h0), "明示指定があるときは自動追従しない"
+
+
+def test_apply_style_font_size_on_math_resizes_box(api: AgentAPI, window: Any) -> None:
+    obj = _make_math(api, window, font_size=20.0)
+    w0, h0 = obj.width, obj.height
+    before = window.undo_stack.index()
+    api.apply_style(ids=[obj.id], style={"font_size": 40.0})
+    assert window.undo_stack.index() == before + 1
+    assert obj.width == pytest.approx(w0 * 2.0, rel=0.1)
+    assert obj.height == pytest.approx(h0 * 2.0, rel=0.1)
+    window.undo_stack.undo()
+    assert obj.font_size == pytest.approx(20.0)
+    assert obj.width == pytest.approx(w0)
+    assert obj.height == pytest.approx(h0)
