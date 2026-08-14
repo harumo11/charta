@@ -401,9 +401,16 @@ uv run python main.py --no-agent-server            # 無効化
 uv run python main.py --no-agent-exec              # charta_exec だけ無効化
 QT_QPA_PLATFORM=offscreen uv run python main.py    # ヘッドレスのエージェント常駐サービス
 
-uv sync --group agent
-claude mcp add charta -- uv run --group agent python tools/charta_mcp.py
+uv sync --group dev --group sam --group agent      # agent は他グループと並べて sync（「## 3」の注意）
+claude mcp add charta -- uv run --directory <リポジトリ絶対パス> --no-sync python tools/charta_mcp.py
 ```
+
+> 登録コマンドの注意（2026-08-15 修正）: 以前の記載 `uv run --group agent python tools/charta_mcp.py`
+> は使わないこと。`uv run` は暗黙に **exact sync**（指定グループ以外の削除）を行うため、
+> ブリッジが起動するたびに sam グループ（torch ≒ 数 GB）が venv から消える。`--no-sync` で
+> ブリッジ起動を venv 無改変にし、mcp 依存は上の `uv sync` 行で入れておく。`--directory` は
+> Claude Code がどの cwd からブリッジを起動しても動くようにするため。登録は
+> セッション開始時に接続されるので、追加した**次のセッションから** `mcp__charta__*` が使える。
 
 手打ちデバッグ:
 ```bash
