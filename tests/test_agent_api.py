@@ -1826,3 +1826,49 @@ def test_apply_style_font_size_on_math_resizes_box(api: AgentAPI, window: Any) -
     assert obj.font_size == pytest.approx(20.0)
     assert obj.width == pytest.approx(w0)
     assert obj.height == pytest.approx(h0)
+
+
+# --------------------------------------------------------------------------
+# export_file の誤引数名の誘導（実地で踏んだ format→kind の往復を回帰固定）
+# --------------------------------------------------------------------------
+
+
+def test_export_file_format_is_guided_to_kind(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.export_file(format="png", path="figure.png")
+    err = excinfo.value
+    assert err.code == "renamed_argument"
+    corrected = err.to_dict()["corrected_call"]
+    assert corrected["tool"] == "export_file"
+    assert "kind" in corrected["arguments"]
+
+
+def test_export_file_fmt_is_guided_to_kind(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.export_file(fmt="svg", path="figure.svg")
+    assert excinfo.value.code == "renamed_argument"
+
+
+def test_export_file_missing_kind_is_actionable(api: AgentAPI) -> None:
+    """kind 省略が素の TypeError ではなく allowed 付きの AgentError になる。"""
+    with pytest.raises(AgentError) as excinfo:
+        api.export_file(path="figure.png")
+    payload = excinfo.value.to_dict()
+    assert payload["code"] == "type_mismatch"
+    assert set(payload["allowed"]) == {"png", "pdf", "svg"}
+
+
+def test_export_file_missing_path_is_actionable(api: AgentAPI) -> None:
+    with pytest.raises(AgentError) as excinfo:
+        api.export_file(kind="png")
+    assert excinfo.value.code == "type_mismatch"
+
+
+def test_export_file_deprecated_aliases_are_machine_readable(api: AgentAPI) -> None:
+    """describe_schema(method="export_file") で format/fmt が deprecated と分かる。"""
+    from app.agent import methods as agent_methods
+
+    assert agent_methods.deprecated_params("export_file") == {"format", "fmt"}
+    spec = api.describe_schema(method="export_file")["methods"]["export_file"]
+    deprecated = {p["name"] for p in spec["params"] if p.get("deprecated")}
+    assert deprecated == {"format", "fmt"}

@@ -79,8 +79,15 @@ def batch_error(errors: list[FieldError], applied: int = 0) -> AgentError:
     )
 
 
-def renamed_argument(method: str, old: str, new: str, note: str = "") -> AgentError:
-    """廃止された引数名で呼ばれたときのエラー（正しい呼び方を添える）。"""
+def renamed_argument(
+    method: str, old: str, new: str, note: str = "", hint: str | None = None
+) -> AgentError:
+    """廃止された引数名で呼ばれたときのエラー（正しい呼び方を添える）。
+
+    `hint` を省略すると既定文はバッチメソッド（配列引数 = items）向けの文言になる。
+    バッチ以外のメソッド（例: `export_file` の format→kind）は自分の文脈に合う
+    hint を渡すこと。
+    """
     return AgentError(
         "renamed_argument",
         f"{method} の引数 {old!r} は {new!r} に改名されました",
@@ -89,8 +96,11 @@ def renamed_argument(method: str, old: str, new: str, note: str = "") -> AgentEr
             "arguments": {new: f"<旧 {old} の中身をそのまま>"},
             "note": note or f"{old} に渡していた配列をそのまま {new} に渡してください",
         },
-        hint="全バッチメソッドの配列引数は 'items' に統一されています。"
-        "要素の形は describe_schema(method=...) で確認できます。",
+        hint=hint
+        or (
+            "全バッチメソッドの配列引数は 'items' に統一されています。"
+            "要素の形は describe_schema(method=...) で確認できます。"
+        ),
     )
 
 

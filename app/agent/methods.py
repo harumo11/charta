@@ -342,7 +342,9 @@ METHOD_SPECS: dict[str, MethodSpec] = {
             "未保存ならランタイム配下）に置かれる。これが最も確実",
             "絶対パスは許可ルートの配下のみ。現在の値は describe_state の "
             "paths.allowed_roots / paths.default_export_dir で引ける",
+            "形式の指定は kind（format / fmt ではない。間違えると renamed_argument が返る）",
         ),
+        deprecated_aliases={"format": "kind", "fmt": "kind"},
     ),
     "manage_project": MethodSpec(
         summary="プロジェクト（project.json + assets/ を含む 1 ディレクトリ）の操作。",

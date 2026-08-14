@@ -154,9 +154,9 @@ def test_deprecated_params_are_marked_in_the_method_schema(api: AgentAPI) -> Non
             continue
         params = api.describe_schema(method=name)["methods"][name]["params"]
         by_name = {p["name"]: p for p in params}
-        for old in spec.deprecated_aliases:
+        for old, new in spec.deprecated_aliases.items():
             assert by_name[old]["deprecated"] is True, f"{name}.{old} に廃止の印が無い"
-        assert by_name["items"]["deprecated"] is False
+            assert by_name[new]["deprecated"] is False, f"{name}.{new}（改名先）に廃止の印"
 
 
 # --------------------------------------------------------------------------

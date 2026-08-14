@@ -1881,10 +1881,13 @@ class AgentAPI:
 
     def export_file(
         self,
-        kind: str,
-        path: str,
+        kind: str | None = None,
+        path: str | None = None,
         transparent: bool = False,
         outline_text: bool = False,
+        *,
+        format: str | None = None,  # noqa: A002 - 廃止エイリアス。renamed_argument で誘導する
+        fmt: str | None = None,
     ) -> dict[str, Any]:
         """出版品質で書き出す。`path` は相対にすると既定の書き出し先に置かれる。
 
@@ -1892,7 +1895,33 @@ class AgentAPI:
         編集可能なテキストを要求するため 2026-08-02 に ON→OFF へ反転済み。UI の
         `_ask_outline_text` も既定 No）。フォント埋め込みを受け付けない入稿先の
         ときだけ True にする。
+
+        `format` / `fmt` は誰もが推測しがちな誤引数名なので、素の TypeError に
+        潰さず `renamed_argument` で `kind` へ誘導する（バッチメソッドの
+        `items=None` と同じ理由で `kind`/`path` の既定を None にしてある —
+        必須のままだと「format だけを送る」呼び方が束縛エラーに潰れて誘導が
+        届かない）。
         """
+        if format is not None or fmt is not None:
+            old = "format" if format is not None else "fmt"
+            raise renamed_argument(
+                "export_file",
+                old,
+                "kind",
+                note=f"{old} に渡していた値をそのまま kind に渡してください",
+                hint=f"kind は {list(_EXPORT_KINDS)} のいずれかです。",
+            )
+        if kind is None:
+            raise AgentError(
+                "type_mismatch",
+                f"kind は必須です（{list(_EXPORT_KINDS)} のいずれか）",
+                allowed=list(_EXPORT_KINDS),
+            )
+        if path is None:
+            raise AgentError(
+                "type_mismatch",
+                "path は必須です（相対パスにすると既定の書き出し先に置かれます）",
+            )
         if kind not in _EXPORT_KINDS:
             raise AgentError(
                 "invalid_enum", f"kind は {list(_EXPORT_KINDS)} です", allowed=list(_EXPORT_KINDS)
