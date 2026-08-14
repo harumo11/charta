@@ -37,6 +37,8 @@ class CanvasScene(QGraphicsScene):
     crop_mode_changed = Signal(bool)
     #: SAM3 マスク編集モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
     mask_mode_changed = Signal(bool)
+    #: 曲線ノード編集モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
+    node_edit_mode_changed = Signal(bool)
     #: `set_document()` で document が差し替わった（P3契約 §4.1）。`ToolManager` 等が
     #: 新 document へリスナー登録し直すために購読する。
     document_replaced = Signal()
@@ -68,6 +70,10 @@ class CanvasScene(QGraphicsScene):
 
         # SAM3 マスク編集セッション（ビュー状態。CanvasView/ToolManager が参照する）。
         self._active_mask_session: object | None = None
+
+        # 曲線ノード編集モード中の CurveItem（ビュー状態。crop の追跡と対称。
+        # CurveItem を直接 import せず BaseItem として扱う）。
+        self._active_node_edit_item: BaseItem | None = None
 
         self.setSceneRect(
             0,
@@ -154,6 +160,7 @@ class CanvasScene(QGraphicsScene):
         self.document.remove_listener(self)
         self.set_active_crop_item(None)
         self._cancel_active_mask_session()
+        self._cancel_active_node_edit()
         for item in list(self._items.values()):
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
@@ -238,6 +245,52 @@ class CanvasScene(QGraphicsScene):
         if callable(cancel):
             cancel()  # session.cancel() 内で set_active_mask_session(None) が呼ばれる
         self._active_mask_session = None  # cancel が失敗しても参照は必ず切る
+
+    # ------------------------------------------------------------------
+    # 曲線ノード編集モード追跡（crop モード追跡と対称。curve 契約 §C-3）
+    # ------------------------------------------------------------------
+    def set_active_node_edit_item(self, item: BaseItem | None) -> None:
+        """ノード編集モード中の item を登録する（None で解除）。CurveItem が begin/end で呼ぶ。
+
+        同値は no-op（emit しない）。
+        """
+        if item is self._active_node_edit_item:
+            return
+        self._active_node_edit_item = item
+        self.node_edit_mode_changed.emit(item is not None)
+
+    def active_node_edit_item(self) -> BaseItem | None:
+        """ノード編集モード中の item を返す（無ければ None）。"""
+        return self._active_node_edit_item
+
+    def _cancel_active_node_edit(self, item: BaseItem | None = None) -> None:
+        """ノード編集を cancel する。item 指定時は対象一致のときだけ。
+
+        `_cancel_active_mask_session` と同型だが、こちらは明示的に try/except で
+        例外を握りつぶす。`MaskEditSession.cancel()` は内部で例外を吸収する作りだが
+        `CurveItem.cancel_node_edit()`（担当外）はその保証を持たない一方、この
+        メソッドは `remove_item_for`/`rebuild`/`_detach` というオブジェクト削除・
+        シーン破棄の経路から呼ばれる。ここで例外を伝播させると `QUndoStack` の
+        コマンド実行やシーン破棄そのものを止めかねないため、握りつぶしを
+        このメソッド自身の責務にする。
+        """
+        target = self._active_node_edit_item
+        if target is None:
+            return
+        if item is not None and target is not item:
+            return
+        cancel = getattr(target, "cancel_node_edit", None)
+        if callable(cancel):
+            try:
+                cancel()  # cancel_node_edit() 内で set_active_node_edit_item(None) が呼ばれる
+            except Exception:  # noqa: BLE001 - 削除/破棄処理を止めないため握りつぶす
+                pass
+        # cancel が失敗しても参照は必ず切る。`set_active_node_edit_item(None)` を
+        # 経由することで `node_edit_mode_changed(False)` の emit も保証する
+        # （直接代入だと cancel() が例外を投げた失敗経路でシグナルが飛ばず、
+        # `MainWindow._on_node_edit_mode_changed(False)` が呼ばれないままステータス
+        # バーの案内が残り続ける。同値ガードがあるので正常経路は no-op のまま）。
+        self.set_active_node_edit_item(None)
 
     # ------------------------------------------------------------------
     # グリッド（M7契約 §5）
@@ -400,6 +453,7 @@ class CanvasScene(QGraphicsScene):
                 # crop モード中に対象が削除された場合、破棄済み item への stale 参照を残さない。
                 self.set_active_crop_item(None)
             self._cancel_active_mask_session(item)
+            self._cancel_active_node_edit(item)
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
                 destroy_bindings()
@@ -420,6 +474,7 @@ class CanvasScene(QGraphicsScene):
         """全 item を破棄し、document.objects から再生成する（load 後に使用）。"""
         self.set_active_crop_item(None)
         self._cancel_active_mask_session()
+        self._cancel_active_node_edit()
         for item in list(self._items.values()):
             self.removeItem(item)
         self._items.clear()

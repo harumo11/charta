@@ -67,6 +67,7 @@ _TOOL_LABELS: list[tuple[str, str]] = [
     ("text", "テキスト"),
     ("math", "数式"),
     ("connector", "コネクタ"),
+    ("curve", "曲線"),
 ]
 
 # ツール切り替えの1文字ショートカット（ヘッダーバー統合契約）。テキスト編集中に奪われない
@@ -81,6 +82,7 @@ _TOOL_SHORTCUTS: dict[str, str] = {
     "text": "T",
     "math": "M",
     "connector": "C",
+    "curve": "B",
 }
 
 
@@ -180,6 +182,8 @@ class MainWindow(QMainWindow):
         self.scene.crop_mode_changed.connect(self._on_crop_mode_changed)
         # SAM3 マスク編集モード中の操作ヒントをステータスバーに出す（crop と同じ流儀）。
         self.scene.mask_mode_changed.connect(self._on_mask_mode_changed)
+        # 曲線ノード編集モード中の操作ヒントをステータスバーに出す（crop/mask と同じ流儀）。
+        self.scene.node_edit_mode_changed.connect(self._on_node_edit_mode_changed)
 
         # undo/redo後にパネル(プロパティ/レイヤー)をモデルへ再同期する。
         # _on_undo_index_changed は都度 self.property_panel/self.layer_panel を
@@ -772,6 +776,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def delete_selected(self) -> None:
+        # ノード編集中の Del はノード編集の操作対象（ハンドル等）へ向けたものでは
+        # なくオブジェクト削除に直結してしまうため、編集中はここで無視する
+        # （誤爆防止。crop/mask は Delete キーの直接ハンドラを持たないため対称の
+        # ガードは不要）。
+        if self.scene.active_node_edit_item() is not None:
+            return
         self._edit.delete_selected()
 
     def _on_crop_mode_changed(self, active: bool) -> None:
@@ -788,6 +798,16 @@ class MainWindow(QMainWindow):
         if active:
             self.statusBar().showMessage(
                 "SAM3 マスク: 左ドラッグ=正例 / 右ドラッグ=負例 / クリック=採否・ボックス削除"
+                " / Enter か外側クリックで確定 / Esc でキャンセル"
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    def _on_node_edit_mode_changed(self, active: bool) -> None:
+        """曲線ノード編集モードの開始/終了に合わせてステータスバーの操作ヒントを出し入れする。"""
+        if active:
+            self.statusBar().showMessage(
+                "ノード編集: ドラッグで移動 / 曲線上クリックで追加 / ノード右クリックで削除"
                 " / Enter か外側クリックで確定 / Esc でキャンセル"
             )
         else:

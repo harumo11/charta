@@ -170,6 +170,24 @@ _MATH_PROPS: list[PropSpec] = [
 
 _ROUTING_OPTIONS: tuple[str, ...] = ("straight", "orthogonal")
 
+_CURVE_PROPS: list[PropSpec] = [
+    PropSpec(key="fill", label="塗り", kind="color_opt"),
+    PropSpec(key="stroke", label="線色", kind="color"),
+    PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
+    PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),
+    PropSpec(key="closed", label="閉じる", kind="bool"),
+    PropSpec(
+        key="tension",
+        label="曲がり",
+        kind="number",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.05,
+        decimals=2,
+    ),
+]
+# points はパネルに出さない（オンキャンバス編集のため。crop と同じ扱い）。
+
 # connector も line 同様、x/y/width/height/rotation を出さない
 # （source_id/target_id + アンカーが幾何の真実源、§9.3）。
 # アンカー(source_anchor/target_anchor)はパネルの enum ウィジェットではなく
@@ -197,4 +215,5 @@ PROPERTIES: dict[str, list[PropSpec]] = {
     "math": COMMON_PROPS + _MATH_PROPS,
     # connector は line 同様に専用の共通プロパティリストを使う（§9.3/M6契約 §6）。
     "connector": _LINE_COMMON_PROPS + _CONNECTOR_PROPS,
+    "curve": COMMON_PROPS + _CURVE_PROPS,
 }

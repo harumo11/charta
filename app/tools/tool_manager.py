@@ -11,7 +11,7 @@ from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainterPath, QPen, QTransform, QUndoCommand
+from PySide6.QtGui import QBrush, QColor, QFont, QPainterPath, QPen, QTransform, QUndoCommand
 from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsLineItem,
@@ -20,9 +20,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.commands.commands import AddObjectCommand, SetGeometryCommand, SetPropertyCommand
+from app.graphics import curves
 from app.model.objects import (
     BaseObject,
     ConnectorObject,
+    CurveObject,
     EllipseObject,
     FreehandObject,
     LineObject,
@@ -35,7 +37,18 @@ from app.model.objects import (
 if TYPE_CHECKING:
     from app.scene.canvas_scene import CanvasScene
 
-_TOOLS = ("select", "rect", "ellipse", "line", "arrow", "freehand", "text", "math", "connector")
+_TOOLS = (
+    "select",
+    "rect",
+    "ellipse",
+    "line",
+    "arrow",
+    "freehand",
+    "text",
+    "math",
+    "connector",
+    "curve",
+)
 _DRAW_TOOLS = ("rect", "ellipse", "line", "arrow")
 
 # 移動判定/最小生成サイズのしきい値(px)。浮動小数の厳密等値比較を避けるための距離マージン。
@@ -45,6 +58,9 @@ _FREEHAND_MIN_DIST = 2.0
 # math: 新規生成時の既定 latex とレンダリング失敗時のフォールバック最小サイズ(px)。
 _MATH_DEFAULT_LATEX = "E = mc^2"
 _MATH_MIN_SIZE = 20.0
+# curve: 下書き点を追加する最小間隔(px)/始点近傍とみなし閉じる判定に使う画面px半径。
+_CURVE_MIN_DIST = 3.0
+_CURVE_CLOSE_SCREEN_PX = 10.0
 
 _MouseHandler = Callable[[Any, QPointF], bool]
 
@@ -74,11 +90,16 @@ _STYLE_KEYS: frozenset[str] = frozenset(
 
 
 class _ToolHandlers(NamedTuple):
-    """1 ツール分の press/move/release ハンドラ束。`ToolManager._handlers` の値型。"""
+    """1 ツール分の press/move/release/double ハンドラ束。`ToolManager._handlers` の値型。
+
+    `double` はダブルクリックで確定するツール（curve）だけが持つため既定値 None を
+    持たせてある。既存の 3 引数での生成はそのまま通る。
+    """
 
     press: _MouseHandler
     move: _MouseHandler
     release: _MouseHandler
+    double: _MouseHandler | None = None
 
 
 class ToolManager(QObject):
@@ -106,6 +127,16 @@ class ToolManager(QObject):
         self._math_start: QPointF | None = None
         # connector ツール: press 時に掴んだ source 候補オブジェクト（無ければ固定点）
         self._connector_source_obj: BaseObject | None = None
+        # curve ツール: 下書き中の scene 点列(2点未満は生成しない)。hover はプレビュー用の
+        # 最新マウス位置、_curve_preview/_curve_nodes_preview はライブ曲線・点マーカーの
+        # プレビュー item。
+        self._curve_points: list[QPointF] | None = None
+        self._curve_hover: QPointF | None = None
+        self._curve_preview: QGraphicsPathItem | None = None
+        self._curve_nodes_preview: QGraphicsPathItem | None = None
+        # 右クリック確定直後に Qt が合成する QContextMenuEvent を 1 回だけ抑止する
+        # ワンショットフラグ(`consume_context_menu_suppression` 参照)。
+        self._suppress_context_menu_once: bool = False
         # press〜release の間 True（`is_interacting`）。ツール別の状態だけでは
         # 「押したが何も掴めなかった」ラバーバンド選択等を取りこぼすため別に持つ。
         self._press_active: bool = False
@@ -121,6 +152,12 @@ class ToolManager(QObject):
             "connector": _ToolHandlers(
                 self._connector_press, self._connector_move, self._connector_release
             ),
+            "curve": _ToolHandlers(
+                self._curve_press,
+                self._curve_move,
+                self._curve_release,
+                self._curve_double_click,
+            ),
         }
         for _draw_tool in _DRAW_TOOLS:
             self._handlers[_draw_tool] = _ToolHandlers(
@@ -135,8 +172,14 @@ class ToolManager(QObject):
         scene.document_replaced.connect(self._on_document_replaced)
 
     def _on_document_replaced(self) -> None:
-        """`scene.document_replaced`(P3契約 §4.1): 新 document へリスナー登録し直す。"""
+        """`scene.document_replaced`(P3契約 §4.1): 新 document へリスナー登録し直す。
+
+        curve の下書きは旧 document 前提の状態（生成予定の id 等）のため、
+        document 差し替え時は確定させずに破棄する（crop/mask 同様、宙に浮いた
+        参照を残さない方針）。
+        """
         self.scene.document.add_listener(self)
+        self._cancel_curve_draft()
 
     # ------------------------------------------------------------------
     # DocumentListener 実装（sticky defaults 専用。他のコールバックは no-op）
@@ -190,6 +233,8 @@ class ToolManager(QObject):
         # 確定されないようにするため（レビュー所見 nit）。
         self._commit_active_crop()
         self._commit_active_mask()
+        self._commit_active_node_edit()
+        self._finish_curve_draft_on_tool_change()
         self._tool = name
         self.tool_changed.emit(name)
 
@@ -210,6 +255,18 @@ class ToolManager(QObject):
         session = getter() if callable(getter) else None
         if session is not None:
             session.commit()
+
+    def _commit_active_node_edit(self) -> None:
+        """曲線ノード編集モード中ならツール切替前に確定する（ダックタイピング、crop と同方針）。
+
+        `active_node_edit_item` は `CanvasScene` 側の追加 API のため、未実装の
+        scene でも壊れないようダックタイピングで呼ぶ。`CurveItem`（担当外）を
+        直接 import せず `commit_node_edit()` の呼び出しだけで連携する。
+        """
+        getter = getattr(self.scene, "active_node_edit_item", None)
+        item = getter() if callable(getter) else None
+        if item is not None:
+            item.commit_node_edit()
 
     def _clear_snap_guides(self) -> None:
         """スナップガイドを消す(M7契約 §7)。
@@ -242,9 +299,18 @@ class ToolManager(QObject):
             or self._freehand_points is not None
             or self._text_start is not None
             or self._math_start is not None
+            or self._curve_points is not None
         )
 
     def handle_mouse_press(self, event: Any, scene_pos: QPointF) -> bool:
+        # 右クリック確定の抑止フラグ（`_suppress_context_menu_once`）は合成
+        # QContextMenuEvent が届かなかった場合に立ちっぱなしになり、次の正当な
+        # 右クリックメニューを 1 回黙って食う恐れがある（レビュー所見）。
+        # `_curve_press` がフラグを立ててから `_finish_curve_draft` →
+        # `_finish_creation` → `set_tool` までを合成イベント到着より前に済ませる
+        # ため、以後のプレスは必ずその合成イベントより後に来る。よってここで
+        # 無条件にクリアしても正当な抑止を消さない。
+        self._suppress_context_menu_once = False
         handlers = self._handlers.get(self._tool)
         if handlers is None:
             return False
@@ -263,6 +329,27 @@ class ToolManager(QObject):
         if handlers is None:
             return False
         return handlers.release(event, scene_pos)
+
+    def handle_mouse_double_click(self, event: Any, scene_pos: QPointF) -> bool:
+        """ダブルクリックを持つツール（curve）に振り分ける。`double` が無いツールは非消費。
+
+        `tool == "curve"` の間は下書きが無くても常に True（消費）を返す。素通しすると
+        `QGraphicsView` の既定処理まで落ち、`ImageItem.begin_crop` 等がダブルクリックに
+        誤反応するため（curve ツール選択中は編集対象が無くてもダブルクリックは
+        curve の確定操作として扱いたい）。
+        """
+        tool = self._tool
+        handlers = self._handlers.get(tool)
+        if handlers is None or handlers.double is None:
+            return False
+        consumed = handlers.double(event, scene_pos)
+        # ★ ディスパッチ前の tool を見る。左ダブルクリック確定は
+        # `_curve_double_click` → `_finish_creation` → `set_tool("select")` を
+        # 呼ぶため、ハンドラ実行「後」の self._tool は既に "select" に変わって
+        # おり、判定が死んでいた（レビュー所見）。
+        if tool == "curve":
+            return True
+        return consumed
 
     # ------------------------------------------------------------------
     # select: 非消費。press で「選択済み・movable な BaseItem 本体」を実際に
@@ -533,24 +620,35 @@ class ToolManager(QObject):
             self._preview_item = None
         self._draw_start = None
 
-    def _finish_creation(self, obj: Any) -> bool:
-        """AddObjectCommand を push し select ツールへ戻して新規オブジェクトを選択する。
+    def _push_creation(self, obj: Any) -> bool:
+        """AddObjectCommand を push し新規オブジェクトを選択する（ツール切替はしない）。
 
         undo_stack 未設定時はモデルを変更しない(§13 と同じ方針)。push 前に sticky defaults
-        (P3契約 §4.2)を適用する。text/math のダイアログ既定値には介入しない
-        （このメソッドを通る、生成された obj への適用のみ）。
+        (P3契約 §4.2)を適用する。curve の「ツール切替時に下書きを確定する」経路
+        （`_finish_curve_draft_on_tool_change`）は `set_tool` の途中から呼ばれるため、
+        ここで `set_tool` を呼ぶと再入することになる。そのため選択までを行う
+        この段と、続けて select ツールへ戻す `_finish_creation` とに分けてある。
         """
         undo_stack = self.scene.undo_stack
         if undo_stack is None:
             return True
         self._apply_style_memory(obj)
         undo_stack.push(AddObjectCommand(self.scene.document, obj))
-        self.set_tool("select")
         new_item = self.scene.item_for(obj)
         if new_item is not None:
             self.scene.clearSelection()
             new_item.setSelected(True)
         return True
+
+    def _finish_creation(self, obj: Any) -> bool:
+        """`_push_creation` に続けて select ツールへ戻す。
+
+        text/math のダイアログ既定値には介入しない（このメソッドを通る、
+        生成された obj への適用のみ）。
+        """
+        result = self._push_creation(obj)
+        self.set_tool("select")
+        return result
 
     # ------------------------------------------------------------------
     # freehand: press で点列開始+プレビュー、move で一定距離以上離れたら点追加、
@@ -782,3 +880,232 @@ class ToolManager(QObject):
             arrow_end="triangle",
         )
         return self._finish_creation(obj)
+
+    # ------------------------------------------------------------------
+    # curve: 左クリックで点を追加し、下書きプレビュー(ライブ曲線+点マーカー)を
+    # 更新する。確定は Enter/ダブルクリック/始点近傍クリック(3点以上、closed)/
+    # 右クリック(開いたまま)のいずれか、Esc またはツール切替で破棄する(§9)。
+    # ------------------------------------------------------------------
+    def _curve_button(self, event: Any) -> Qt.MouseButton | None:
+        """`event.button()` があれば呼んで返す（無ければ None。move イベント等）。"""
+        button_getter = getattr(event, "button", None)
+        return button_getter() if callable(button_getter) else None
+
+    def _curve_press(self, event: Any, scene_pos: QPointF) -> bool:
+        button = self._curve_button(event)
+        if button == Qt.MouseButton.RightButton:
+            if self._curve_points is None:
+                # 下書きなしの右クリックは消費しない(既定のコンテキストメニューに委ねる)。
+                return False
+            # Qt は press の直後に QContextMenuEvent を合成する。確定処理で
+            # is_interacting() が False に戻るため、抑止フラグを立てておかないと
+            # 確定直後にメニューが出てしまう(`consume_context_menu_suppression` 参照)。
+            self._suppress_context_menu_once = True
+            return self._finish_curve_draft(closed=False)
+        if button is not None and button != Qt.MouseButton.LeftButton:
+            # 中ボタン等はパンを妨げないよう非消費のまま無視する。
+            return False
+        if self._curve_points is None:
+            self._curve_points = [scene_pos]
+            self._curve_hover = scene_pos
+            self._refresh_curve_preview()
+            return True
+        if len(self._curve_points) >= 3:
+            start = self._curve_points[0]
+            if (
+                math.hypot(scene_pos.x() - start.x(), scene_pos.y() - start.y())
+                <= self._curve_close_radius()
+            ):
+                # 始点近傍クリック(3点以上)は閉じて確定する。
+                return self._finish_curve_draft(closed=True)
+        last = self._curve_points[-1]
+        if math.hypot(scene_pos.x() - last.x(), scene_pos.y() - last.y()) < _CURVE_MIN_DIST:
+            # 直前点に近すぎる連打は無視する(消費はする)。
+            return True
+        self._curve_points.append(scene_pos)
+        self._curve_hover = scene_pos
+        self._refresh_curve_preview()
+        return True
+
+    def _curve_move(self, event: Any, scene_pos: QPointF) -> bool:
+        if self._curve_points is None:
+            return False
+        self._curve_hover = scene_pos
+        self._refresh_curve_preview()
+        return True
+
+    def _curve_release(self, event: Any, scene_pos: QPointF) -> bool:
+        return self._curve_points is not None
+
+    def _curve_double_click(self, event: Any, scene_pos: QPointF) -> bool:
+        button = self._curve_button(event)
+        if button is not None and button != Qt.MouseButton.LeftButton:
+            return False
+        self._dedupe_curve_tail()
+        return self._finish_curve_draft(closed=False)
+
+    def _build_curve_object(self, points: list[QPointF], *, closed: bool) -> CurveObject | None:
+        """下書き点列(2点以上)から CurveObject を組み立てる。2点未満は None。"""
+        if len(points) < 2:
+            return None
+        raw = [[p.x(), p.y()] for p in points]
+        x, y, width, height, normalized = curves.normalize_points(raw)
+        return CurveObject(
+            id=self.scene.document.new_id(),
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            points=normalized,
+            closed=closed and len(points) >= 3,
+        )
+
+    def _finish_curve_draft(self, *, closed: bool) -> bool:
+        """下書きを確定する。`closed` は 3 点以上のときのみ有効(2 点なら開いたまま)。"""
+        points = self._curve_points
+        self._cancel_curve_draft()
+        if points is None or len(points) < 2:
+            return True
+        obj = self._build_curve_object(points, closed=closed)
+        if obj is None:
+            return True
+        return self._finish_creation(obj)
+
+    def _cancel_curve_draft(self) -> None:
+        """下書きを破棄する(冪等)。モデルには一切触れない。"""
+        if self._curve_preview is not None:
+            item_scene = self._curve_preview.scene()
+            if item_scene is not None:
+                item_scene.removeItem(self._curve_preview)
+            self._curve_preview = None
+        if self._curve_nodes_preview is not None:
+            item_scene = self._curve_nodes_preview.scene()
+            if item_scene is not None:
+                item_scene.removeItem(self._curve_nodes_preview)
+            self._curve_nodes_preview = None
+        self._curve_points = None
+        self._curve_hover = None
+
+    def _finish_curve_draft_on_tool_change(self) -> None:
+        """`set_tool` からのみ呼ぶ: 下書き(2点以上)を確定するが select ツールへは戻さない。
+
+        `set_tool` の実行途中から呼ばれるため、ここで `set_tool("select")` を
+        呼ぶ `_finish_creation` を使うと再入する。`_push_creation` だけを使う。
+        """
+        points = self._curve_points
+        self._cancel_curve_draft()
+        if points is None or len(points) < 2:
+            return
+        obj = self._build_curve_object(points, closed=False)
+        if obj is not None:
+            self._push_creation(obj)
+
+    def _refresh_curve_preview(self) -> None:
+        """置いた点＋hover からライブ曲線と点マーカーのプレビューを更新する。
+
+        始点の閉じ判定半径内に hover がある間は、hover を含めず既存点だけで
+        閉じたプレビューを描き、始点を大きめの点でハイライトする。
+        """
+        points = self._curve_points
+        if points is None:
+            return
+        hover = self._curve_hover
+        closing = (
+            hover is not None
+            and len(points) >= 3
+            and math.hypot(hover.x() - points[0].x(), hover.y() - points[0].y())
+            <= self._curve_close_radius()
+        )
+        if closing:
+            anchor_points = list(points)
+        elif hover is not None:
+            anchor_points = points + [hover]
+        else:
+            anchor_points = points
+
+        anchors = [(p.x(), p.y()) for p in anchor_points]
+        segments = curves.catmull_rom_segments(
+            anchors, closed=closing, tension=curves.DEFAULT_TENSION
+        )
+
+        path = QPainterPath()
+        if anchors:
+            path.moveTo(anchors[0][0], anchors[0][1])
+            for c1, c2, end in segments:
+                path.cubicTo(c1[0], c1[1], c2[0], c2[1], end[0], end[1])
+            if closing:
+                path.closeSubpath()
+
+        nodes_path = QPainterPath()
+        marker_r = 3.0
+        for p in points:
+            nodes_path.addEllipse(p, marker_r, marker_r)
+        if closing:
+            nodes_path.addEllipse(points[0], marker_r * 1.8, marker_r * 1.8)
+
+        if self._curve_preview is None:
+            pen = QPen(QColor("#3399ff"))
+            pen.setCosmetic(True)
+            pen.setWidthF(2.0)
+            preview_item = QGraphicsPathItem()
+            preview_item.setPen(pen)
+            preview_item.setZValue(1000000.0)
+            self.scene.addItem(preview_item)
+            self._curve_preview = preview_item
+        self._curve_preview.setPath(path)
+
+        if self._curve_nodes_preview is None:
+            node_pen = QPen(QColor("#3399ff"))
+            node_pen.setCosmetic(True)
+            nodes_item = QGraphicsPathItem()
+            nodes_item.setPen(node_pen)
+            nodes_item.setBrush(QBrush(QColor("#ffffff")))
+            nodes_item.setZValue(1000001.0)
+            self.scene.addItem(nodes_item)
+            self._curve_nodes_preview = nodes_item
+        self._curve_nodes_preview.setPath(nodes_path)
+
+    def _curve_close_radius(self) -> float:
+        """`_CURVE_CLOSE_SCREEN_PX`(画面px) を現在のズーム倍率で scene 単位に換算する。
+
+        `views()` が空(ヘッドレス・テスト)の場合は 1.0 で割る(IndexError 防止。
+        つまり画面 px = scene 単位とみなす)。
+        """
+        views = self.scene.views()
+        scale = views[0].transform().m11() if views else 1.0
+        if not scale:
+            scale = 1.0
+        return _CURVE_CLOSE_SCREEN_PX / scale
+
+    def _dedupe_curve_tail(self) -> None:
+        """末尾 2 点が `_CURVE_MIN_DIST` 未満なら末尾の点を落とす(ダブルクリックの重複対策)。"""
+        if self._curve_points is None or len(self._curve_points) < 2:
+            return
+        a = self._curve_points[-2]
+        b = self._curve_points[-1]
+        if math.hypot(b.x() - a.x(), b.y() - a.y()) < _CURVE_MIN_DIST:
+            self._curve_points.pop()
+
+    # -- curve 公開 API(CanvasView・エージェント/テストから使う) ----------------
+
+    def has_curve_draft(self) -> bool:
+        """curve の下書き中かどうか。"""
+        return self._curve_points is not None
+
+    def commit_curve_draft(self, *, closed: bool = False) -> bool:
+        """curve の下書きを外部(Enter キー等)から確定する。"""
+        return self._finish_curve_draft(closed=closed)
+
+    def cancel_curve_draft(self) -> None:
+        """curve の下書きを外部(Esc キー等)から破棄する。"""
+        self._cancel_curve_draft()
+
+    def consume_context_menu_suppression(self) -> bool:
+        """右クリック確定直後の合成 QContextMenuEvent 抑止フラグを 1 回だけ消費する。
+
+        ワンショット: 読み取ると同時に False に戻す。`CanvasView.contextMenuEvent`
+        から呼ぶ想定。
+        """
+        flag = self._suppress_context_menu_once
+        self._suppress_context_menu_once = False
+        return flag

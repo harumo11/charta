@@ -261,6 +261,10 @@ class CanvasView(QGraphicsView):
             return
         if self._handle_crop_key(event):
             return
+        if self._handle_node_edit_key(event):
+            return
+        if self._handle_curve_draft_key(event):
+            return
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             if not self._space_panning:
                 self._space_panning = True
@@ -362,14 +366,83 @@ class CanvasView(QGraphicsView):
         event.accept()
         return True
 
+    # -- 曲線ノード編集モード（Enter=確定 / Esc=キャンセル / 外側クリック=確定） --
+
+    def _active_node_edit_item(self):  # noqa: ANN202 - CurveItem への import 循環を避ける
+        """ノード編集モード中の item を返す（無ければ None。`_active_crop_item` と同型）。"""
+        scene = self.scene()
+        getter = getattr(scene, "active_node_edit_item", None)
+        return getter() if callable(getter) else None
+
+    def _handle_node_edit_key(self, event: QKeyEvent) -> bool:
+        """ノード編集モード中の Enter=commit / Esc=cancel（処理したら True）。"""
+        node_item = self._active_node_edit_item()
+        if node_item is None:
+            return False
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            node_item.commit_node_edit()
+            event.accept()
+            return True
+        if event.key() == Qt.Key.Key_Escape:
+            node_item.cancel_node_edit()
+            event.accept()
+            return True
+        return False
+
+    def _commit_node_edit_on_outside_press(self, event: QMouseEvent) -> bool:
+        """ノード編集対象の外側を左クリックしたら確定し、そのクリックは消費する。
+
+        対象自身・オーバーレイ・ハンドル（子孫アイテム）上の押下は通常処理へ通す
+        （`_commit_crop_on_outside_press` と同一方式）。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        node_item = self._active_node_edit_item()
+        if node_item is None:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        hit = self.scene().itemAt(scene_pos, self.transform())
+        if hit is not None and (hit is node_item or node_item.isAncestorOf(hit)):
+            return False
+        node_item.commit_node_edit()
+        event.accept()
+        return True
+
+    # -- curve ツールの下書き（Enter=確定 / Esc=キャンセル） ---------------------
+
+    def _handle_curve_draft_key(self, event: QKeyEvent) -> bool:
+        """curve ツールの下書き中の Enter=commit / Esc=cancel（処理したら True）。"""
+        if self.tool_manager is None or not self.tool_manager.has_curve_draft():
+            return False
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.tool_manager.commit_curve_draft()
+            event.accept()
+            return True
+        if event.key() == Qt.Key.Key_Escape:
+            self.tool_manager.cancel_curve_draft()
+            event.accept()
+            return True
+        return False
+
     # -- 右クリックメニュー起点(P3契約 §1) ------------------------------------
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
-        """crop/マスク編集中・操作中は無視し、それ以外は `context_menu_requested` を emit する。
+        """crop/マスク/ノード編集中・操作中は無視し、それ以外は `context_menu_requested` を emit。
 
         マスク編集は右ドラッグ=負例ボックスに使うため、右クリックメニューを出さない。
+        ノード編集中の右クリックはノード削除に使うため同様に無視する。curve 下書き中に
+        右クリックで確定した直後は、Qt が press の後に合成する QContextMenuEvent を
+        1 回だけ抑止する（`consume_context_menu_suppression`。`is_interacting()` の
+        判定より前に消費すること — 確定処理で下書きは既に無くなっているため）。
         """
-        if self._active_crop_item() is not None or self._active_mask_session() is not None:
+        if self.tool_manager is not None and self.tool_manager.consume_context_menu_suppression():
+            event.ignore()
+            return
+        if (
+            self._active_crop_item() is not None
+            or self._active_mask_session() is not None
+            or self._active_node_edit_item() is not None
+        ):
             event.ignore()
             return
         if self.tool_manager is not None and self.tool_manager.is_interacting():
@@ -456,12 +529,29 @@ class CanvasView(QGraphicsView):
         if self._commit_crop_on_outside_press(event):
             return
 
+        if self._commit_node_edit_on_outside_press(event):
+            return
+
         if self.tool_manager is not None:
             scene_pos = self.mapToScene(event.pos())
             if self.tool_manager.handle_mouse_press(event, scene_pos):
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """ダブルクリックを tool_manager へ委譲する（curve ツールの下書き確定用）。
+
+        素通しして `QGraphicsView` の既定処理まで落ちると、curve ツール選択中でも
+        直下のアイテムへダブルクリックが配送され得る（`ImageItem.begin_crop` 等の
+        誤爆を招く）ため、`tool_manager` が消費すればここで終える。
+        """
+        if self.tool_manager is not None:
+            scene_pos = self.mapToScene(event.pos())
+            if self.tool_manager.handle_mouse_double_click(event, scene_pos):
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         # ステータスバーの座標表示用（軽量な QLabel 更新のみが受け手のためスロットリングしない）。

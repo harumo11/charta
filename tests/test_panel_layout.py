@@ -94,6 +94,7 @@ _OBJECT_KWARGS: dict[str, dict[str, Any]] = {
     "connector": dict(
         source_id=None, target_id=None, source_point=[0.0, 0.0], target_point=[50.0, 50.0]
     ),
+    "curve": dict(x=0, y=0, width=10, height=10, points=[[0, 0], [0.5, 1], [1, 0]]),
 }
 
 _ALL_TYPES: tuple[str, ...] = tuple(_OBJECT_KWARGS)

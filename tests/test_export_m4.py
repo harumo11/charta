@@ -21,6 +21,7 @@ from app.export.png_exporter import artboard_pixel_size, export_png
 from app.export.svg_exporter import _build_text_font, document_to_svg, export_svg
 from app.model.document import Artboard, Document, Physical
 from app.model.objects import (
+    CurveObject,
     EllipseObject,
     FreehandObject,
     ImageObject,
@@ -126,8 +127,20 @@ def _build_document(project_dir: Path, tmp_path: Path) -> Document:
         font_size=20.0,
     )
     image = ImageObject(id=doc.new_id(), x=60.0, y=410.0, width=100.0, height=80.0, src=rel)
+    curve = CurveObject(
+        id=doc.new_id(),
+        x=300.0,
+        y=340.0,
+        width=100.0,
+        height=80.0,
+        points=[[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+        closed=True,
+        fill="#00CCCC",
+        stroke="#888888",
+        stroke_width=3.0,
+    )
 
-    for obj in (rect, ellipse, line, arrow, freehand, text, image):
+    for obj in (rect, ellipse, line, arrow, freehand, text, image, curve):
         doc.add_object(obj)
 
     return doc
@@ -291,8 +304,8 @@ def test_svg_contains_expected_elements_outline_true(
     # background rect + rect オブジェクト = 少なくとも 2
     assert len(rects) >= 2
     assert len(ellipses) >= 1
-    # line body(1) + arrow body+arrowhead(2) + freehand(1) + text outline(1) >= 5
-    assert len(paths) >= 5
+    # line body(1) + arrow body+arrowhead(2) + freehand(1) + text outline(1) + curve(1) >= 6
+    assert len(paths) >= 6
     assert len(images) == 1
     # outline_text=True では <text> は出ない(すべて path 化)
     assert len(texts) == 0
@@ -324,6 +337,7 @@ def test_svg_z_order_matches_objects_order(qapp: Any, project_dir: Path, tmp_pat
         'stroke="#555555"',  # freehand
         'fill="#666666"',  # text outline path
         "<image",  # image
+        'stroke="#888888"',  # curve
     ]
     positions = [svg.index(marker) for marker in markers]
     assert positions == sorted(positions), "z順(document.objects 順)で出力されていない"

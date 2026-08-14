@@ -123,7 +123,8 @@ def test_key_that_exists_on_another_type_is_not_suggested_away() -> None:
     assert error.code == "key_not_on_type"
     result = error.to_dict()
     assert "suggestion" not in result
-    assert result["available_on"] == ["ellipse", "rect"]
+    # curve も fill を持つ型として追加された（曲線オブジェクト契約 A-2/A-3）。
+    assert result["available_on"] == ["curve", "ellipse", "rect"]
 
 
 def test_completely_unknown_key_still_gets_a_difflib_suggestion() -> None:

@@ -12,11 +12,10 @@ from typing import Any
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QPainterPath, QPainterPathStroker
 
+from app.graphics import curves
 from app.scene.items.box_item import BoxItem
 from app.scene.items.registry import register_item
 from app.scene.items.shape_item import pen_for
-
-_MIN_DIMENSION = 1.0
 
 
 def normalize_freehand_points(
@@ -26,24 +25,10 @@ def normalize_freehand_points(
 
     返り値: (x, y, width, height, normalized_points)。bbox の一辺が 1.0 未満の
     退化ケースは寸法を 1.0 に底上げし、その軸の正規化座標は 0 に固定する
-    （0 除算ガード）。
+    （0 除算ガード）。アルゴリズム本体は curve オブジェクトと共有するため
+    `app.graphics.curves.normalize_points` に委譲する（唯一の真実源）。
     """
-    if not raw_points:
-        return (0.0, 0.0, _MIN_DIMENSION, _MIN_DIMENSION, [])
-    xs = [float(p[0]) for p in raw_points]
-    ys = [float(p[1]) for p in raw_points]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    bbox_w = max_x - min_x
-    bbox_h = max_y - min_y
-    width = bbox_w if bbox_w >= _MIN_DIMENSION else _MIN_DIMENSION
-    height = bbox_h if bbox_h >= _MIN_DIMENSION else _MIN_DIMENSION
-    normalized: list[list[float]] = []
-    for x, y in zip(xs, ys, strict=True):
-        nx = (x - min_x) / width if bbox_w >= _MIN_DIMENSION else 0.0
-        ny = (y - min_y) / height if bbox_h >= _MIN_DIMENSION else 0.0
-        normalized.append([nx, ny])
-    return (min_x, min_y, width, height, normalized)
+    return curves.normalize_points(raw_points)
 
 
 @register_item("freehand")

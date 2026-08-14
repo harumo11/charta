@@ -35,11 +35,11 @@ CHECK_NAMES = diagnostics.CHECK_NAMES
 #: 文字採寸が必要な検査。これ以外しか要求されていないなら `QFontMetricsF` を呼ばない。
 _CHECKS_NEEDING_TEXT_METRICS = frozenset({"text_overflow"})
 
-_FILL_TYPES = frozenset({"rect", "ellipse"})
+_FILL_TYPES = frozenset({"rect", "ellipse", "curve"})
 _TEXTUAL_TYPES = frozenset({"text", "math"})
 #: `update_objects` で width/height を直接書ける型（幾何が box のもの）。
 #: line/arrow は p1/p2、connector はアンカーが真実源なので縮められない。
-_RESIZABLE_TYPES = frozenset({"rect", "ellipse", "image", "text", "math", "freehand"})
+_RESIZABLE_TYPES = frozenset({"rect", "ellipse", "image", "text", "math", "freehand", "curve"})
 
 
 def _text_sizes(obj: BaseObject) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:

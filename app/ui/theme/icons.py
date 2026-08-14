@@ -24,10 +24,11 @@ TOOL_ICONS: dict[str, str] = {
     "text": "mdi6.format-text",
     "math": "mdi6.sigma",
     "connector": "mdi6.transit-connection-variant",
+    "curve": "mdi6.vector-curve",
 }
 
 #: オブジェクト型 → qtawesome アイコン名の対応表（P2契約 §4、レイヤーパネルの型アイコン用）。
-#: `image` を除く8種は `TOOL_ICONS` と同じ意匠（対応する作成ツールと見た目を揃える）。
+#: `image` を除く9種は `TOOL_ICONS` と同じ意匠（対応する作成ツールと見た目を揃える）。
 OBJECT_ICONS: dict[str, str] = {
     "rect": TOOL_ICONS["rect"],
     "ellipse": TOOL_ICONS["ellipse"],
@@ -37,6 +38,7 @@ OBJECT_ICONS: dict[str, str] = {
     "text": TOOL_ICONS["text"],
     "math": TOOL_ICONS["math"],
     "connector": TOOL_ICONS["connector"],
+    "curve": TOOL_ICONS["curve"],
     "image": "mdi6.image-outline",
 }
 

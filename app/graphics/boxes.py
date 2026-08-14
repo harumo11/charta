@@ -258,8 +258,10 @@ def obb_contains(outer: Box, rot_outer: float, inner: Box, rot_inner: float) -> 
     return all(point_in_obb(p, outer, rot_outer) for p in corners(inner, rot_inner))
 
 
-#: 面を持たない（覆い隠せない）型。線・矢印・フリーハンド・コネクタ。
-_AREALESS_TYPES = frozenset({"line", "arrow", "freehand", "connector"})
+#: 面を持たない（覆い隠せない）型。線・矢印・フリーハンド・コネクタ・曲線。
+#: curve は bbox が矩形でも実形状が任意のブロブ（freehand と同様）なので、
+#: bbox の矩形包含で「覆っている」と誤判定しないよう areal から除外する。
+_AREALESS_TYPES = frozenset({"line", "arrow", "freehand", "connector", "curve"})
 
 
 def covers(
@@ -273,7 +275,7 @@ def covers(
 
     楕円は bbox ではなく楕円そのもので判定する（bbox で判定すると「楕円ノードの
     隅にはみ出したラベル」を覆っていると誤判定するため）。線・矢印・フリーハンド・
-    コネクタは面を持たないので常に False。
+    コネクタ・曲線は面を持たないので常に False。
     """
     if shape_type in _AREALESS_TYPES:
         return False

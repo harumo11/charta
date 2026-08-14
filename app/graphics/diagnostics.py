@@ -72,8 +72,9 @@ HOST_MIN_INSIDE_RATIO = 0.5
 #: はみ出した方向のラベル（メッセージ用）。
 _SIDE_LABELS = {"left": "左", "top": "上", "right": "右", "bottom": "下"}
 
-#: 面を持たず、重なり判定に意味がない型。
-_AREALESS_TYPES = frozenset({"line", "arrow", "freehand", "connector"})
+#: 面を持たず、重なり判定に意味がない型（`app.graphics.boxes._AREALESS_TYPES` と同一。
+#: 2 か所を必ず揃えること）。
+_AREALESS_TYPES = frozenset({"line", "arrow", "freehand", "connector", "curve"})
 #: 文字を持つ型。
 _TEXTUAL_TYPES = frozenset({"text", "math"})
 

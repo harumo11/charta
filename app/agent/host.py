@@ -87,6 +87,17 @@ def busy_state(window: MainWindow) -> dict[str, Any]:
             }
 
     tool_manager = getattr(window, "tool_manager", None)
+    if tool_manager is not None and tool_manager.has_curve_draft():
+        # curve の下書きは crop/mask/ノード編集と同じく人間が無期限に居座りうる
+        # モードなので、一過性のドラッグ用の "user_interacting"（500ms）に
+        # 落とさず専用 reason で 2000ms を返す（レビュー所見: 人間が下書き途中で
+        # 席を離れると 500ms ポーリングが終わらなくなる）。
+        return {
+            "busy": True,
+            "reason": "curve_draft",
+            "detail": "曲線の下書き中です（Enter で確定 / Esc で破棄）",
+            "retry_after_ms": 2000,
+        }
     if tool_manager is not None and tool_manager.is_interacting():
         return {
             "busy": True,
@@ -110,6 +121,15 @@ def busy_state(window: MainWindow) -> dict[str, Any]:
             "busy": True,
             "reason": "mask_mode",
             "detail": "SAM3 マスク編集中です",
+            "retry_after_ms": 2000,
+        }
+    node_item = scene.active_node_edit_item()
+    if node_item is not None:
+        oid = getattr(getattr(node_item, "obj", None), "id", None)
+        return {
+            "busy": True,
+            "reason": "node_edit_mode",
+            "detail": f"オブジェクト {oid} を曲線ノード編集中です",
             "retry_after_ms": 2000,
         }
     return {"busy": False, "reason": None, "detail": "", "retry_after_ms": 0}

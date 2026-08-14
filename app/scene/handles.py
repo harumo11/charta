@@ -243,6 +243,33 @@ class _HandleItem(QGraphicsItem):
         event.accept()
 
 
+def make_handle(
+    owner: Any,
+    role: str,
+    parent_item: QGraphicsItem,
+    *,
+    shape: str = "square",
+    pen_color: str = _HANDLE_DEFAULT_PEN,
+    brush_color: str = _HANDLE_DEFAULT_BRUSH,
+    size: float | None = None,
+) -> QGraphicsItem:
+    """外部モジュール（`curve_node_overlay` 等）向けのハンドル生成口。
+
+    `_HandleItem` は本モジュール内部の実装詳細のため直接 import させず、この
+    ファクトリ越しに公開する。`owner` は `begin_drag`/`drag_to`/`end_drag` を
+    持つダックタイピングの対象（`BoxHandleSet` 等と同じ契約）。
+    """
+    return _HandleItem(
+        owner,
+        role,
+        parent_item,
+        shape=shape,
+        pen_color=pen_color,
+        brush_color=brush_color,
+        size=size,
+    )
+
+
 class BoxHandleSet:
     """矩形/楕円用: 8方向リサイズハンドル + 1回転ハンドル。"""
 

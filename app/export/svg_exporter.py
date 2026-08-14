@@ -4,7 +4,7 @@ Qt の `QSvgGenerator` 経由の `scene.render()` は `QGraphicsSvgItem`・`QPix
 フォントで劣化/欠落を起こすため使わない（§4 の検証済み制約）。代わりに `Document`
 （モデル）を直接 z 順に走査し、種別ごとにネイティブ SVG 要素を組み立てる。
 
-対応種別: rect / ellipse / line / arrow / freehand / text / image / math。
+対応種別: rect / ellipse / line / arrow / freehand / text / image / math / curve。
 math（数式）は matplotlib が生成した SVG をそのまま入れ子 `<svg>` として挿入する
 ことでベクター保持する（§8「そのまま入れ子挿入」）。未対応種別は XML コメントとして
 安全にスキップし将来の拡張を妨げない（`SVG_RENDERERS` への `@register_svg_renderer`
@@ -24,6 +24,7 @@ from PySide6.QtCore import QRectF
 from PySide6.QtGui import QFont, QFontInfo, QFontMetricsF, QPainterPath
 
 from app.export.text_outline import text_to_path, valign_offset
+from app.graphics import curves
 from app.graphics.arrows import (
     arrow_visible,
     circle_center_radius,
@@ -204,6 +205,43 @@ def _render_freehand(obj: BaseObject) -> str:
         f' stroke-width="{_fmt(obj.stroke_width)}" stroke-linecap="round"'
         f' stroke-linejoin="round"/>'
     )
+
+
+def _curve_path_d(obj: BaseObject) -> str | None:
+    """curve の正規化点列 → path d 属性文字列。
+
+    `CurveItem._build_local_path`（`app/scene/items/curve_item.py`）と同一の
+    `curves.curve_segments`/`curves.path_d` を通す（画面表示との一致のため。
+    片方だけ直すと画面と SVG が食い違う）。点が2個未満の退化ケースは None。
+    """
+    points: list[list[float]] = getattr(obj, "points", [])
+    closed = bool(getattr(obj, "closed", False))
+    result = curves.curve_segments(
+        points,
+        obj.width,
+        obj.height,
+        closed=closed,
+        tension=float(getattr(obj, "tension", curves.DEFAULT_TENSION)),
+    )
+    if result is None:
+        return None
+    start, segments = result
+    return curves.path_d(start, segments, closed=closed, fmt=_fmt)
+
+
+def _render_curve(obj: BaseObject) -> str:
+    d = _curve_path_d(obj)
+    if d is None:
+        return _xml_comment("curve: insufficient points, skipped")
+    # fill-rule="evenodd" は必須（Qt の QPainterPath 既定 OddEvenFill と一致させる。
+    # SVG の既定は nonzero のため、明示しないと自己交差する曲線で塗りが食い違う）。
+    attrs = (
+        f'd="{d}" fill={quoteattr(_fill_attr(obj.fill))} fill-rule="evenodd"'
+        f' stroke={quoteattr(obj.stroke)} stroke-width="{_fmt(obj.stroke_width)}"'
+        f' stroke-linecap="round" stroke-linejoin="round"'
+    )
+    attrs += _dash_attr(obj.dash, obj.stroke_width)
+    return f"<path {attrs}/>"
 
 
 def _render_arrowhead(
@@ -520,6 +558,11 @@ def _render_math_entry(document: Document, obj: BaseObject, outline_text: bool) 
 @register_svg_renderer("connector")
 def _render_connector_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
     return _render_connector(document, obj)
+
+
+@register_svg_renderer("curve")
+def _render_curve_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    return _wrap_box(_render_curve(obj), obj)
 
 
 def _render_object(document: Document, obj: BaseObject, outline_text: bool) -> str:

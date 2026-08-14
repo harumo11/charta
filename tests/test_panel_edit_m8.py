@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 from app.commands.commands import AddObjectCommand, RemoveObjectCommand
 from app.model.objects import (
     ConnectorObject,
+    CurveObject,
     EllipseObject,
     FreehandObject,
     ImageObject,
@@ -463,6 +464,63 @@ def test_connector_object_enum_edit_arrow_end(env: dict[str, Any]) -> None:
     stack.undo()
     assert shiboken6.isValid(combo)
     assert connector.arrow_end == "triangle"
+
+
+def test_curve_object_bool_edit_closed(env: dict[str, Any]) -> None:
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    curve = _add(
+        env,
+        CurveObject(
+            id=scene.document.new_id(),
+            x=0,
+            y=0,
+            width=10,
+            height=10,
+            points=[[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+        ),
+    )
+    _select_only(env, curve)
+
+    checkbox = _field_widget(panel, "curve", "closed")
+    assert isinstance(checkbox, QCheckBox)
+    assert curve.closed is False
+
+    checkbox.setChecked(True)
+    assert shiboken6.isValid(checkbox), "編集中のチェックボックス自身が破棄されていないこと"
+    assert curve.closed is True
+
+    stack.undo()
+    assert shiboken6.isValid(checkbox)
+    assert curve.closed is False
+    assert checkbox.isChecked() is False
+
+
+def test_curve_object_number_edit_tension(env: dict[str, Any]) -> None:
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    curve = _add(
+        env,
+        CurveObject(
+            id=scene.document.new_id(),
+            x=0,
+            y=0,
+            width=10,
+            height=10,
+            points=[[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+        ),
+    )
+    _select_only(env, curve)
+
+    spin = _field_widget(panel, "curve", "tension")
+    assert isinstance(spin, QDoubleSpinBox)
+    assert curve.tension == pytest.approx(0.5)
+
+    spin.setValue(0.1)
+    assert shiboken6.isValid(spin)
+    assert curve.tension == pytest.approx(0.1)
+
+    stack.undo()
+    assert shiboken6.isValid(spin)
+    assert curve.tension == pytest.approx(0.5)
 
 
 # --------------------------------------------------------------------------

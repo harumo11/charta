@@ -10,6 +10,7 @@ from app.scene.items.base_item import BaseItem
 # 各サブモジュールの import は `@register_item` を実行させ ITEM_FACTORIES を
 # 埋めるために必須（未使用に見えても削除しないこと）。
 from app.scene.items.connector_item import ConnectorItem as ConnectorItem
+from app.scene.items.curve_item import CurveItem as CurveItem
 from app.scene.items.freehand_item import FreehandItem as FreehandItem
 from app.scene.items.image_item import ImageItem as ImageItem
 from app.scene.items.math_item import MathItem as MathItem
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 def create_item(obj: BaseObject, document: Document | None = None) -> BaseItem:
     """obj.type に応じた item を生成する。
 
-    rect/ellipse/line/arrow/image/freehand/text/math/connector 以外は
+    rect/ellipse/line/arrow/image/freehand/text/math/connector/curve 以外は
     NotImplementedError。ImageItem は `document.base_dir` から画像を解決するため
     document を要る。
     """

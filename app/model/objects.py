@@ -213,6 +213,27 @@ class ConnectorObject(BaseObject):
     GEOMETRY: ClassVar[str] = "connector"
 
 
+@dataclass(kw_only=True)
+class CurveObject(BaseObject):
+    """通過点を Catmull-Rom で滑らかに結ぶ曲線（塗り可）。
+
+    points は bbox に対する [0,1] 正規化座標（freehand と同一規約）。
+    接線ハンドルは持たず、描画時に app.graphics.curves で毎回計算する。
+    """
+
+    type: str = "curve"
+    points: list[list[float]] = field(default_factory=list)
+    closed: bool = False
+    tension: float = 0.5
+    fill: str | None = None
+    stroke: str = "#000000"
+    stroke_width: float = 2.0
+    dash: str = "solid"
+
+    TYPE: ClassVar[str] = "curve"
+    # GEOMETRY はオーバーライドしない（既定 "box"）
+
+
 # --------------------------------------------------------------------------
 # レジストリ登録
 # --------------------------------------------------------------------------
@@ -225,6 +246,7 @@ register_object("freehand")(FreehandObject)
 register_object("text")(TextObject)
 register_object("math")(MathObject)
 register_object("connector")(ConnectorObject)
+register_object("curve")(CurveObject)
 
 
 def new_object(type: str, id: int, **kwargs: Any) -> BaseObject:  # noqa: A002

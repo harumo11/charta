@@ -116,7 +116,7 @@ myproject/
 | フィールド | 型 | 説明 |
 |---|---|---|
 | `id` | int | 一意 ID |
-| `type` | str | "image" / "rect" / "ellipse" / "line" / "arrow" / "freehand" / "text" / "math" / "connector" |
+| `type` | str | "image" / "rect" / "ellipse" / "line" / "arrow" / "freehand" / "text" / "math" / "connector" / "curve" |
 | `name` | str | レイヤーパネル表示名 |
 | `x`, `y` | float | アートボード座標（オブジェクト原点） |
 | `width`, `height` | float | バウンディングサイズ |
@@ -193,6 +193,15 @@ myproject/
 
 用語定義: **アンカー（接続点）** = コネクタが図形の縁のどこに接続するかを示す定義済み点。
 
+**curve**（Catmull-Rom 曲線・塗り可）
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `points` | [[x,y],...] | bbox に対する [0,1] 正規化座標（freehand と同一規約）。接線ハンドルは持たず描画のたび `app/graphics/curves.py` で計算 |
+| `closed` | bool | 閉じるか（既定 False） |
+| `tension` | float | Catmull-Rom の張力 0.0–1.0（既定 0.5。0 で折れ線） |
+| `fill` | str or null | 塗り色 `#RRGGBB` / null=透明 |
+| `stroke`, `stroke_width`, `dash` | — | 線プロパティ（rect/ellipse と同型） |
+
 ---
 
 ## 8. エクスポート（品質の要）
@@ -207,7 +216,7 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 
 ### SVG（自前シリアライザ・`scene.render` は使わない）
 `export/svg_exporter.py` で `Document` を走査し、オブジェクトごとに SVG 要素を生成する。理由は Qt の `QSvgGenerator` が SVG アイテム・画像・フォントで劣化/欠落を起こすため（検証済み）。
-- rect/ellipse/line/arrow/freehand → ネイティブ SVG 要素（`<rect>`,`<ellipse>`,`<path>` 等）。矢じりは `<marker>` 定義。
+- rect/ellipse/line/arrow/freehand/curve → ネイティブ SVG 要素（`<rect>`,`<ellipse>`,`<path>` 等）。矢じりは `<marker>` 定義。curve は `<path fill-rule="evenodd">`（画面の `QPainterPath` 既定 `OddEvenFill` と一致させるため。`app/graphics/curves.py` の `curve_segments`/`path_d` を画面（`CurveItem`）と共有し、d 属性の食い違いを構造的に防ぐ）。
 - text → 既定は `<text>`（編集可能なまま。フォント依存の警告を出す）。アウトライン化 ON 時は `QPainterPath.addText` → パスの `d` 属性（2026-08-02 に既定を反転。上記 PDF 節の経緯参照）。
 - image → `<image>` に Base64 埋め込み。クロップ・補正を反映した最終ビットマップを埋める。
 - math → matplotlib が生成した数式 SVG を `<g transform=...>` として**そのまま入れ子挿入**（ベクター保持）。
@@ -285,6 +294,19 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - 合成: `app/graphics/image_pipeline.py` の `apply_mask_overlay()`（crop → brightness/contrast → mask の順、`apply_mask_if_any()` で共有)。**覆い色 null = 透明 = 切り取り**（対象外 alpha を落とす)。キャンバス表示・SVG・PNG/PDF の全経路が同一関数を通るため出力が一致する。
 - 事後編集: プロパティパネル（`mask_color`=color_opt「透明」チェック、`mask_opacity`、`mask_enabled`。`PropSpec.requires="mask_src"` で mask 保有時のみ表示）。再推論なしで変更可能。
 - 推論層: `app/ai/sam3.py`（`Sam3Engine` シングルトン、`is_available()`、遅延 import、Qt 非依存）。CLI 検証は `scripts/smoke_sam3.py`。
+
+### 9.6a 曲線とノード編集モード（2026-08 追加）
+
+- クリックで通過点を置き、Catmull-Rom で自動スムーズされる曲線（`curve`、塗りつぶし可）。
+- 作成 UX: ツール "curve"（ショートカット B）。左クリックで点を追加、Enter/ダブルクリック=開いたまま確定、
+  始点付近クリック（3 点以上時）=閉じて確定、右クリック=開いたまま確定、Esc=キャンセル。
+- 事後編集はダブルクリックで**ノード編集モード**に入る。**crop / SAM3 マスク編集と同じ設計文法**
+  （オンキャンバス直接編集・専用オーバーレイ・確定/キャンセルの対称 API）で、アンカーをドラッグ移動、
+  曲線上左クリックで追加、ノード右クリックで削除、Enter/外側クリック/ツール切替=確定（1 undo マクロ）、
+  Esc=キャンセル。
+- `app/graphics/curves.py`（Qt 非依存）が Catmull-Rom→ベジエ変換・SVG パス文字列生成の**唯一の真実源**。
+  画面（`CurveItem._build_local_path`）と SVG（`svg_exporter._curve_path_d`）が同一関数を通ることで、
+  画面と出力の食い違いを構造的に防ぐ。
 
 ### 9.6 その他 Must 機能
 - Undo/Redo（`QUndoStack`）。ドラッグ移動は「離した時点」で 1 コマンドに集約（毎フレーム記録しない）。

@@ -178,6 +178,36 @@ def test_crop_mode_blocks_mutations(host: AgentHost, window: Any) -> None:
         window.scene.set_active_crop_item(None)
 
 
+def test_curve_draft_blocks_mutations_with_dedicated_reason(host: AgentHost, window: Any) -> None:
+    """curve の下書き中は crop/mask/node_edit と同じ「無期限に居座る」扱いとし、
+    一過性のドラッグ用 `reason="user_interacting"`（500ms）に落とさない
+    （レビュー所見: 席を離れると 500ms ポーリングが終わらなくなる）。
+    """
+    from PySide6.QtCore import QPointF
+
+    class _FakeEvent:
+        def button(self) -> Any:
+            from PySide6.QtCore import Qt
+
+            return Qt.MouseButton.LeftButton
+
+    tm = window.tool_manager
+    tm.set_tool("curve")
+    tm.handle_mouse_press(_FakeEvent(), QPointF(10.0, 10.0))
+    tm.handle_mouse_release(_FakeEvent(), QPointF(10.0, 10.0))
+    tm.handle_mouse_press(_FakeEvent(), QPointF(60.0, 10.0))
+    tm.handle_mouse_release(_FakeEvent(), QPointF(60.0, 10.0))
+    try:
+        assert tm.has_curve_draft() is True
+        state = busy_state(window)
+        assert state["reason"] == "curve_draft"
+        assert state["retry_after_ms"] == 2000
+        assert _error(host, "delete_objects", ids=[])["data"]["code"] == "busy"
+        assert _error(host, "delete_objects", ids=[])["data"]["reason"] == "curve_draft"
+    finally:
+        tm.cancel_curve_draft()
+
+
 def test_autosave_is_suspended_during_mutations(host: AgentHost, window: Any) -> None:
     """自動保存が半端な図を永続化しないよう、変更系の実行中はタイマーを止める。"""
     seen: list[bool] = []

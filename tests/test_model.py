@@ -15,6 +15,7 @@ from app.model.objects import (
     OBJECT_REGISTRY,
     BaseObject,
     ConnectorObject,
+    CurveObject,
     EllipseObject,
     FreehandObject,
     ImageObject,
@@ -136,6 +137,28 @@ def test_connector_roundtrip() -> None:
     assert restored.routing == "orthogonal"
 
 
+def test_curve_roundtrip() -> None:
+    obj = CurveObject(
+        id=10,
+        x=1.0,
+        y=2.0,
+        width=30.0,
+        height=40.0,
+        points=[[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+        closed=True,
+        tension=0.3,
+        fill="#0000FF",
+    )
+    d = obj.to_dict()
+    assert d["type"] == "curve"
+    restored = BaseObject.from_dict(d)
+    assert isinstance(restored, CurveObject)
+    assert restored.points == [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]]
+    assert restored.closed is True
+    assert restored.tension == pytest.approx(0.3)
+    assert restored.fill == "#0000FF"
+
+
 def test_from_dict_unknown_type_raises() -> None:
     with pytest.raises(ValueError):
         BaseObject.from_dict({"type": "unknown_type_xyz"})
@@ -157,7 +180,18 @@ def test_new_object_helper() -> None:
 
 
 def test_object_registry_has_all_types() -> None:
-    for t in ("rect", "ellipse", "line", "arrow", "image", "freehand", "text", "math", "connector"):
+    for t in (
+        "rect",
+        "ellipse",
+        "line",
+        "arrow",
+        "image",
+        "freehand",
+        "text",
+        "math",
+        "connector",
+        "curve",
+    ):
         assert t in OBJECT_REGISTRY
 
 
@@ -429,6 +463,7 @@ def test_geometry_classvar_defaults_and_overrides() -> None:
     assert FreehandObject.GEOMETRY == "box"
     assert TextObject.GEOMETRY == "box"
     assert MathObject.GEOMETRY == "box"
+    assert CurveObject.GEOMETRY == "box"
     assert LineObject.GEOMETRY == "endpoints"
     assert ConnectorObject.GEOMETRY == "connector"
 
@@ -453,6 +488,7 @@ def test_geometry_kind_dispatches_via_registry() -> None:
     assert geometry_kind("freehand") == "box"
     assert geometry_kind("text") == "box"
     assert geometry_kind("math") == "box"
+    assert geometry_kind("curve") == "box"
     assert geometry_kind("line") == "endpoints"
     assert geometry_kind("arrow") == "endpoints"
     assert geometry_kind("connector") == "connector"
