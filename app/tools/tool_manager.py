@@ -228,6 +228,17 @@ class ToolManager(QObject):
             if hasattr(obj, key):
                 setattr(obj, key, value)
 
+    def clear_style_memory(self) -> None:
+        """sticky defaults(style memory)を全消去する。
+
+        `_style_memory` は「同種を一度でも作っていれば」永久に環境設定の既定値を
+        上書きし続けてしまう（所見: rect を 1 個描いた直後に環境設定で色/線幅を
+        変えても、次に描く rect は変更前の記憶された値のまま）。環境設定ダイアログ
+        で作成既定を変更した確定時に `MainWindow.open_preferences` から呼ぶことで、
+        「設定を変えた直後の新規作成は変更後の値になる」という自然な期待に合わせる。
+        """
+        self._style_memory.clear()
+
     def _apply_pref_defaults(self, obj: Any) -> None:
         """環境設定(`self.prefs`)の既定値を新規オブジェクトへ適用する(C契約 §C-1)。
 
@@ -692,12 +703,42 @@ class ToolManager(QObject):
             return True
         self._apply_pref_defaults(obj)
         self._apply_style_memory(obj)
+        self._remeasure_new_text_or_math(obj)
         undo_stack.push(AddObjectCommand(self.scene.document, obj))
         new_item = self.scene.item_for(obj)
         if new_item is not None:
             self.scene.clearSelection()
             new_item.setSelected(True)
         return True
+
+    def _remeasure_new_text_or_math(self, obj: Any) -> None:
+        """text/math の新規作成時、環境設定/style memory 適用後の実フォントで箱を再採寸する。
+
+        所見: `_text_release`/`_math_release` は生成直後の dataclass 既定フォント
+        （18pt 等）で width/height を採寸するが、`font_family`/`font_size` は
+        直前の `_apply_pref_defaults`/`_apply_style_memory` が書き換えるため、箱と
+        実際に使われるフォントが食い違ったまま push されていた（`default_font_size`
+        を大きくすると生成直後から `text_overflow` が発生、math は箱にフィット
+        描画するため設定が見た目に反映されない、の二重の実害）。`obj.type` を
+        text/math に限定して再採寸することで、幾何由来の寸法を持つ他の型
+        （freehand/curve 等）の挙動には触れない。prefs が None かつ style memory も
+        空の回帰ケースでは、生成時に使ったのと同じ既定フォントで再計算するだけ
+        なので結果は変わらない。
+        """
+        if obj.type == "text":
+            from app.scene.items.text_item import default_text_size
+
+            font = QFont(obj.font_family)
+            font.setPointSizeF(obj.font_size)
+            font.setBold(obj.bold)
+            font.setItalic(obj.italic)
+            obj.width, obj.height = default_text_size(obj.text, font)
+        elif obj.type == "math":
+            from app.scene.items.math_item import natural_math_size
+
+            obj.width, obj.height = natural_math_size(
+                obj.latex, obj.font_size, obj.color, minimum=_MATH_MIN_SIZE
+            )
 
     def _finish_creation(self, obj: Any) -> bool:
         """`_push_creation` に続けて select ツールへ戻す。

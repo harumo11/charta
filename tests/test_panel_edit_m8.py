@@ -207,6 +207,36 @@ def test_rect_color_opt_edit_fill_checkbox_and_button(
     assert rect.fill == "#123456"
 
 
+def test_rect_fill_button_requests_non_native_color_dialog(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """所見(S1): ネイティブ色ダイアログの環境では `QColorDialog.setCustomColor` で
+    載せたパレットスウォッチが表示されないため、常に Qt 製ダイアログを強制する。
+    `customColor()` を読み戻すだけの検証ではこの回帰を検知できない
+    （`setCustomColor` 自体は成功するため）ので、実際の呼び出しに
+    `DontUseNativeDialog` が付いていることを直接確認する。
+    """
+    scene, panel = env["scene"], env["panel"]
+    rect = _add(
+        env, RectObject(id=scene.document.new_id(), x=10, y=10, width=50, height=40, fill="#FF0000")
+    )
+    _select_only(env, rect)
+
+    container = _field_widget(panel, "rect", "fill")
+    button = _first(container, QPushButton)
+
+    captured: dict[str, Any] = {}
+
+    def _fake_get_color(*args: Any, **kwargs: Any) -> QColor:
+        captured.update(kwargs)
+        return QColor()  # invalid → 変更しない
+
+    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(_fake_get_color))
+    button.click()
+
+    assert captured.get("options") == QColorDialog.ColorDialogOption.DontUseNativeDialog
+
+
 def test_rect_enum_edit_dash(env: dict[str, Any]) -> None:
     scene, stack, panel = env["scene"], env["stack"], env["panel"]
     rect = _add(env, RectObject(id=scene.document.new_id(), x=0, y=0, width=10, height=10))

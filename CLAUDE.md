@@ -314,6 +314,62 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - コピー/複製、z順操作 UI。
 - 自動保存: 一定間隔＋終了時に `project.json` 保存、クラッシュ用 `.autosave` を別途書き出し。
 
+### 9.7 環境設定（Preferences）とカラーパレット（2026-08-15 追加）
+
+`project.json`（プロジェクト固有）とは別に、**プロジェクトを跨いで生きるユーザー
+環境設定**を `app/prefs.py`（Qt 非依存）が管理する。
+
+- **置き場所**: `$CHARTA_CONFIG_DIR` > `$XDG_CONFIG_HOME/charta` > `~/.config/charta`
+  の `prefs.json`。`load_prefs()`/`save_prefs()` はどちらも例外を外に出さない
+  （壊れたファイル・非 UTF-8・権限エラー・書き込み不能は `warnings.warn` 1回に
+  留め、既定値へフォールバックする。無音にしてよいのはファイルが無い＝初回起動
+  のときだけ）。値は `from_dict()` で値域クランプ/列挙ホワイトリスト/色形式検証
+  まで行う（px 1–20000・dpi 72–1200・font 6–128・stroke 0–50・autosave 0–600秒・
+  routing∈{orthogonal,straight}・色は `^#[0-9A-Fa-f]{6}$`）。手編集や旧/他機の
+  ファイルの不正値で本体（Qt の C++ 層）が落ちないことがここでの責務。
+- **複数プロセス間のマージ**: `save_prefs()` は渡された `Preferences` を丸ごと
+  書き戻すため、GUI とヘッドレス常駐（§15）が同時に動いていると後勝ちで消し合う。
+  ウィンドウジオメトリ/グリッド/スナップの自動記憶、環境設定ダイアログの確定は
+  `update_prefs(**changes)`（ディスクを読み直し→指定フィールドだけ上書き→保存）
+  を使い、無関係なフィールドを巻き戻さない。
+- **カラーパレット**: `app/model/palettes.py`（Qt 非依存）に 6 種ビルトイン
+  （material/apple/seaborn_deep/tableau10/okabe_ito/kusumi、各 8 色）。
+  環境設定で選ぶと (a) `QColorDialog.setCustomColor` でプロセス全体のカスタム
+  色スウォッチに載る、(b) 新規図形の初期色（線色/文字色。塗りには介入しない）、
+  (c) 「このプロジェクトに styles として登録」ボタンで `document.styles` へ
+  1 undo ステップで登録できる。全 `QColorDialog.getColor` 呼び出しは
+  `options=QColorDialog.ColorDialogOption.DontUseNativeDialog` を渡す
+  （GTK/portal 等のネイティブ色ダイアログを使う環境では Qt 側のカスタム色配列
+  が画面に出ず、パレット機能が無言で無効になるため）。
+- **新規オブジェクト/アートボードの既定**: `ToolManager._apply_pref_defaults`
+  がフォント/線幅/コネクタ routing/初期色を、`_default_document()` がアートボード
+  既定を適用する（`prefs` を渡さない 0 引数呼び出しは互換のため残しつつ、
+  `MainWindow`/`ProjectIOController` は `self.prefs` を明示的に渡す）。
+  text/math は生成直後に**実際に使うフォント**（prefs/sticky defaults 適用後）
+  で再採寸してから push する（採寸を先にしてしまうと、大きい既定フォントサイズで
+  作った瞬間から文字があふれる／math は箱にフィット描画のため設定が無効になる）。
+- **sticky defaults（style memory）とのリセット**: `ToolManager._style_memory`
+  は同種オブジェクトを一度でも作ると以後その値を優先し続ける。環境設定で作成
+  既定（フォント/線幅/routing/初期色）を実際に変更して確定したときだけ、
+  `ToolManager.clear_style_memory()` を呼んで「設定変更直後は新しい既定が効く」
+  を成立させる（無関係な設定変更では sticky defaults を消さない）。
+- **書き出しの確認レス化**: `export_confirm=False` なら `ExportController` は
+  アウトライン化/PNG透過の確認ダイアログを出さず prefs の既定値をそのまま使う。
+  確認する場合も既定ボタンを prefs 値に合わせる。エージェント経由の
+  `export_file`（`app/agent/api.py`）は意図的にこれらの prefs を参照しない
+  （明示引数のみで完結させる方針）。
+- **ウィンドウジオメトリの復元**: 前回終了時の `[x,y,w,h]` を復元する際、
+  最小サイズ（640×480）未満・タイトルバー相当の帯がどの画面とも交差しない
+  場合は既定ロジックへフォールバックし、それ以外は交差した画面の利用可能領域へ
+  クランプする（4K モニタ後にノート単体で開いても画面外に出ない）。最大化中の
+  終了は `normalGeometry()` を保存する（スキーマは変えず「次回が画面いっぱいの
+  非最大化ウィンドウになる」実害だけ防ぐ）。
+- **設定ダイアログ**: `app/ui/prefs_dialog.py`（house style は `math_item.
+  edit_latex` と同じ QDialog + QDialogButtonBox）。`QFontComboBox` はユーザーが
+  実際に操作した（`currentFontChanged` を受けた）ときだけ新しい family を採用し、
+  未操作なら渡された値をそのまま持ち越す（未インストールフォントの環境で開いた
+  だけで既定フォントがファウンドリ接尾辞付きの別名に化けるのを防ぐ）。
+
 ---
 
 ## 10. 単位系・座標の規約

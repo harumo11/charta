@@ -13,7 +13,9 @@ Qt 非依存（`app/prefs.py` は PySide6 を import しない）。呼び出し
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import tempfile
 import warnings
 from dataclasses import asdict, dataclass
@@ -22,6 +24,36 @@ from typing import Any
 
 #: prefs.json のファイル名。config_dir() の直下に置く。
 _PREFS_FILENAME = "prefs.json"
+
+#: 値域クランプの定数（`app/ui/prefs_dialog.py` のスピンボックス range と同じ値を
+#: ここに一本化し、ずれないようにする。所見: from_dict が値域検証を持たず、
+#: 手編集/破損した prefs.json の値がそのまま Qt の C++ 側に渡って起動不能になる）。
+ARTBOARD_PX_MIN = 1.0
+ARTBOARD_PX_MAX = 20000.0
+ARTBOARD_MM_MIN = 1.0
+ARTBOARD_MM_MAX = 2000.0
+ARTBOARD_DPI_MIN = 72
+ARTBOARD_DPI_MAX = 1200
+FONT_SIZE_MIN = 6.0
+FONT_SIZE_MAX = 128.0
+STROKE_WIDTH_MIN = 0.0
+STROKE_WIDTH_MAX = 50.0
+AUTOSAVE_INTERVAL_MIN = 0
+AUTOSAVE_INTERVAL_MAX = 600
+CONNECTOR_ROUTING_VALUES = ("orthogonal", "straight")
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _clamp_float(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _clamp_int(value: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, value))
+
+
+def _is_hex_color(value: Any) -> bool:
+    return isinstance(value, str) and bool(_HEX_COLOR_RE.match(value))
 
 
 @dataclass
@@ -64,33 +96,76 @@ class Preferences:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Preferences:
-        """未知キー無視・欠落は既定値・型が合わない値は既定値に落とす（例外を出さない）。"""
+        """未知キー無視・欠落は既定値・型が合わない値は既定値に落とす（例外を出さない）。
+
+        型が合っていても値域外・無限大/NaN・列挙外・色として不正な文字列は
+        本体（Qt の C++ 層）を壊し得るため、ここでクランプ/ホワイトリスト
+        検証まで行う（所見: from_dict は型しか見ておらず、手編集・破損・
+        旧/他機の prefs.json で起動不能になっていた）。クランプ幅は
+        `app/ui/prefs_dialog.py` のスピンボックス range と同じ値をこのモジュール
+        の定数として共有する。
+        """
         defaults = cls()
+
+        default_connector_routing = _coerce_str(
+            d.get("default_connector_routing"), defaults.default_connector_routing
+        )
+        if default_connector_routing not in CONNECTOR_ROUTING_VALUES:
+            default_connector_routing = defaults.default_connector_routing
+
+        artboard_background = _coerce_str(
+            d.get("artboard_background"), defaults.artboard_background
+        )
+        if not _is_hex_color(artboard_background):
+            artboard_background = defaults.artboard_background
+
+        initial_color = _coerce_optional_str(d.get("initial_color"), defaults.initial_color)
+        if initial_color is not None and not _is_hex_color(initial_color):
+            initial_color = None
+
         return cls(
             version=_coerce_int(d.get("version"), defaults.version),
             palette_id=_coerce_str(d.get("palette_id"), defaults.palette_id),
-            initial_color=_coerce_optional_str(d.get("initial_color"), defaults.initial_color),
+            initial_color=initial_color,
             default_font_family=_coerce_str(
                 d.get("default_font_family"), defaults.default_font_family
             ),
-            default_font_size=_coerce_float(d.get("default_font_size"), defaults.default_font_size),
-            default_stroke_width=_coerce_float(
-                d.get("default_stroke_width"), defaults.default_stroke_width
+            default_font_size=_clamp_float(
+                _coerce_float(d.get("default_font_size"), defaults.default_font_size),
+                FONT_SIZE_MIN,
+                FONT_SIZE_MAX,
             ),
-            default_connector_routing=_coerce_str(
-                d.get("default_connector_routing"), defaults.default_connector_routing
+            default_stroke_width=_clamp_float(
+                _coerce_float(d.get("default_stroke_width"), defaults.default_stroke_width),
+                STROKE_WIDTH_MIN,
+                STROKE_WIDTH_MAX,
             ),
-            artboard_width_px=_coerce_float(d.get("artboard_width_px"), defaults.artboard_width_px),
-            artboard_height_px=_coerce_float(
-                d.get("artboard_height_px"), defaults.artboard_height_px
+            default_connector_routing=default_connector_routing,
+            artboard_width_px=_clamp_float(
+                _coerce_float(d.get("artboard_width_px"), defaults.artboard_width_px),
+                ARTBOARD_PX_MIN,
+                ARTBOARD_PX_MAX,
             ),
-            artboard_width_mm=_coerce_float(d.get("artboard_width_mm"), defaults.artboard_width_mm),
-            artboard_dpi=_coerce_int(d.get("artboard_dpi"), defaults.artboard_dpi),
-            artboard_background=_coerce_str(
-                d.get("artboard_background"), defaults.artboard_background
+            artboard_height_px=_clamp_float(
+                _coerce_float(d.get("artboard_height_px"), defaults.artboard_height_px),
+                ARTBOARD_PX_MIN,
+                ARTBOARD_PX_MAX,
             ),
-            autosave_interval_s=_coerce_int(
-                d.get("autosave_interval_s"), defaults.autosave_interval_s
+            artboard_width_mm=_clamp_float(
+                _coerce_float(d.get("artboard_width_mm"), defaults.artboard_width_mm),
+                ARTBOARD_MM_MIN,
+                ARTBOARD_MM_MAX,
+            ),
+            artboard_dpi=_clamp_int(
+                _coerce_int(d.get("artboard_dpi"), defaults.artboard_dpi),
+                ARTBOARD_DPI_MIN,
+                ARTBOARD_DPI_MAX,
+            ),
+            artboard_background=artboard_background,
+            autosave_interval_s=_clamp_int(
+                _coerce_int(d.get("autosave_interval_s"), defaults.autosave_interval_s),
+                AUTOSAVE_INTERVAL_MIN,
+                AUTOSAVE_INTERVAL_MAX,
             ),
             export_outline_text=_coerce_bool(
                 d.get("export_outline_text"), defaults.export_outline_text
@@ -120,7 +195,13 @@ def _coerce_float(value: Any, default: float) -> float:
     if isinstance(value, bool):
         return default
     if isinstance(value, (int, float)):
-        return float(value)
+        result = float(value)
+        # JSON の `Infinity`/`NaN`（`json.loads` は受理する）が本体側の
+        # `int(round(...))`/Qt の C++ setter で OverflowError を引き起こすため、
+        # ここで弾く（所見: 起動不能になる実測ケース）。
+        if not math.isfinite(result):
+            return default
+        return result
     return default
 
 
@@ -165,15 +246,25 @@ def prefs_path() -> Path:
 def load_prefs() -> Preferences:
     """`prefs_path()` から読み込む。
 
-    ファイルが無ければ（初回起動）静かに既定値を返す。存在するが JSON として
-    壊れている場合のみ `warnings.warn` を 1 回発してから既定値を返す
-    （読めない設定を毎起動サイレントに握りつぶすと、ユーザーが原因に気付けない
-    まま設定を失い続けるため）。
+    ファイルが無ければ（初回起動）静かに既定値を返す。存在するが読めない
+    （JSON 破損・非 UTF-8・権限エラー等）場合は `warnings.warn` を 1 回発してから
+    既定値を返す（読めない設定を毎起動サイレントに握りつぶすと、ユーザーが
+    原因に気付けないまま設定を失い続けるため）。無音にしてよいのは
+    「ファイルが無い」＝初回起動のときだけで、それ以外（`PermissionError` 等の
+    `OSError` や非 UTF-8 バイト列による `UnicodeDecodeError`）は同じ警告を出す
+    （所見: 従来は `except OSError` のみで、非 UTF-8 は捕捉されず例外が漏れ、
+    権限エラーは初回起動と区別できず無警告だった）。
     """
     path = prefs_path()
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return Preferences()
+    except (OSError, UnicodeDecodeError) as exc:
+        warnings.warn(
+            f"charta: 環境設定ファイルを読み込めません。既定値を使用します path={path}: {exc}",
+            stacklevel=2,
+        )
         return Preferences()
 
     try:
@@ -196,20 +287,56 @@ def load_prefs() -> Preferences:
 
 
 def save_prefs(prefs: Preferences) -> None:
-    """`prefs_path()` へアトミックに書き込む（tmp に書いて `os.replace`）。"""
-    path = prefs_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """`prefs_path()` へアトミックに書き込む（tmp に書いて `os.replace`）。
 
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=f".{_PREFS_FILENAME}.", suffix=".tmp"
-    )
+    書き込み不能（ディスクフル・`CHARTA_CONFIG_DIR` が書けない・権限エラー等）
+    でも例外を外に出さない——`warnings.warn` を 1 回発するだけにする
+    （`load_prefs` と対称。所見: 従来は `OSError` を再送出しており、
+    `MainWindow.closeEvent`/グリッド・スナップのトグルハンドラ等、呼び出し側が
+    無防備な箇所すべてに例外が漏れ、`closeEvent` では `super().closeEvent()`
+    より前に例外が飛ぶため終了処理の残りが実行されなかった）。
+    書いた内容は `os.fsync` してから `os.replace` する（電源断で 0 バイトの
+    ファイルが残ることを避けるため）。
+    """
+    path = prefs_path()
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(prefs.to_dict(), f, indent=2, ensure_ascii=False)
-        os.replace(tmp_name, path)
-    except BaseException:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{_PREFS_FILENAME}.", suffix=".tmp"
+        )
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(prefs.to_dict(), f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        warnings.warn(
+            f"charta: 環境設定ファイルを保存できません path={path}: {exc}",
+            stacklevel=2,
+        )
+
+
+def update_prefs(**changes: Any) -> Preferences:
+    """ディスク上の prefs を読み直し、`changes` のキーだけ上書きして保存する。
+
+    `save_prefs` はインスタンスが持つ `Preferences` を丸ごと書き戻すため、
+    複数プロセス（GUI + `--no-agent-server` 無しのヘッドレス常駐等、§15）が
+    同時に起動していると、片方の保存がもう片方の変更を後勝ちで消してしまう
+    （所見）。ウィンドウジオメトリ/グリッド/スナップの自動記憶や、環境設定
+    ダイアログの確定など「このフィールドだけ確実に反映したい」呼び出しは、
+    `self.prefs` を直接 `save_prefs` するのではなくこちらを使うことで、
+    他インスタンスが書いた無関係なフィールドを保存のたびに巻き戻さない。
+    戻り値は保存後の（ディスクの最新値をベースにした）`Preferences`。
+    """
+    current = load_prefs()
+    for key, value in changes.items():
+        setattr(current, key, value)
+    save_prefs(current)
+    return current

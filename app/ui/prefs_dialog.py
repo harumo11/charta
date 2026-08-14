@@ -9,6 +9,7 @@ house style は `math_item.edit_latex` のダイアログ（QDialog + QDialogBut
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
@@ -32,7 +33,21 @@ from PySide6.QtWidgets import (
 )
 
 from app.model.palettes import PALETTES, Palette, palette_by_id
-from app.prefs import Preferences
+from app.prefs import (
+    ARTBOARD_DPI_MAX,
+    ARTBOARD_DPI_MIN,
+    ARTBOARD_MM_MAX,
+    ARTBOARD_MM_MIN,
+    ARTBOARD_PX_MAX,
+    ARTBOARD_PX_MIN,
+    AUTOSAVE_INTERVAL_MAX,
+    AUTOSAVE_INTERVAL_MIN,
+    FONT_SIZE_MAX,
+    FONT_SIZE_MIN,
+    STROKE_WIDTH_MAX,
+    STROKE_WIDTH_MIN,
+    Preferences,
+)
 
 #: パレット未選択を表す QComboBox の userData（"" = palette_id 上も「なし」と一致）。
 _NO_PALETTE_DATA = ""
@@ -61,7 +76,12 @@ class PrefsDialog(QDialog):
         # 設定ダイアログに出さない自動記憶フィールド(version/window_geometry/
         # grid_visible/snap_enabled)を accept() 時にそのまま持ち越すための控え。
         self._initial_prefs = prefs
-        self._edited_prefs = prefs
+        # accept 前/reject 後に `edited_prefs()` が返す値は「渡された初期値と
+        # 同じ内容」であればよく、渡された生オブジェクトそのもの（同一参照）で
+        # ある必要はない。コピーにしておくことで、将来 `edited_prefs()` の戻り値
+        # を書き換えるコードが入っても呼び出し側の `Preferences` を直接壊さない
+        # （軽微な保険。契約の「コピーを編集する」の字面により忠実に合わせる）。
+        self._edited_prefs = dataclasses.replace(prefs)
         self._on_register_styles = on_register_styles
 
         layout = QVBoxLayout(self)
@@ -187,6 +207,11 @@ class PrefsDialog(QDialog):
             return
         self._on_register_styles(palette)
         self._register_button.setText("登録済み")
+        # 2回目のクリックで無変化の SetStylesCommand が積まれないことは
+        # `MainWindow._register_palette_styles` 側（所見）で保証済みだが、そもそも
+        # 再クリックできないようにしておく方が分かりやすい（`_on_palette_changed`
+        # がパレット変更時に再度有効化する）。
+        self._register_button.setEnabled(False)
 
     # ------------------------------------------------------------------
     # セクション2: 新規オブジェクトの既定
@@ -198,15 +223,25 @@ class PrefsDialog(QDialog):
 
         self._font_combo = QFontComboBox()
         self._font_combo.setCurrentFont(QFont(prefs.default_font_family))
+        # ユーザーが実際にフォント欄を操作したかのダーティフラグ（所見 S7）。
+        # 未インストール／別名のファミリを `setCurrentFont` すると `QFontComboBox`
+        # は近縁の別ファミリへ自動的に置き換わる（実測: "Helvetica" ->
+        # "Nimbus Sans [UKWN]"）。無条件に `currentFont().family()` を採用すると、
+        # 自動保存間隔だけ変えて OK を押した等、フォント欄に触れていない操作でも
+        # 既定フォントが無言で書き換わってしまう。接続は初期値設定の**後**に
+        # 行う（プログラム的な `setCurrentFont` で誤ってダーティにしないため、
+        # 上のパレットコンボと同じ流儀）。
+        self._font_dirty = False
+        self._font_combo.currentFontChanged.connect(self._on_font_changed)
         form.addRow("フォント", self._font_combo)
 
         self._font_size_spin = QDoubleSpinBox()
-        self._font_size_spin.setRange(6.0, 128.0)
+        self._font_size_spin.setRange(FONT_SIZE_MIN, FONT_SIZE_MAX)
         self._font_size_spin.setValue(prefs.default_font_size)
         form.addRow("サイズ", self._font_size_spin)
 
         self._stroke_width_spin = QDoubleSpinBox()
-        self._stroke_width_spin.setRange(0.0, 50.0)
+        self._stroke_width_spin.setRange(STROKE_WIDTH_MIN, STROKE_WIDTH_MAX)
         self._stroke_width_spin.setSingleStep(0.5)
         self._stroke_width_spin.setValue(prefs.default_stroke_width)
         form.addRow("線幅", self._stroke_width_spin)
@@ -220,6 +255,9 @@ class PrefsDialog(QDialog):
 
         return group
 
+    def _on_font_changed(self, _font: QFont) -> None:
+        self._font_dirty = True
+
     # ------------------------------------------------------------------
     # セクション3: 新規アートボードの既定
     # ------------------------------------------------------------------
@@ -230,23 +268,23 @@ class PrefsDialog(QDialog):
 
         self._artboard_width_spin = QDoubleSpinBox()
         self._artboard_width_spin.setDecimals(0)
-        self._artboard_width_spin.setRange(1.0, 20000.0)
+        self._artboard_width_spin.setRange(ARTBOARD_PX_MIN, ARTBOARD_PX_MAX)
         self._artboard_width_spin.setValue(prefs.artboard_width_px)
         form.addRow("幅 (px)", self._artboard_width_spin)
 
         self._artboard_height_spin = QDoubleSpinBox()
         self._artboard_height_spin.setDecimals(0)
-        self._artboard_height_spin.setRange(1.0, 20000.0)
+        self._artboard_height_spin.setRange(ARTBOARD_PX_MIN, ARTBOARD_PX_MAX)
         self._artboard_height_spin.setValue(prefs.artboard_height_px)
         form.addRow("高さ (px)", self._artboard_height_spin)
 
         self._artboard_mm_spin = QDoubleSpinBox()
-        self._artboard_mm_spin.setRange(1.0, 2000.0)
+        self._artboard_mm_spin.setRange(ARTBOARD_MM_MIN, ARTBOARD_MM_MAX)
         self._artboard_mm_spin.setValue(prefs.artboard_width_mm)
         form.addRow("幅 (mm)", self._artboard_mm_spin)
 
         self._artboard_dpi_spin = QSpinBox()
-        self._artboard_dpi_spin.setRange(72, 1200)
+        self._artboard_dpi_spin.setRange(ARTBOARD_DPI_MIN, ARTBOARD_DPI_MAX)
         self._artboard_dpi_spin.setValue(prefs.artboard_dpi)
         form.addRow("DPI", self._artboard_dpi_spin)
 
@@ -268,7 +306,16 @@ class PrefsDialog(QDialog):
         self._bg_button.setStyleSheet(f"background-color: {color};")
 
     def _on_bg_button_clicked(self) -> None:
-        color = QColorDialog.getColor(QColor(self._bg_color_value), self, "背景色")
+        # DontUseNativeDialog: ネイティブ色ダイアログの環境（実測: xcb + GNOME）
+        # では `QColorDialog.setCustomColor` で載せたパレットスウォッチが表示
+        # されない（所見 S1）。この画面自体はパレットの表示先ではないが、
+        # 統一のため他の色選択ボタンと同じオプションを付ける。
+        color = QColorDialog.getColor(
+            QColor(self._bg_color_value),
+            self,
+            "背景色",
+            options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
+        )
         if not color.isValid():
             return
         self._apply_bg_button_color(color.name())
@@ -282,7 +329,7 @@ class PrefsDialog(QDialog):
         form = QFormLayout(group)
 
         self._autosave_spin = QSpinBox()
-        self._autosave_spin.setRange(0, 600)
+        self._autosave_spin.setRange(AUTOSAVE_INTERVAL_MIN, AUTOSAVE_INTERVAL_MAX)
         self._autosave_spin.setSuffix(" 秒")
         self._autosave_spin.setSpecialValueText("OFF")
         self._autosave_spin.setValue(prefs.autosave_interval_s)
@@ -325,7 +372,7 @@ class PrefsDialog(QDialog):
             version=base.version,
             palette_id=self._current_palette_id(),
             initial_color=initial_color,
-            default_font_family=self._font_combo.currentFont().family(),
+            default_font_family=self._collect_font_family(base.default_font_family),
             default_font_size=self._font_size_spin.value(),
             default_stroke_width=self._stroke_width_spin.value(),
             default_connector_routing=self._routing_combo.currentData(),
@@ -342,6 +389,24 @@ class PrefsDialog(QDialog):
             grid_visible=base.grid_visible,
             snap_enabled=base.snap_enabled,
         )
+
+    def _collect_font_family(self, unchanged_value: str) -> str:
+        """フォント欄が実際に操作されていれば新しい family を、そうでなければ
+        `unchanged_value`（元の prefs 値）をそのまま返す（所見 S7）。
+
+        採用時は `QFontDatabase` のファウンドリ接尾辞（例:
+        "Nimbus Sans [UKWN]" の " [UKWN]"）を除去する。この接尾辞込みの文字列が
+        `TextObject.font_family` に入ると SVG の `font-family` へそのまま出力され、
+        角括弧付きは正当な CSS ファミリ名ではないため閲覧側でフォールバックする
+        （出力品質を損なう）。
+        """
+        if not self._font_dirty:
+            return unchanged_value
+        family = self._font_combo.currentFont().family()
+        bracket = family.find(" [")
+        if bracket != -1 and family.endswith("]"):
+            family = family[:bracket]
+        return family
 
     def accept(self) -> None:  # noqa: D102 (Qt override、docstring はクラス docstring 参照)
         self._edited_prefs = self._collect_prefs()

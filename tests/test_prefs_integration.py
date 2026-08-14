@@ -111,6 +111,72 @@ def test_text_creation_uses_pref_font_and_color(qapp: Any) -> None:
     assert text_obj.color == "#00FF00"
 
 
+def test_text_creation_box_matches_pref_font_size(qapp: Any) -> None:
+    """所見: 採寸が prefs 適用前の dataclass 既定フォント(18pt)で行われるため、
+    大きい `default_font_size` を設定すると新規テキストが生成直後から
+    `TextWordWrap` で折り返され、箱からあふれていた。
+    """
+    from PySide6.QtGui import QFont
+
+    from app.scene.items.text_item import default_text_size
+
+    prefs = Preferences(default_font_family="DejaVu Serif", default_font_size=48.0)
+    env = _make_env(prefs)
+    _click(env["tm"], "text", QPointF(50, 50))
+
+    text_obj = env["document"].objects[0]
+    font = QFont("DejaVu Serif")
+    font.setPointSizeF(48.0)
+    expected_w, expected_h = default_text_size(text_obj.text, font)
+    assert text_obj.width == expected_w
+    assert text_obj.height == expected_h
+    # 18pt(dataclass既定)の箱よりはっきり大きいこと（実測: 誤った採寸は
+    # 103.2×42.7 ・正しい採寸は 262.0×100.7 前後になる）。
+    assert text_obj.height > 60.0
+
+
+def test_math_creation_box_matches_pref_font_size(qapp: Any) -> None:
+    """所見: math は箱にフィット描画するため、誤った採寸のままだと
+    `default_font_size` を上げても見た目が一切変わらない（設定が無言で無効）。
+    """
+    from app.scene.items.math_item import natural_math_size
+    from app.tools.tool_manager import _MATH_DEFAULT_LATEX, _MATH_MIN_SIZE
+
+    prefs = Preferences(default_font_size=48.0)
+    env = _make_env(prefs)
+    _click(env["tm"], "math", QPointF(50, 50))
+
+    math_obj = env["document"].objects[0]
+    assert math_obj.font_size == 48.0
+    expected_w, expected_h = natural_math_size(
+        _MATH_DEFAULT_LATEX, 48.0, math_obj.color, minimum=_MATH_MIN_SIZE
+    )
+    assert math_obj.width == expected_w
+    assert math_obj.height == expected_h
+
+
+def test_style_memory_reset_lets_pref_defaults_apply_again(qapp: Any) -> None:
+    """所見: `_style_memory` は最初の生成時から永久に環境設定を上書きし続ける。
+    `clear_style_memory()` を呼べば、次の生成は環境設定の値に戻る
+    （`MainWindow.open_preferences` が作成既定の変更を検知して呼ぶ）。
+    """
+    prefs = Preferences(default_stroke_width=5.0, initial_color="#123456")
+    env = _make_env(prefs)
+    tm = env["tm"]
+    document = env["document"]
+    stack = env["stack"]
+
+    _drag(tm, "rect", QPointF(10, 10), QPointF(110, 90))
+    first = document.objects[0]
+    stack.push(SetPropertyCommand(document, first, "stroke", "#ABCDEF", first.stroke))
+
+    tm.clear_style_memory()
+    _drag(tm, "rect", QPointF(200, 200), QPointF(260, 240))
+    second = document.objects[-1]
+    assert second.stroke == "#123456"
+    assert second.stroke_width == 5.0
+
+
 def test_connector_creation_uses_pref_routing(qapp: Any) -> None:
     prefs = Preferences(default_connector_routing="straight")
     env = _make_env(prefs)

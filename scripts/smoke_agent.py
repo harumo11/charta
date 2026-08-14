@@ -466,6 +466,11 @@ def main() -> int:
         **os.environ,
         "QT_QPA_PLATFORM": "offscreen",
         "CHARTA_AGENT_PATHS": os.pathsep.join([tempfile.gettempdir(), str(runtime)]),
+        # 実ユーザーの ~/.config/charta/prefs.json を読み書きしない（環境設定
+        # レビュー所見）。`tests/conftest.py` の pytest 隔離は子プロセス起動の
+        # この smoke には効かないため、ここで明示的に隔離する。無指定だと
+        # 1 回実行するだけで実 GUI のウィンドウジオメトリ等が書き換わり得る。
+        "CHARTA_CONFIG_DIR": str(runtime / "config"),
     }
     print(f"charta を起動します（socket={socket_path}）")
     proc = subprocess.Popen(

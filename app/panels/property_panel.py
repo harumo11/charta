@@ -655,7 +655,14 @@ class PropertyPanel(QWidget):
         ) -> None:
             old_value = getattr(obj, spec.key)
             initial = QColor(old_value) if old_value else QColor(_DEFAULT_COLOR)
-            color = QColorDialog.getColor(initial, self, "色を選択")
+            # DontUseNativeDialog: ネイティブ色ダイアログの環境では `setCustomColor`
+            # で載せたパレットスウォッチが表示されない（所見 S1）。
+            color = QColorDialog.getColor(
+                initial,
+                self,
+                "色を選択",
+                options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
+            )
             if not color.isValid():
                 return
             new_value = color.name()
@@ -717,7 +724,14 @@ class PropertyPanel(QWidget):
         ) -> None:
             old_value = getattr(obj, spec.key)
             initial = QColor(old_value) if old_value else QColor(_DEFAULT_COLOR)
-            color = QColorDialog.getColor(initial, self, "色を選択")
+            # DontUseNativeDialog: ネイティブ色ダイアログの環境では `setCustomColor`
+            # で載せたパレットスウォッチが表示されない（所見 S1）。
+            color = QColorDialog.getColor(
+                initial,
+                self,
+                "色を選択",
+                options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
+            )
             if not color.isValid():
                 return
             new_value = color.name()
@@ -1036,7 +1050,14 @@ class PropertyPanel(QWidget):
         def on_click(_checked: bool = False, button: QPushButton = button) -> None:
             values = {getattr(o, spec.key) for o in objs}
             initial = QColor(next(iter(values))) if len(values) == 1 else QColor(_DEFAULT_COLOR)
-            color = QColorDialog.getColor(initial, self, "色を選択")
+            # DontUseNativeDialog: ネイティブ色ダイアログの環境では `setCustomColor`
+            # で載せたパレットスウォッチが表示されない（所見 S1）。
+            color = QColorDialog.getColor(
+                initial,
+                self,
+                "色を選択",
+                options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
+            )
             if not color.isValid():
                 return
             new_value = color.name()
@@ -1267,7 +1288,12 @@ class PropertyPanel(QWidget):
 
             def on_bg_click(_checked: bool = False, bg_button: QPushButton = bg_button) -> None:
                 old_artboard = self.scene.document.artboard
-                color = QColorDialog.getColor(QColor(old_artboard.background), self, "背景色")
+                color = QColorDialog.getColor(
+                    QColor(old_artboard.background),
+                    self,
+                    "背景色",
+                    options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
+                )
                 if not color.isValid():
                     return
                 new_value = color.name()

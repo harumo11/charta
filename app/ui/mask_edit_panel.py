@@ -151,7 +151,16 @@ class MaskEditPanel(QWidget):
         self._color_button.setEnabled(not checked)
 
     def _pick_color(self) -> None:
-        color = QColorDialog.getColor(QColor(self._selected_color), self, "マスク覆い色")
+        # DontUseNativeDialog: GTK/portal 等のネイティブ色ダイアログを使う環境
+        # （実測: xcb + GNOME）では `QColorDialog.setCustomColor` で載せたパレット
+        # スウォッチが一切表示されない（Qt 側の配列自体が画面に出ないため）。
+        # これを避けるため常に Qt 製ダイアログを強制する（所見 S1）。
+        color = QColorDialog.getColor(
+            QColor(self._selected_color),
+            self,
+            "マスク覆い色",
+            options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
+        )
         if not color.isValid():
             return
         self._selected_color = color.name()

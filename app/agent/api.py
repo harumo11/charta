@@ -1894,7 +1894,12 @@ class AgentAPI:
         `outline_text` の既定は **False**（CLAUDE.md §8。Nature 等の投稿規定が
         編集可能なテキストを要求するため 2026-08-02 に ON→OFF へ反転済み。UI の
         `_ask_outline_text` も既定 No）。フォント埋め込みを受け付けない入稿先の
-        ときだけ True にする。
+        ときだけ True にする。**意図的な仕様**: この既定は `Preferences.
+        export_outline_text`/`export_transparent_png` を参照しない（引数明示のみ）。
+        エージェント経由の呼び出しは明示引数で完結させ、UI 側の環境設定と結合
+        しない方針のため（環境設定レビュー所見。UI で「常にアウトライン化」を
+        設定していても、エージェントに書き出させるときは明示的に指定する必要が
+        ある）。
 
         `format` / `fmt` は誰もが推測しがちな誤引数名なので、素の TypeError に
         潰さず `renamed_argument` で `kind` へ誘導する（バッチメソッドの

@@ -85,18 +85,26 @@ class ExportController:
         prefs = self.prefs
         if prefs is not None and not prefs.export_confirm:
             return prefs.export_outline_text
+        outline_is_default = prefs is not None and prefs.export_outline_text
         default_button = (
-            QMessageBox.StandardButton.Yes
-            if prefs is not None and prefs.export_outline_text
-            else QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.Yes if outline_is_default else QMessageBox.StandardButton.No
+        )
+        # 本文の既定説明は `prefs.export_outline_text` に合わせて出し分ける
+        # （所見・軽微: 環境設定で ON にしているのに本文が常に「既定: しない」の
+        # ままだと、既定ボタンと本文が矛盾する）。`prefs=None` 経路（既定ボタン
+        # No・毎回確認）は従来の文言と完全一致し回帰しない。
+        default_note = (
+            "（既定: する — この環境設定になっています。\n"
+            "アウトライン化は、提出先がフォント埋め込みを受け付けない場合に推奨されます）"
+            if outline_is_default
+            else "（既定: しない — Nature 等の投稿規定は編集可能なテキストを要求します。\n"
+            "アウトライン化は、提出先がフォント埋め込みを受け付けない場合のみ推奨）"
         )
         return (
             QMessageBox.question(
                 self._window,
                 "テキストのアウトライン化",
-                "テキストをアウトライン化しますか？\n"
-                "（既定: しない — Nature 等の投稿規定は編集可能なテキストを要求します。\n"
-                "アウトライン化は、提出先がフォント埋め込みを受け付けない場合のみ推奨）",
+                f"テキストをアウトライン化しますか？\n{default_note}",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 default_button,
             )

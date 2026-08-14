@@ -10,9 +10,10 @@ from typing import Any
 
 import pytest
 import shiboken6
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import QColorDialog
 
+from app.commands.commands import SetPropertyCommand
 from app.model.document import Document
 from app.model.palettes import PALETTES, palette_by_id
 from app.prefs import Preferences, load_prefs, prefs_path, save_prefs
@@ -135,6 +136,53 @@ def test_register_button_calls_callback_once_and_relabels(qapp: Any) -> None:
     assert len(calls) == 1
     assert calls[0].id == _MATERIAL.id
     assert dialog._register_button.text() == "登録済み"
+    # 所見(#11): 2回目のクリックで無変化のコマンドを積ませないよう、
+    # 登録後はボタン自体を無効化しておく。
+    assert not dialog._register_button.isEnabled()
+
+
+# --------------------------------------------------------------------------
+# フォントコンボのダーティフラグ（所見 S7: 未操作でもフォントが書き換わる）
+# --------------------------------------------------------------------------
+
+
+def test_font_untouched_preserves_original_family_even_if_widget_normalizes(qapp: Any) -> None:
+    """フォント欄を一切操作しなければ、`QFontComboBox` が内部的にどう正規化
+    していても元の `default_font_family` がそのまま持ち越される。"""
+    dialog = PrefsDialog(Preferences(default_font_family="NoSuchFontXYZ"))
+    dialog._font_size_spin.setValue(20.0)  # 他フィールドの操作は無関係
+    dialog.accept()
+    assert dialog.edited_prefs().default_font_family == "NoSuchFontXYZ"
+
+
+def test_font_touched_marks_dirty_and_adopts_new_family(qapp: Any) -> None:
+    dialog = PrefsDialog(Preferences(default_font_family="Noto Sans CJK JP"))
+    assert dialog._font_dirty is False
+    dialog._font_combo.setCurrentFont(QFont("Arial"))
+    assert dialog._font_dirty is True
+    dialog.accept()
+    assert dialog.edited_prefs().default_font_family == dialog._font_combo.currentFont().family()
+
+
+def test_collect_font_family_strips_foundry_suffix_when_dirty(qapp: Any) -> None:
+    """`QFontDatabase` のファウンドリ接尾辞（例 "Nimbus Sans [UKWN]"）付きの文字列が
+    そのまま `font_family` に入ると SVG の `font-family` として不正になる。"""
+
+    class _FakeCombo:
+        def currentFont(self) -> QFont:
+            font = QFont()
+            font.setFamily("Nimbus Sans [UKWN]")
+            return font
+
+    dialog = PrefsDialog(Preferences())
+    dialog._font_dirty = True
+    dialog._font_combo = _FakeCombo()
+    assert dialog._collect_font_family("ignored") == "Nimbus Sans"
+
+
+def test_collect_font_family_returns_unchanged_value_when_not_dirty(qapp: Any) -> None:
+    dialog = PrefsDialog(Preferences())
+    assert dialog._collect_font_family("kept-as-is") == "kept-as-is"
 
 
 # --------------------------------------------------------------------------
@@ -286,3 +334,164 @@ def test_open_preferences_reject_leaves_prefs_unchanged(
     window.open_preferences()
 
     assert window.prefs == before
+
+
+def test_register_palette_styles_second_call_is_noop(window: Any) -> None:
+    """所見(#11): 同じ内容で 2 回登録しても 2 個目の undo ステップは積まない
+    （空コマンドを Ctrl+Z すると図が変わらないのに 1 手戻るように見えるため）。"""
+    window._register_palette_styles(_MATERIAL)
+    count_after_first = window.undo_stack.count()
+
+    window._register_palette_styles(_MATERIAL)
+
+    assert window.undo_stack.count() == count_after_first
+
+
+def test_open_preferences_clears_style_memory_when_creation_defaults_change(
+    qapp: Any, window: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """所見(#2/S2): rect を 1 個描いた直後に環境設定で初期色/線幅を変えても、
+    従来は sticky defaults(style memory)が永久に勝ち続けていた。
+    `open_preferences` が作成既定の変化を検知して `clear_style_memory()` を
+    呼ぶことで、変更後の最初の生成から新しい既定が効くようにする。
+    """
+    from PySide6.QtCore import QPointF, Qt
+
+    class _FakeEvent:
+        def button(self) -> Qt.MouseButton:
+            return Qt.MouseButton.LeftButton
+
+    tm = window.tool_manager
+    tm.set_tool("rect")
+    tm.handle_mouse_press(_FakeEvent(), QPointF(10, 10))
+    tm.handle_mouse_move(_FakeEvent(), QPointF(110, 90))
+    tm.handle_mouse_release(_FakeEvent(), QPointF(110, 90))
+    first = window.scene.document.objects[0]
+    assert first.stroke == "#000000"  # 変更前の既定
+
+    class _FakeDialog:
+        def __init__(self, prefs: Preferences, on_register_styles: Any = None) -> None:
+            self._edited = Preferences(
+                **{**prefs.to_dict(), "initial_color": "#F44336", "default_stroke_width": 8.0}
+            )
+
+        def exec(self) -> int:
+            return 1
+
+        def edited_prefs(self) -> Preferences:
+            return self._edited
+
+    monkeypatch.setattr("app.ui.main_window.PrefsDialog", _FakeDialog)
+    window.open_preferences()
+
+    tm.set_tool("rect")
+    tm.handle_mouse_press(_FakeEvent(), QPointF(200, 200))
+    tm.handle_mouse_move(_FakeEvent(), QPointF(260, 240))
+    tm.handle_mouse_release(_FakeEvent(), QPointF(260, 240))
+    second = window.scene.document.objects[-1]
+    assert second.stroke == "#F44336"
+    assert second.stroke_width == 8.0
+
+
+def test_open_preferences_without_default_change_keeps_style_memory(
+    qapp: Any, window: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """作成既定に関わらない設定（自動保存間隔等）だけを変えた場合は、
+    育てた sticky defaults を無意味に消さない。"""
+    from PySide6.QtCore import QPointF, Qt
+
+    class _FakeEvent:
+        def button(self) -> Qt.MouseButton:
+            return Qt.MouseButton.LeftButton
+
+    tm = window.tool_manager
+    tm.set_tool("rect")
+    tm.handle_mouse_press(_FakeEvent(), QPointF(10, 10))
+    tm.handle_mouse_move(_FakeEvent(), QPointF(110, 90))
+    tm.handle_mouse_release(_FakeEvent(), QPointF(110, 90))
+    first = window.scene.document.objects[0]
+    window.undo_stack.push(
+        SetPropertyCommand(window.scene.document, first, "stroke", "#ABCDEF", first.stroke)
+    )
+
+    class _FakeDialog:
+        def __init__(self, prefs: Preferences, on_register_styles: Any = None) -> None:
+            self._edited = Preferences(**{**prefs.to_dict(), "autosave_interval_s": 5})
+
+        def exec(self) -> int:
+            return 1
+
+        def edited_prefs(self) -> Preferences:
+            return self._edited
+
+    monkeypatch.setattr("app.ui.main_window.PrefsDialog", _FakeDialog)
+    window.open_preferences()
+
+    tm.set_tool("rect")
+    tm.handle_mouse_press(_FakeEvent(), QPointF(200, 200))
+    tm.handle_mouse_move(_FakeEvent(), QPointF(260, 240))
+    tm.handle_mouse_release(_FakeEvent(), QPointF(260, 240))
+    second = window.scene.document.objects[-1]
+    assert second.stroke == "#ABCDEF"
+
+
+# --------------------------------------------------------------------------
+# ウィンドウジオメトリ復元のクランプ（所見 S6）
+# --------------------------------------------------------------------------
+
+
+def test_oversized_saved_geometry_is_clamped_to_screen(qapp: Any) -> None:
+    save_prefs(Preferences(window_geometry=[0, 0, 100000, 100000]))
+    w = MainWindow()
+    try:
+        screen = w.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        geo = w.geometry()
+        assert geo.width() <= avail.width()
+        assert geo.height() <= avail.height()
+    finally:
+        w.close()
+
+
+def test_tiny_saved_geometry_falls_back_to_default_logic(qapp: Any) -> None:
+    save_prefs(Preferences(window_geometry=[10, 10, 1, 1]))
+    w = MainWindow()
+    try:
+        geo = w.geometry()
+        assert geo.width() > 1
+        assert geo.height() > 1
+    finally:
+        w.close()
+
+
+def test_offscreen_titlebar_geometry_falls_back_to_default_logic(qapp: Any) -> None:
+    """タイトルバー相当の帯が画面外なら、本体が多少重なっていても復元しない。"""
+    save_prefs(Preferences(window_geometry=[-100000, -100000, 800, 600]))
+    w = MainWindow()
+    try:
+        geo = w.geometry()
+        assert geo.x() != -100000
+        assert geo.y() != -100000
+    finally:
+        w.close()
+
+
+# --------------------------------------------------------------------------
+# QColorDialog: ネイティブダイアログ回避オプション（所見 S1）
+# --------------------------------------------------------------------------
+
+
+def test_bg_button_requests_non_native_color_dialog(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_get_color(*args: Any, **kwargs: Any) -> QColor:
+        captured.update(kwargs)
+        return QColor()  # invalid → ボタンの色は変えない
+
+    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(_fake_get_color))
+    dialog = PrefsDialog(Preferences())
+    dialog._bg_button.click()
+
+    assert captured.get("options") == QColorDialog.ColorDialogOption.DontUseNativeDialog

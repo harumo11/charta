@@ -41,7 +41,7 @@ from app.model.objects import BaseObject
 from app.model.palettes import Palette, palette_by_id, palette_style_bundles
 from app.panels.layer_panel import LayerPanel
 from app.panels.property_panel import PropertyPanel
-from app.prefs import Preferences, load_prefs, save_prefs
+from app.prefs import Preferences, load_prefs, update_prefs
 from app.scene.canvas_scene import CanvasScene
 from app.scene.canvas_view import CanvasView
 from app.tools.tool_manager import ToolManager
@@ -63,6 +63,36 @@ _AGENT_MESSAGE_MS = 4_000
 # 画像取り込み時のウィンドウ自動リサイズの最小サイズ。
 _MIN_WINDOW_W = 800
 _MIN_WINDOW_H = 600
+# 前回終了時のジオメトリを復元してよい最小サイズ(px)。これを下回るものは
+# 「1×1」等の壊れた記憶とみなし既定ロジックへフォールバックする（S6所見）。
+_MIN_RESTORED_W = 640
+_MIN_RESTORED_H = 480
+# ジオメトリ復元時、タイトルバー相当とみなして画面交差判定に使う帯の高さ(px)。
+_TITLEBAR_BAND_PX = 40
+
+# 新規オブジェクトの作成既定に関わる Preferences フィールド（`ToolManager.
+# _apply_pref_defaults` が参照するもの）。環境設定でこれらが変化したときだけ
+# sticky defaults(style memory)をリセットする（所見: 変わっていないのに
+# 毎回リセットすると、ユーザーが意図的に style memory を育てた直後の無関係な
+# 設定変更で消えてしまう）。
+_CREATION_DEFAULT_PREF_KEYS: tuple[str, ...] = (
+    "default_font_family",
+    "default_font_size",
+    "default_stroke_width",
+    "default_connector_routing",
+    "initial_color",
+)
+
+# 環境設定ダイアログには出さない自動記憶フィールド（`app/prefs.py` の
+# Preferences docstring 参照）。`open_preferences` はこれらを除いたフィールド
+# だけをディスクへマージ保存する（`update_prefs`、所見: 全フィールド保存だと
+# 複数プロセス間で後勝ち上書きが起きる）。
+_PREFS_AUTO_MEMORY_FIELDS: frozenset[str] = frozenset(
+    {"version", "window_geometry", "grid_visible", "snap_enabled"}
+)
+_PREFS_DIALOG_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in dataclasses.fields(Preferences) if f.name not in _PREFS_AUTO_MEMORY_FIELDS
+)
 
 _TOOL_LABELS: list[tuple[str, str]] = [
     ("select", "選択"),
@@ -93,15 +123,20 @@ _TOOL_SHORTCUTS: dict[str, str] = {
 }
 
 
-def _default_document() -> Document:
+def _default_document(prefs: Preferences | None = None) -> Document:
     """既定の空 Document を生成する（環境設定のアートボード既定値を使う。B契約 §B-2）。
 
-    引数なしの現シグネチャを維持する（`app/ui/controllers/project_io.py` や
-    `app/agent/api.py` が引数なしの callable として保持しているため）。呼ぶたびに
-    `load_prefs()` するので、環境設定ダイアログでの変更後に呼ばれる「新規」操作は
-    常に最新の既定値を反映する。
+    `prefs` を渡さなければディスクから `load_prefs()` する（0 引数呼び出しの
+    現行契約を維持——`app/ui/controllers/project_io.py` や `app/agent/api.py` が
+    引数なしの callable として保持しているため）。所見: 引数なし固定だと
+    「メモリ上の `self.prefs`」と「新規作成が見る値」が別経路になり、保存に
+    失敗した場合（`save_prefs` が warn するだけで例外を出さなくなった今、
+    ディスクが更新されない状況は現実的に起き得る）や、テスト/将来 API が
+    `window.prefs` を直接書き換えた場合にその変更が無視される。`MainWindow`/
+    `ProjectIOController` は `self.prefs` を明示的に渡すことでこれを避ける。
     """
-    prefs = load_prefs()
+    if prefs is None:
+        prefs = load_prefs()
     artboard = Artboard(
         width_px=int(round(prefs.artboard_width_px)),
         height_px=int(round(prefs.artboard_height_px)),
@@ -124,11 +159,13 @@ class MainWindow(QMainWindow):
 
         self.undo_stack: QUndoStack = QUndoStack(self)
 
-        doc = document if document is not None else _default_document()
+        doc = document if document is not None else _default_document(self.prefs)
         self.scene: CanvasScene = CanvasScene(doc)
         self.scene.set_undo_stack(self.undo_stack)
 
-        self._project_io = ProjectIOController(self, self.scene, _default_document)
+        self._project_io = ProjectIOController(
+            self, self.scene, lambda: _default_document(self.prefs)
+        )
         self._export = ExportController(
             self,
             self.scene,
@@ -281,18 +318,26 @@ class MainWindow(QMainWindow):
         """起動時のウィンドウジオメトリを決める。
 
         `prefs.window_geometry`（前回終了時に保存したもの）が有効（4要素・幅高さが
-        正）かつ、いずれかのスクリーンと交差する（マルチモニタ構成の変更等で完全に
-        画面外になっていない）なら、それをそのまま復元する。それ以外は従来の
-        既定ロジック（横長基調・利用可能領域の85%でクランプ）にフォールバックする
-        （B契約 §B-2）。
+        最小サイズ以上）かつ、タイトルバー相当の帯がいずれかのスクリーンの利用可能
+        領域と交差する（マルチモニタ構成の変更等で完全に画面外になっていない）なら、
+        その交差したスクリーンの利用可能領域にクランプして復元する。それ以外は
+        従来の既定ロジック（横長基調・利用可能領域の85%でクランプ）にフォールバック
+        する（B契約 §B-2）。
+
+        所見: 従来はサイズの上限・下限を一切見ていなかったため、4K モニタで使った
+        後にノート単体で起動すると画面より大きいウィンドウがそのまま復元され、
+        右ドック/ステータスバーが画面外に出て操作不能になった。また 1px でも
+        画面と交差すれば復元してしまうため、タイトルバーが画面外の位置（例:
+        ほぼ全体が上に飛び出している）も通り抜けていた。
         """
         geometry = self.prefs.window_geometry
         if geometry is not None and len(geometry) == 4:
             x, y, w, h = geometry
-            if w > 0 and h > 0:
+            if w >= _MIN_RESTORED_W and h >= _MIN_RESTORED_H:
                 rect = QRect(x, y, w, h)
-                if self._rect_intersects_any_screen(rect):
-                    self.setGeometry(rect)
+                screen = self._screen_for_titlebar(rect)
+                if screen is not None:
+                    self.setGeometry(self._clamp_rect_to_screen(rect, screen))
                     return
 
         # 明示的に resize しないと右ドック（プロパティ/レイヤー縦積み）の sizeHint に
@@ -312,6 +357,31 @@ class MainWindow(QMainWindow):
         return any(
             screen.availableGeometry().intersects(rect) for screen in QGuiApplication.screens()
         )
+
+    @staticmethod
+    def _screen_for_titlebar(rect: QRect) -> Any:
+        """`rect` のタイトルバー相当の帯と交差するスクリーンを返す（無ければ None）。
+
+        `rect` 全体ではなく上端の帯だけで判定することで、「タイトルバーは画面外・
+        本体だけ画面内」のような、掴んで動かせない配置を復元候補から除く
+        （所見: 1px でも交差すれば復元していた従来ロジックの穴）。
+        """
+        band_height = min(_TITLEBAR_BAND_PX, rect.height())
+        band = QRect(rect.x(), rect.y(), rect.width(), band_height)
+        for screen in QGuiApplication.screens():
+            if screen.availableGeometry().intersects(band):
+                return screen
+        return None
+
+    @staticmethod
+    def _clamp_rect_to_screen(rect: QRect, screen: Any) -> QRect:
+        """`rect` を `screen` の利用可能領域に収まるようクランプする。"""
+        avail = screen.availableGeometry()
+        w = min(rect.width(), avail.width())
+        h = min(rect.height(), avail.height())
+        x = max(avail.left(), min(rect.x(), avail.right() - w + 1))
+        y = max(avail.top(), min(rect.y(), avail.bottom() - h + 1))
+        return QRect(x, y, w, h)
 
     def _resize_window_to_fit(self, rect: QRectF) -> None:
         """取り込んだ画像（の外接矩形）がビューポートを余白なく満たすようリサイズする。
@@ -715,25 +785,47 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def open_preferences(self) -> None:
-        """環境設定ダイアログを開き、OK なら保存して実行時反映を行う。
+        """環境設定ダイアログを開き、OK なら実行時反映してから保存する。
 
         `self.prefs` は `ToolManager`/`ExportController` が同一オブジェクトの
         参照を保持しているため、差し替えず中身だけ更新する（`_update_prefs_in_place`）。
         アートボード既定・新規オブジェクト既定は次回作成分から効くだけで、
         現在のドキュメントには一切触れない。
+
+        - **sticky defaults のリセット**（所見）: `ToolManager._style_memory` は
+          同種オブジェクトを一度でも作っていると、以後ずっと環境設定の既定値を
+          上書きし続けてしまう。新規作成の既定に関わるフィールドが実際に変わった
+          ときだけ `clear_style_memory()` を呼び、「設定を変えた直後の新規作成は
+          変更後の値になる」を成立させる。
+        - **実行時反映を保存より先に行う**（所見）: 保存（ディスク I/O）は失敗し得る
+          が、パレットスウォッチ/自動保存間隔の反映はメモリ内操作なので失敗しない。
+          先に保存していた従来の並びだと、保存失敗時に「OK を押したのに何も
+          反映されない」が起き得た。
+        - **保存はフィールド単位でマージ**（`update_prefs`、所見）: `self.prefs` を
+          丸ごと `save_prefs` すると、ウィンドウジオメトリ等をこのインスタンスが
+          読み込んだ後に他インスタンス（§15 のヘッドレス常駐等）が保存した分を
+          後勝ちで消してしまう。ダイアログが実際に編集するフィールドだけを
+          ディスクの最新値へ重ね書きする。
         """
         dialog = PrefsDialog(self.prefs, on_register_styles=self._register_palette_styles)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._update_prefs_in_place(dialog.edited_prefs())
-        save_prefs(self.prefs)
+        new_prefs = dialog.edited_prefs()
+        defaults_changed = any(
+            getattr(self.prefs, key) != getattr(new_prefs, key)
+            for key in _CREATION_DEFAULT_PREF_KEYS
+        )
+        self._update_prefs_in_place(new_prefs)
+        if defaults_changed:
+            self.tool_manager.clear_style_memory()
         self._apply_palette_swatches()
         self._configure_autosave_timer()
+        update_prefs(**{name: getattr(self.prefs, name) for name in _PREFS_DIALOG_FIELDS})
 
     def _update_prefs_in_place(self, new_prefs: Preferences) -> None:
         """`self.prefs` の中身を `new_prefs` の値で丸ごと置き換える（参照は保つ）。
 
-        `ToolManager.prefs` / `ExportController._prefs` はコンストラクタで
+        `ToolManager.prefs` / `ExportController.prefs` はコンストラクタで
         `self.prefs` と同じオブジェクトを受け取っているため、参照自体を
         差し替えると配線し直しが要る。フィールドを書き換えるだけなら、
         既存の参照経由で即座に新しい値が見える。
@@ -759,23 +851,33 @@ class MainWindow(QMainWindow):
 
         `PrefsDialog` の「このプロジェクトに styles として登録」ボタンから呼ばれる
         コールバック。既存の同名キー（同じパレットを登録し直した場合等）は上書きする。
+        マージ結果が既存の `document.styles` と完全一致する（＝既に登録済みで
+        ボタンを再度押しただけ）なら push しない（所見: 空コマンドでも undo
+        スタックに積むと、ダイアログを閉じて Ctrl+Z したときに「図は何も
+        変わらないのに 1 手取り消される」という一見壊れた挙動になる）。
         """
         document = self.scene.document
         old_styles = {name: dict(values) for name, values in document.styles.items()}
         new_styles = dict(old_styles)
         new_styles.update(palette_style_bundles(palette))
+        if new_styles == old_styles:
+            return
         text = f"パレット登録 ({palette.name})"
         self.undo_stack.push(SetStylesCommand(document, new_styles, old_styles, text=text))
 
     def _on_grid_toggled(self, checked: bool) -> None:
         self._edit.toggle_grid(checked)
         self.prefs.grid_visible = checked
-        save_prefs(self.prefs)
+        # フィールド単位のマージ保存（`update_prefs`）。`self.prefs` を丸ごと
+        # 保存すると、他プロセスが更新した無関係なフィールドを後勝ちで消し得る
+        # （所見）。`save_prefs`/`update_prefs` は書き込み失敗時も例外を出さず
+        # `warnings.warn` するだけなので、ここで try/except は不要。
+        update_prefs(grid_visible=checked)
 
     def _on_snap_toggled(self, checked: bool) -> None:
         self._edit.toggle_snap(checked)
         self.prefs.snap_enabled = checked
-        save_prefs(self.prefs)
+        update_prefs(snap_enabled=checked)
 
     # ------------------------------------------------------------------
     # 自動保存（§9.6・M7契約 §9、間隔は環境設定 B契約 §B-2）
@@ -810,9 +912,19 @@ class MainWindow(QMainWindow):
         self.stop_agent_server()
         self._autosave()
         # ウィンドウジオメトリを環境設定へ記憶する（B契約 §B-2、自動記憶）。
-        geo = self.geometry()
+        # 最大化中は `geometry()` が画面いっぱいの座標を返すため、次回はその
+        # まま「画面いっぱいの非最大化ウィンドウ」で起動してしまう。
+        # `normalGeometry()`（最大化前の通常状態のジオメトリ）を保存すれば、
+        # スキーマ（`window_geometry: [x,y,w,h]`）を変えずにこの実害を防げる
+        # （所見。最大化フラグ自体は保存しないので、次回はその正常サイズの
+        # 非最大化ウィンドウで開く——現状の「最大化状態は復元しない」という
+        # 契約上の制限はそのまま）。
+        geo = self.normalGeometry() if self.isMaximized() else self.geometry()
         self.prefs.window_geometry = [geo.x(), geo.y(), geo.width(), geo.height()]
-        save_prefs(self.prefs)
+        # フィールド単位のマージ保存（`update_prefs`、上記 `_on_grid_toggled` と
+        # 同じ理由）。書き込み失敗は `warnings.warn` に留まるため、終了処理
+        # （`super().closeEvent(event)`）の手前で例外が飛ぶことはない。
+        update_prefs(window_geometry=self.prefs.window_geometry)
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
