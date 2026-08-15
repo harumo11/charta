@@ -81,6 +81,8 @@ class TextItem(BoxItem):
         self._layout_rect_cache: tuple[tuple[Any, ...], QRectF] | None = None
         self._text_edit_mode: bool = False
         self._editor: TextEditorItem | None = None
+        # begin_text_edit() 開始時点の obj.text（外部要因による本文変更の検出用。所見2）。
+        self._edit_start_text: str | None = None
 
     def set_export_outline(self, enabled: bool) -> None:
         """エクスポート用のアウトライン描画モードを切り替える（既定 False = 通常表示）。"""
@@ -144,28 +146,48 @@ class TextItem(BoxItem):
             self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
 
     def _on_sync_geometry(self) -> None:
-        if self._text_edit_mode and self._editor is not None:
-            # 外部要因(プロパティパネルの数値入力・Ctrl+Z 等)で幅高さが変わると、
-            # エディタの折返し幅と valign オフセットが古いまま取り残される
-            # (CurveItem._on_sync_geometry と同じ理由)。
-            self._editor.sync_geometry()
+        """外部要因（プロパティパネル・undo/redo 等）によるモデル変更をエディタへ反映する。
+
+        `BoxItem.sync_from_model` はプロパティ変更全般で呼ばれる（幾何限定ではない）ため、
+        ここが編集中のエディタ同期の唯一のフック点になる（所見2）。`obj.text` が
+        `begin_text_edit()` 開始時点から変わっていれば外部からの本文変更とみなし、
+        エディタの下書きを上書きせずそのまま編集を打ち切る（`cancel_text_edit()` は
+        自身が `sync_from_model()` を呼ぶため、ここでは `_end_text_edit()` のみ呼び、
+        残りの同期は呼び出し元の `sync_from_model` に任せる＝再入を避ける）。
+        本文以外の変更（font/color/align/幅高さ）はエディタへそのまま再適用する。
+        """
+        if not (self._text_edit_mode and self._editor is not None):
+            return
+        if self.obj.text != self._edit_start_text:
+            self._end_text_edit()
+            return
+        self._editor.sync_from_model()
+
+    def _draw_placeholder(self, painter: Any) -> None:
+        """空テキストのプレースホルダ破線枠を描く（編集中/非編集で共通・所見4）。"""
+        rect = QRectF(0.0, 0.0, self._w, self._h)
+        placeholder_pen = QPen(QColor(180, 180, 180))
+        placeholder_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(placeholder_pen)
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        painter.drawRect(rect)
 
     def paint(self, painter: Any, option: Any, widget: Any = None) -> None:
         if self._text_edit_mode:
-            # 編集中は本体テキストを描かない(空テキストのプレースホルダ破線も含む)。
-            # エディタ(子アイテム)が唯一の描画源であることが方針b(見た目完全一致)の
-            # 前提であり、親が枠等を描き足すと編集中/非編集の render が一致しなく
-            # なる(ピクセル比較テストで固定済み)。二重描画防止のため何も描かない。
+            # 編集中の見た目の真実源はエディタの生テキスト（`obj.text` は確定まで
+            # 凍結されている）。空なら確定後と同じプレースホルダ破線を描く（契約
+            # 自身の矛盾＝所見4: 全選択削除で箱が消えるのは方針bに反する）。非空
+            # ならエディタ（子アイテム）が唯一の描画源であり、親が描き足すと
+            # 編集中/非編集の render が食い違うため二重描画しない。
+            editor_text = self._editor.current_text() if self._editor is not None else ""
+            if not editor_text:
+                self._draw_placeholder(painter)
             return
-        rect = QRectF(0.0, 0.0, self._w, self._h)
         text = self.obj.text
         if not text:
-            placeholder_pen = QPen(QColor(180, 180, 180))
-            placeholder_pen.setStyle(Qt.PenStyle.DashLine)
-            painter.setPen(placeholder_pen)
-            painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-            painter.drawRect(rect)
+            self._draw_placeholder(painter)
             return
+        rect = QRectF(0.0, 0.0, self._w, self._h)
         color = QColor(self.obj.color) if self.obj.color else QColor(0, 0, 0)
         if self._export_outline:
             font = font_for(self.obj)
@@ -198,6 +220,32 @@ class TextItem(BoxItem):
     # ------------------------------------------------------------------
     # テキスト編集
     # ------------------------------------------------------------------
+    def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
+        """編集中、箱の余白（エディタの bounding rect 外だが箱内）への press でも
+        フォーカスをエディタへ戻す（review2 所見1）。
+
+        `TextEditorItem` の bounding rect はテキストブロックの高さ分しかないため、
+        箱の残り領域は本アイテム（`ItemIsFocusable` を持たない）が受ける。Qt は
+        フォーカス不能アイテムへの press 配送前にシーンのフォーカスをクリアする
+        ため、何もしないと `scene.focusItem()` が None になり以後のキー入力が
+        どこにも届かなくなる。press 配送はフォーカスクリアの後に走るため、ここで
+        エディタへ `setFocus()` すれば必ず復帰する。クリック位置に応じてキャレット
+        も置く（`QAbstractTextDocumentLayout.hitTest`）。
+        """
+        if self._text_edit_mode and self._editor is not None:
+            editor = self._editor
+            local = self.mapToItem(editor, event.pos())
+            layout = editor.document().documentLayout()
+            cursor_pos = layout.hitTest(local, Qt.HitTestAccuracy.FuzzyHit)
+            editor.setFocus(Qt.FocusReason.MouseFocusReason)
+            if cursor_pos >= 0:
+                cursor = editor.textCursor()
+                cursor.setPosition(cursor_pos)
+                editor.setTextCursor(cursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         if self.obj.locked:
             event.ignore()
@@ -243,6 +291,7 @@ class TextItem(BoxItem):
         from app.scene.items.text_editor_item import TextEditorItem
 
         self._text_edit_mode = True
+        self._edit_start_text = self.obj.text
         self._hide_handles()
         # 編集中は画像 crop/曲線ノード編集と同じ理由で本体の移動を無効化する。
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)

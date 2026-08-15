@@ -28,10 +28,11 @@ from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
 from app.ai.sam3 import MaskCandidate
 from app.commands.commands import AddObjectCommand, RemoveObjectCommand
-from app.model.objects import ImageObject
+from app.model.objects import ImageObject, TextObject
 from app.model.serialize import import_image, save_document
 from app.scene.items.image_item import ImageItem
 from app.scene.items.mask_edit_overlay import MaskEditOverlay
+from app.scene.items.text_item import TextItem
 from app.ui.controllers.sam3_masking import Sam3Worker
 from app.ui.main_window import MainWindow
 
@@ -541,4 +542,41 @@ def test_auto_detect_not_requested_when_text_and_boxes_both_empty(
     window.mask_edit_panel.text_committed.emit()
     assert len(captured) == 1, "テキスト・ボックスとも空では worker に投げないこと"
 
+    session.cancel()
+
+
+def test_start_mask_edit_action_commits_active_text_edit(
+    window: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """SAM3 マスク編集の開始（メニュー起動）は、テキスト編集中なら先に確定する。
+
+    メニュー起動はキャンバス press を伴わないため
+    `CanvasView._commit_text_edit_on_outside_press` の確定経路を通らず、対策が
+    無いとテキスト編集とマスク編集が同時 active になる（review2 所見4）。
+    """
+    obj_img, item_img = _add_image(window, project_dir, tmp_path, name="sam3_text.png")
+
+    text_obj = TextObject(
+        id=window.scene.document.new_id(),
+        text="編集中",
+        x=100.0,
+        y=100.0,
+        width=100.0,
+        height=40.0,
+    )
+    window.undo_stack.push(AddObjectCommand(window.scene.document, text_obj))
+    text_item = window.scene.item_for(text_obj)
+    assert isinstance(text_item, TextItem)
+
+    assert text_item.begin_text_edit() is True
+    assert window.scene.active_text_edit_item() is text_item
+
+    item_img.setSelected(True)
+    window._sam3_masking.start_mask_edit_action()
+
+    assert (
+        window.scene.active_text_edit_item() is None
+    ), "マスク編集開始前にテキスト編集が確定していること"
+    session = window.scene.active_mask_session()
+    assert session is not None
     session.cancel()

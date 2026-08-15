@@ -24,8 +24,9 @@ from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
 from app.commands.commands import AddObjectCommand, RemoveObjectCommand
 from app.model.document import Document
-from app.model.objects import CurveObject
+from app.model.objects import CurveObject, TextObject
 from app.scene.canvas_scene import CanvasScene
+from app.scene.items.text_item import TextItem
 from app.ui.main_window import MainWindow
 
 _MOVABLE = QGraphicsItem.GraphicsItemFlag.ItemIsMovable
@@ -545,3 +546,30 @@ def test_node_edit_mode_blocks_agent_mutations(window: Any, qapp: Any) -> None:
         assert read_response["result"]["busy"]["busy"] is True
     finally:
         item.cancel_node_edit()
+
+
+# --------------------------------------------------------------------------
+# 11. ノード編集開始はテキスト編集を確定する(review2 所見4の対称箇所)
+# --------------------------------------------------------------------------
+
+
+def test_begin_node_edit_commits_active_text_edit() -> None:
+    """ノード編集開始はテキスト編集中なら先に確定する（`TextItem.begin_text_edit` が
+    ノード編集を確定するのと対称）。"""
+    scene, stack, _obj, item = _scene_with_curve()
+    text_obj = TextObject(
+        id=scene.document.new_id(), text="編集中", x=300.0, y=0.0, width=100.0, height=40.0
+    )
+    stack.push(AddObjectCommand(scene.document, text_obj))
+    text_item = scene.item_for(text_obj)
+    assert isinstance(text_item, TextItem)
+
+    assert text_item.begin_text_edit() is True
+    assert scene.active_text_edit_item() is text_item
+
+    assert item.begin_node_edit() is True
+
+    assert scene.active_text_edit_item() is None, "ノード編集開始前にテキスト編集が確定していること"
+    assert scene.active_node_edit_item() is item
+    item.cancel_node_edit()
+    scene.close()

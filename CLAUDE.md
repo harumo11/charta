@@ -280,6 +280,55 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - ダブルクリックで LaTeX 再編集ダイアログ → SVG 再生成 → 差し替え（`latex` が真実源）。
 - 生成失敗（不正な LaTeX）時はエラー表示し、直前の有効表示を維持。
 
+### 9.4a text のインプレース編集（2026-08-15、ダイアログ廃止）
+
+text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`）を廃止し、
+**crop / SAM3 マスク編集 / 曲線ノード編集と同じ設計文法**（オンキャンバス直接編集・
+専用の子アイテム・確定/キャンセルの対称 API）の4例目としてキャンバス上の
+インプレース編集に統一した。math（数式）は LaTeX 検証があるためダイアログのまま
+（対象外。「## 9.4」参照）。
+
+- **起動**: text をダブルクリック → `TextItem.begin_text_edit()` が子アイテム
+  `TextEditorItem`（`QGraphicsTextItem` 派生、`app/scene/items/text_editor_item.py`）
+  を生成し、以後の表示を担わせる（locked は無視。他アイテムの crop/mask/
+  ノード編集/テキスト編集は先に確定してから入る）。
+- **キー割り当て**（変更禁止のユーザー向け仕様）: **Enter=改行**（複数行のため確定
+  ではない）／**Ctrl+Enter・外側クリック・ツール切替=確定**／**Esc=キャンセル**
+  （破棄）。確定は `commit_text_edit()` → 既存の `commit_text()` に委譲し、undo
+  1 マクロ・高さ再採寸・valign アンカー維持は従来どおり。
+- **見た目完全一致（方針b）の実現方式**: `TextEditorItem` に `TextItem.paint`
+  （`drawText` 経路）と**完全に同一のレイアウト条件**を与える —
+  `document().setDocumentMargin(0.0)`（既定 4px マージンを殺す）／同一 `QFont`
+  （`font_for(obj)`、px 焼き込み済み）／同一 `QTextOption`（alignment + WordWrap）／
+  同一折返し幅（`setTextWidth`）／同一文字色／`text_outline.valign_offset()` に
+  よる手動 y オフセット（テキスト変化のたび再計算）。`drawText` も
+  `QTextDocument` も内部は `QTextLayout` を使うため、これらを揃えれば行分割・
+  行送りが一致する。**一致することはピクセル比較テストで固定する**
+  （`tests/test_text_editor_parity.py`: 通常描画と編集中描画を同一シーンで
+  `QImage` へ render し不一致画素を 0.5% 未満に固定。日本語複数行 ×
+  align/valign/bold/font_size の代表ケースに加え、空テキストのプレースホルダ
+  破線一致・境界ケースも収録）。編集中は親 `TextItem.paint` が本体テキストを
+  描かず、エディタが唯一の描画源になる（空テキストのプレースホルダ破線のみ、
+  親が編集中/非編集で共通に描く）。
+- **既知の非一致**: 箱幅より長い1トークン（改行不能な長い識別子等）× 中央/右揃え
+  は `QTextDocument` が行幅基準（実質左寄せ）で整列する一方、`paint`/
+  `text_to_path`/SVG/PDF は箱幅基準で中央/右揃えするため編集中だけ数%食い違う。
+  根本解決（3経路すべてを break-anywhere に揃える）は行分割の仕様変更でありユーザー
+  判断が必要なため、現状は境界を固定するテストで既知の限界として扱っている
+  （`test_known_mismatch_long_unbreakable_token_exceeding_box_width`）。
+- **編集中の外部モデル変更**: プロパティパネル等で font/color/align/幅高さが
+  変わればエディタへ即座に再適用する。`text` 自体が外部から変わった場合は
+  エディタの下書きで上書き確定せず、そのままキャンセルする（`TextItem._on_sync_geometry`）。
+- **フォーカス**: `TextEditorItem` の bounding rect はテキストブロック高さ分
+  しかなく、箱の残り（余白）は親 `TextItem` が受ける。`TextItem.mousePressEvent`
+  が余白クリックでもエディタへフォーカスを同期的に戻し、キャレットも
+  クリック位置に置く。`CanvasView` の ShortcutOverride ガードは
+  `active_text_edit_item()`（`scene.focusItem()` ではない）を条件に印字可能
+  キー等を accept し、QAction のショートカットに奪わせない。
+- **保存/書き出し中の扱い**: crop/mask/ノード編集と同じ立場で、編集中でも
+  Ctrl+S/Ctrl+E/自動保存は確定済みのモデルをそのまま書き出す（詳細は
+  `.claude/working/architecture/export.md`）。
+
 ### 9.5 SAM3 選択的マスキング（旧: 背景除去の削除経緯）
 
 **経緯**: かつて rembg（自動）＋ OpenCV GrabCut（手動補正）の2段構えの背景除去を実装していたが、専用の外部ツールの方が高品質・高使い勝手のため **2026-07-23 に全削除**した（自動背景除去は今もスコープ外。「## 12」参照）。その後、**「対象物以外を覆う/切り取る」選択的マスキングは 2026-07-27 にユーザー指示で正式スコープ化**し、SAM3 で実装した。

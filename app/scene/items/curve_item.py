@@ -190,6 +190,14 @@ class CurveItem(BoxItem):
                 commit_node = getattr(node_item, "commit_node_edit", None)
                 if callable(commit_node):
                     commit_node()
+            # テキスト編集中にノード編集開始すると 2 モード同時 active になる
+            # （`TextItem.begin_text_edit` の対称。review2 所見4）ため先に確定する。
+            text_getter = getattr(scene, "active_text_edit_item", None)
+            text_item = text_getter() if callable(text_getter) else None
+            if text_item is not None:
+                commit_text_edit = getattr(text_item, "commit_text_edit", None)
+                if callable(commit_text_edit):
+                    commit_text_edit()
         self._node_edit_mode = True
         self._hide_handles()
         # ノード編集中は画像 crop と同じ理由で本体の移動を無効化する。

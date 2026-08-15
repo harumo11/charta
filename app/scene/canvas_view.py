@@ -129,21 +129,28 @@ class CanvasView(QGraphicsView):
         ここで `accept()` しておかないと、テキストアイテム編集中に "r" と打っただけで
         矩形ツールへ切り替わってしまう（QAction のショートカットが横取りする）。
 
-        2026-08-15 にキャンバス上インプレース編集（`TextEditorItem`）を導入したことで
-        `scene.focusItem()` が非 None になる経路ができ、このガードが実際に発火する
-        ようになった（旧 `QDialog` 方式の `edit_text` では `scene.focusItem()` が常に
-        None でデッドコードだった）。編集中はエディタへ渡すべきキーを広く accept する:
-        印字可能キー全般（`event.text()` が非空。A–Z・数字・記号・Space・かな変換前の
-        IME 入力を含む）、Delete/Backspace、Ctrl+{C,V,X,A,Z,Y}（エディタ内のコピペ・
-        全選択・`QTextDocument` 内蔵のテキスト undo/redo）。Ctrl+Enter/Return は該当する
+        判定条件は `scene.focusItem() is not None` ではなく `active_text_edit_item()`
+        （所見3・review2）: 実測では `TextEditorItem` がシーンのキーボードフォーカスを
+        持っている間は Qt 自身（`QGraphicsTextItem`→`QWidgetTextControl` の
+        ShortcutOverride 処理）が既にこれらのキーを accept しており、このガードは
+        素の Qt 既定挙動と重複するだけで実質デッドコードだった。このガードが実際に
+        意味を持つのは、箱の余白クリック等でシーンのフォーカスが失われても
+        （review2 所見1）編集モード自体は継続している局面——すなわち
+        `scene.focusItem()` が None なのに `active_text_edit_item()` は非 None、
+        という乖離が起きたとき。`TextItem.mousePressEvent` がフォーカスを
+        同期的に復帰させるため実害は小さいが、他の未知の経路でフォーカスが
+        失われた場合の防御として、判定を「編集モード中かどうか」そのものに揃える。
+        編集中はエディタへ渡すべきキーを広く accept する: 印字可能キー全般
+        （`event.text()` が非空。A–Z・数字・記号・Space・かな変換前の IME 入力を
+        含む）、Delete/Backspace、Ctrl+{C,V,X,A,Z,Y}（エディタ内のコピペ・全選択・
+        `QTextDocument` 内蔵のテキスト undo/redo）。Ctrl+Enter/Return は該当する
         `QShortcut` が無いため accept しない（確定は `keyPressEvent`/
         `_handle_text_edit_key` 側で処理する）。
         なお、プロパティパネルの入力欄（QLineEdit 等）は Qt 標準のフォーカスウィジェット
         に対する ShortcutOverride 処理で既に保護されており、このガードとは独立して安全。
         """
         if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
-            scene = self.scene()
-            if scene is not None and scene.focusItem() is not None:
+            if self._active_text_edit_item() is not None:
                 key = event.key()
                 modifiers = event.modifiers()
                 # Ctrl 修飾時は X11 等で event.text() が制御文字（例: Ctrl+S → "\x13"）を

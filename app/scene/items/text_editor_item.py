@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QKeyEvent, QTextCursor, QTextOption
+from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QTextCursor, QTextOption
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsTextItem
 
 from app.export.text_outline import valign_offset
@@ -68,42 +68,82 @@ class TextEditorItem(QGraphicsTextItem):
         return self.toPlainText()
 
     def _sync_layout(self) -> None:
-        """valign オフセットを再計算し、親のジオメトリ変更を通知する。
+        """valign オフセットを再計算し、親の再描画をスケジュールする。
 
         テキスト変化(`contentsChanged`)のたびに呼ばれる。`text_item._w`/`_h` は
         箱の折返し幅・高さで、編集中もモデルの箱サイズをそのまま使う(方針 b:
         `TextItem.paint` の `valign_offset(text, font, rect, valign)` と同一計算)。
+        `TextItem.paint` は編集中の空テキストプレースホルダ判定にエディタの生
+        テキストを使う(所見4)ため、`prepareGeometryChange()`(親の boundingRect は
+        モデル依存で不変なので効果が無い。nit6)ではなく `update()` で親の
+        再描画を予約し、空↔非空の切り替わりを取りこぼさないようにする。
         """
         text_item = self._text_item
         obj = text_item.obj
         rect = QRectF(0.0, 0.0, max(float(text_item._w), 1.0), max(float(text_item._h), 1.0))
         offset = valign_offset(self.toPlainText(), self.font(), rect, obj.valign)
-        # 親側の boundingRect には影響しないが、契約 §A-1 の指示どおり明示しておく
-        # (編集中に親の他の幾何キャッシュが古いまま参照されるのを防ぐ保険)。
-        text_item.prepareGeometryChange()
+        text_item.update()
         self.setPos(0.0, offset)
 
-    def sync_geometry(self) -> None:
-        """親の `_w`/`_h` が外部要因で変わったときの再同期(折返し幅・valign オフセット)。
+    def sync_from_model(self) -> None:
+        """外部要因(プロパティパネル・undo/redo等)によるモデル変更をエディタへ再適用する。
 
-        `TextItem._on_sync_geometry` から編集中のみ呼ばれる。
+        `TextItem._on_sync_geometry` から編集中のみ呼ばれる(所見2)。font/color/
+        alignment/折返し幅を再適用してから valign オフセットを再計算する。本文
+        (`obj.text`)自体の変更はここでは扱わない(呼び出し元が別途キャンセル
+        判定する。エディタの下書きを外部テキストで上書きしないため)。
         """
+        obj = self._text_item.obj
+        document = self.document()
+        self.setFont(font_for(obj))
+        option = QTextOption(ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft))
+        option.setWrapMode(QTextOption.WrapMode.WordWrap)
+        document.setDefaultTextOption(option)
+        self.setDefaultTextColor(QColor(obj.color) if obj.color else QColor(0, 0, 0))
         self.setTextWidth(max(float(self._text_item._w), 1.0))
         self._sync_layout()
 
     # ------------------------------------------------------------------
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 (Qt override)
         key = event.key()
+        modifiers = event.modifiers()
         if key == Qt.Key.Key_Escape:
             self._text_item.cancel_text_edit()
             event.accept()
             return
         is_enter = key in (Qt.Key.Key_Enter, Qt.Key.Key_Return)
-        if is_enter and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+        if is_enter and bool(modifiers & Qt.KeyboardModifier.ControlModifier):
             self._text_item.commit_text_edit()
             event.accept()
             return
+        if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            # `TextItem.paint`(drawText)は `Qt.TextFlag.TextExpandTabs` を付けず
+            # タブをほぼ1スペース幅で描く一方、`QTextDocument` は既定タブ幅で
+            # レイアウトするため、タブ文字のまま入れると行送りが食い違う(所見3)。
+            # 一致させるため、タブ文字ではなく単一スペースとして挿入する。
+            self.textCursor().insertText(" ")
+            event.accept()
+            return
+        is_paste = (modifiers == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_V) or (
+            modifiers == Qt.KeyboardModifier.ShiftModifier and key == Qt.Key.Key_Insert
+        )
+        if is_paste:
+            self._insert_normalized_clipboard_text()
+            event.accept()
+            return
         super().keyPressEvent(event)
+
+    def _insert_normalized_clipboard_text(self) -> None:
+        """クリップボードのタブ文字をスペースに正規化してから貼り付ける(所見3)。
+
+        既定のペーストはタブ文字をそのまま挿入し、`keyPressEvent` のタブ正規化を
+        すり抜ける(タブ区切りテキストの貼り付けは日常的に起こる)。
+        """
+        clipboard = QGuiApplication.clipboard()
+        text = clipboard.text() if clipboard is not None else ""
+        if not text:
+            return
+        self.textCursor().insertText(text.replace("\t", " "))
 
     # ------------------------------------------------------------------
     def destroy(self) -> None:

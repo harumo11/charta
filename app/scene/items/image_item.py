@@ -212,6 +212,14 @@ class ImageItem(BoxItem):
         other = getter() if callable(getter) else None
         if other is not None and other is not self:
             other.commit_crop()
+        # テキスト編集中に crop 開始すると 2 モード同時 active になる
+        # （`TextItem.begin_text_edit` の対称。review2 所見4）ため先に確定する。
+        text_getter = getattr(scene, "active_text_edit_item", None)
+        text_item = text_getter() if callable(text_getter) else None
+        if text_item is not None:
+            commit_text_edit = getattr(text_item, "commit_text_edit", None)
+            if callable(commit_text_edit):
+                commit_text_edit()
         self._crop_mode = True
         self._hide_handles()
         # crop 中は画像本体の移動を無効化する（暗転領域のドラッグで画像が

@@ -21,7 +21,7 @@ from PySide6.QtGui import QImage, QPainter
 
 from app.commands.commands import AddObjectCommand
 from app.model.document import Document
-from app.model.objects import ImageObject
+from app.model.objects import ImageObject, TextObject
 from app.model.serialize import (
     import_image,
     load_document,
@@ -31,6 +31,7 @@ from app.model.serialize import (
 from app.scene.canvas_scene import CanvasScene
 from app.scene.items import create_item
 from app.scene.items.image_item import ImageItem
+from app.scene.items.text_item import TextItem
 
 
 def _make_source_image(path: Path, w: int = 40, h: int = 30) -> None:
@@ -659,3 +660,24 @@ def test_crop_tracking_cleared_on_object_removal(
 
     scene.document.remove_object(obj)  # crop モード中の削除で stale 参照を残さない
     assert scene.active_crop_item() is None
+
+
+def test_begin_crop_commits_active_text_edit(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    """crop 開始はテキスト編集中なら先に確定する（`TextItem.begin_text_edit` が crop を
+    確定するのと対称。review2 所見4の対称箇所）。"""
+    scene, stack, _obj, item = _scene_with_image(project_dir, tmp_path)
+    text_obj = TextObject(
+        id=scene.document.new_id(), text="編集中", x=200.0, y=0.0, width=100.0, height=40.0
+    )
+    stack.push(AddObjectCommand(scene.document, text_obj))
+    text_item = scene.item_for(text_obj)
+    assert isinstance(text_item, TextItem)
+
+    assert text_item.begin_text_edit() is True
+    assert scene.active_text_edit_item() is text_item
+
+    item.begin_crop()
+
+    assert scene.active_text_edit_item() is None, "crop 開始前にテキスト編集が確定していること"
+    assert scene.active_crop_item() is item
+    item.cancel_crop()

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent, QUndoStack
+from PySide6.QtGui import QContextMenuEvent, QKeyEvent, QMouseEvent, QTextCursor, QUndoStack
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
 from app.commands.commands import AddObjectCommand, RemoveObjectCommand
@@ -362,6 +362,91 @@ def test_shortcut_override_does_not_capture_unlisted_ctrl_combo_during_text_edit
     event = _shortcut_override_event(Qt.Key.Key_S, Qt.KeyboardModifier.ControlModifier, "\x13")
     view.event(event)
     assert not event.isAccepted(), "ホワイトリスト外の Ctrl 組み合わせは奪わないこと"
+
+    item.cancel_text_edit()
+    scene.close()
+
+
+# --------------------------------------------------------------------------
+# 11. review2 所見1: 箱の余白クリックでフォーカスが失われてもエディタへ戻る
+# --------------------------------------------------------------------------
+
+
+def test_margin_click_restores_editor_focus_and_moves_caret(qapp: Any) -> None:
+    """`TextEditorItem` の bounding rect はテキストブロック高さ分しかないため、
+    箱の残り領域（余白）は `TextItem`（`ItemIsFocusable` を持たない）が受ける。
+    Qt はフォーカス不能アイテムへの press 配送前にシーンのフォーカスをクリアする
+    ため、対策が無いと `scene.focusItem()` が None になり以後のキー入力が
+    どこにも届かなくなる（review2 所見1）。`clearFocus()` で欠落状態を再現し、
+    余白への press で `TextItem.mousePressEvent` がエディタへフォーカスを
+    戻すこと、およびクリック位置に応じてキャレットが移動することを固定する。
+
+    `clearFocus()` は `scene.hasFocus()` が True（＝scene が view 経由で widget
+    フォーカスを持っている）でなければ `scene.focusItem()` の「保留中のフォーカス
+    先」記録を消さない（offscreen platform で実測確認済み）。`activateWindow()`
+    のような実ウィンドウのアクティブ化までは不要だが、`view.show()` +
+    `processEvents()` で scene に widget フォーカスを持たせる必要はある。
+    """
+    scene, _stack, _obj, item = _scene_with_text(
+        text="line one\nline two", width=200.0, height=200.0
+    )
+    view = CanvasView(scene)
+    view.resize(400, 300)
+    view.show()
+    qapp.processEvents()
+
+    item.begin_text_edit()
+    editor = item._editor
+    assert editor is not None
+    cursor = editor.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.Start)
+    editor.setTextCursor(cursor)
+    editor.clearFocus()
+    assert scene.focusItem() is None, "前提: フォーカスが失われた状態を再現する"
+
+    # エディタの実高さ（数行分）より下、箱内の余白をクリックする。
+    margin_scene_pos = item.mapToScene(QPointF(item._w * 0.5, item._h * 0.9))
+    press = QGraphicsSceneMouseEvent(QEvent.Type.GraphicsSceneMousePress)
+    press.setScenePos(margin_scene_pos)
+    press.setPos(item.mapFromScene(margin_scene_pos))
+    press.setButton(Qt.MouseButton.LeftButton)
+    press.setButtons(Qt.MouseButton.LeftButton)
+    qapp.sendEvent(scene, press)
+
+    assert scene.focusItem() is editor, "箱の余白クリックでエディタへフォーカスが戻ること"
+    assert editor.textCursor().position() > 0, "クリック位置に応じてキャレットが移動すること"
+
+    item.cancel_text_edit()
+    scene.close()
+
+
+# --------------------------------------------------------------------------
+# 12. review2 所見3: ガードは focusItem() ではなく active_text_edit_item() を見る
+# --------------------------------------------------------------------------
+
+
+def test_shortcut_override_accepted_even_if_scene_focus_is_lost(qapp: Any) -> None:
+    """ガードの判定条件を `scene.focusItem() is not None` のままにしていた場合、
+    フォーカスが失われた瞬間（review2 所見1）に "r" 等の1文字ショートカットが
+    QAction へ抜けてツールが切り替わってしまう。`active_text_edit_item()` に
+    揃えたことで、フォーカスの生死に関わらず編集モード中は奪い続けることを固定する
+    （`test_margin_click_restores_editor_focus_and_moves_caret` がフォーカスは
+    同期的に復帰することも別途固定しているが、本テストはその復帰に依存しない
+    防御であることを検証する）。
+    """
+    scene, _stack, _obj, item = _scene_with_text()
+    view = CanvasView(scene)
+    view.resize(400, 300)
+    view.show()
+    qapp.processEvents()
+
+    item.begin_text_edit()
+    item._editor.clearFocus()
+    assert scene.focusItem() is None, "前提: フォーカスが失われた状態を再現する"
+
+    event = _shortcut_override_event(Qt.Key.Key_R, Qt.KeyboardModifier.NoModifier, "r")
+    view.event(event)
+    assert event.isAccepted(), "フォーカスが失われていても編集中は 'r' を奪うこと"
 
     item.cancel_text_edit()
     scene.close()

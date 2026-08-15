@@ -348,6 +348,16 @@ class Sam3MaskController:
             return
         obj = selected[0]
 
+        # メニュー起動はキャンバス press を伴わないため、`_commit_text_edit_on_outside_press`
+        # の確定経路を通らない。テキスト編集中に「SAM3 マスク…」を選ぶと 2 モード同時
+        # active になってしまう（review2 所見4）ため、先に確定しておく。
+        text_getter = getattr(self._scene, "active_text_edit_item", None)
+        text_item = text_getter() if callable(text_getter) else None
+        if text_item is not None:
+            commit_text_edit = getattr(text_item, "commit_text_edit", None)
+            if callable(commit_text_edit):
+                commit_text_edit()
+
         # セッションはキャンバス側の経路（Enter/Esc/外側クリック/ツール切替）でも終了する
         # ため、参照が残っていても closed なら「開いている」とは扱わない（そうしないと
         # 一度確定した画像でメニューから再編集できなくなる）。
