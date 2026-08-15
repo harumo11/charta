@@ -239,6 +239,13 @@ class MainWindow(QMainWindow):
         self.scene.mask_mode_changed.connect(self._on_mask_mode_changed)
         # 曲線ノード編集モード中の操作ヒントをステータスバーに出す（crop/mask と同じ流儀）。
         self.scene.node_edit_mode_changed.connect(self._on_node_edit_mode_changed)
+        # テキストのインプレース編集モード中の操作ヒントをステータスバーに出す
+        # （crop/mask/ノード編集と同じ流儀）。`text_edit_mode_changed` は
+        # `CanvasScene` 側の追加 API（担当B）のため、未実装の scene でも壊れない
+        # ようダックタイピングで接続する。
+        _text_edit_mode_changed = getattr(self.scene, "text_edit_mode_changed", None)
+        if _text_edit_mode_changed is not None:
+            _text_edit_mode_changed.connect(self._on_text_edit_mode_changed)
 
         # undo/redo後にパネル(プロパティ/レイヤー)をモデルへ再同期する。
         # _on_undo_index_changed は都度 self.property_panel/self.layer_panel を
@@ -1026,6 +1033,14 @@ class MainWindow(QMainWindow):
         # ガードは不要）。
         if self.scene.active_node_edit_item() is not None:
             return
+        # テキストのインプレース編集中も同様に Del を無視する（編集用の Delete
+        # キー入力に向けたものであり、オブジェクト削除ではない。ガードは
+        # ShortcutOverride（第一防衛線、担当B）に次ぐ第二防衛線。`active_text_edit_item`
+        # は CanvasScene 側の追加 API のため、未実装の scene でも壊れないよう
+        # ダックタイピングで判定する。
+        text_edit_getter = getattr(self.scene, "active_text_edit_item", None)
+        if callable(text_edit_getter) and text_edit_getter() is not None:
+            return
         self._edit.delete_selected()
 
     def _on_crop_mode_changed(self, active: bool) -> None:
@@ -1053,6 +1068,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "ノード編集: ドラッグで移動 / 曲線上クリックで追加 / ノード右クリックで削除"
                 " / Enter か外側クリックで確定 / Esc でキャンセル"
+            )
+        else:
+            self.statusBar().clearMessage()
+
+    def _on_text_edit_mode_changed(self, active: bool) -> None:
+        """テキストのインプレース編集モードの開始/終了に合わせてステータスバーの操作ヒントを出し入れする。"""
+        if active:
+            self.statusBar().showMessage(
+                "テキスト編集: Ctrl+Enter か外側クリックで確定 / Esc でキャンセル / Enter は改行"
             )
         else:
             self.statusBar().clearMessage()

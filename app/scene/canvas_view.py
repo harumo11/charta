@@ -123,29 +123,49 @@ class CanvasView(QGraphicsView):
     # -- ShortcutOverride ガード ----------------------------------------------
 
     def event(self, event: QEvent) -> bool:
-        """キャンバス上でテキスト編集中は 1 文字ツールショートカット（V/R/O/…）を奪わない。
+        """キャンバス上でテキスト編集中は QAction のショートカットにキーを奪わせない。
 
         Qt はショートカットの発火可否を `ShortcutOverride` イベントで先に問い合わせる。
         ここで `accept()` しておかないと、テキストアイテム編集中に "r" と打っただけで
         矩形ツールへ切り替わってしまう（QAction のショートカットが横取りする）。
 
-        現状 text/math オブジェクトの編集はダイアログ方式のため、`scene.focusItem()`
-        が非 None になってこのガードが実際に発火する経路はまだ無い（デッドコード）。
-        将来キャンバス上インライン編集（text の直接編集等）を追加したときのための
-        保険として残す。なお、プロパティパネルの入力欄（QLineEdit 等）は Qt 標準の
-        フォーカスウィジェットに対する ShortcutOverride 処理で既に保護されており、
-        このガードとは独立して安全。
+        2026-08-15 にキャンバス上インプレース編集（`TextEditorItem`）を導入したことで
+        `scene.focusItem()` が非 None になる経路ができ、このガードが実際に発火する
+        ようになった（旧 `QDialog` 方式の `edit_text` では `scene.focusItem()` が常に
+        None でデッドコードだった）。編集中はエディタへ渡すべきキーを広く accept する:
+        印字可能キー全般（`event.text()` が非空。A–Z・数字・記号・Space・かな変換前の
+        IME 入力を含む）、Delete/Backspace、Ctrl+{C,V,X,A,Z,Y}（エディタ内のコピペ・
+        全選択・`QTextDocument` 内蔵のテキスト undo/redo）。Ctrl+Enter/Return は該当する
+        `QShortcut` が無いため accept しない（確定は `keyPressEvent`/
+        `_handle_text_edit_key` 側で処理する）。
+        なお、プロパティパネルの入力欄（QLineEdit 等）は Qt 標準のフォーカスウィジェット
+        に対する ShortcutOverride 処理で既に保護されており、このガードとは独立して安全。
         """
         if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
             scene = self.scene()
-            if (
-                scene is not None
-                and scene.focusItem() is not None
-                and event.modifiers() == Qt.KeyboardModifier.NoModifier
-                and Qt.Key.Key_A <= event.key() <= Qt.Key.Key_Z
-            ):
-                event.accept()
-                return True
+            if scene is not None and scene.focusItem() is not None:
+                key = event.key()
+                modifiers = event.modifiers()
+                # Ctrl 修飾時は X11 等で event.text() が制御文字（例: Ctrl+S → "\x13"）を
+                # 保持し非空になりうるため、Ctrl 修飾を明示的に除外する。除外しないと
+                # Ctrl+S/Ctrl+D 等、下記ホワイトリスト外の Ctrl ショートカットまで
+                # 編集中に丸ごと奪ってしまう(printable 判定は無修飾のキーのみを対象とする
+                # 契約の趣旨「A-Z・数字・記号・Space・かな変換前入力」)。
+                printable = bool(event.text()) and not (
+                    modifiers & Qt.KeyboardModifier.ControlModifier
+                )
+                deletion = key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+                editor_ctrl = modifiers == Qt.KeyboardModifier.ControlModifier and key in (
+                    Qt.Key.Key_C,
+                    Qt.Key.Key_V,
+                    Qt.Key.Key_X,
+                    Qt.Key.Key_A,
+                    Qt.Key.Key_Z,
+                    Qt.Key.Key_Y,
+                )
+                if printable or deletion or editor_ctrl:
+                    event.accept()
+                    return True
         return super().event(event)
 
     def set_tool_manager(self, tm: ToolManager) -> None:
@@ -257,6 +277,8 @@ class CanvasView(QGraphicsView):
         self.setDragMode(self._pre_pan_drag_mode)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._handle_text_edit_key(event):
+            return
         if self._handle_mask_key(event):
             return
         if self._handle_crop_key(event):
@@ -282,6 +304,59 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+    # -- テキストのインプレース編集モード（Esc=キャンセル / Ctrl+Enter=確定 /
+    #    外側クリック=確定。インライン編集契約 §B-2） -------------------------
+
+    def _active_text_edit_item(self):  # noqa: ANN202 - TextItem への import 循環を避ける
+        scene = self.scene()
+        getter = getattr(scene, "active_text_edit_item", None)
+        return getter() if callable(getter) else None
+
+    def _handle_text_edit_key(self, event: QKeyEvent) -> bool:
+        """テキスト編集モード中のキーを処理する（処理したら True）。
+
+        他モードの `_handle_*_key` と異なり、Esc/Ctrl+Enter 以外のキー（改行・
+        通常の文字入力・IME・カーソル移動等）も**この分岐の中で** Qt 既定経路
+        （`QGraphicsView.keyPressEvent` → scene → `scene.focusItem()`、すなわち
+        `TextEditorItem`）へ直接流して True を返す。`keyPressEvent` の先頭
+        （Space のパン横取りより前）でこのメソッドを呼ぶことで、編集中は
+        Space が常にエディタへの入力（空白文字）として届き、パンが始まらない
+        ようにする。
+        """
+        text_item = self._active_text_edit_item()
+        if text_item is None:
+            return False
+        if event.key() == Qt.Key.Key_Escape:
+            text_item.cancel_text_edit()
+            event.accept()
+            return True
+        is_enter = event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return)
+        if is_enter and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            text_item.commit_text_edit()
+            event.accept()
+            return True
+        QGraphicsView.keyPressEvent(self, event)
+        return True
+
+    def _commit_text_edit_on_outside_press(self, event: QMouseEvent) -> bool:
+        """テキスト編集対象の外側を左クリックしたら確定し、そのクリックは消費する。
+
+        対象自身・エディタ（子孫アイテム）上の押下は通常処理へ通す
+        （`_commit_crop_on_outside_press` と同一方式）。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        text_item = self._active_text_edit_item()
+        if text_item is None:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        hit = self.scene().itemAt(scene_pos, self.transform())
+        if hit is not None and (hit is text_item or text_item.isAncestorOf(hit)):
+            return False
+        text_item.commit_text_edit()
+        event.accept()
+        return True
 
     # -- crop モード（Enter=確定 / Esc=キャンセル / 外側クリック=確定） ----------
 
@@ -427,7 +502,8 @@ class CanvasView(QGraphicsView):
     # -- 右クリックメニュー起点(P3契約 §1) ------------------------------------
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
-        """crop/マスク/ノード編集中・操作中は無視し、それ以外は `context_menu_requested` を emit。
+        """crop/マスク/ノード編集/テキスト編集中・操作中は無視し、それ以外は
+        `context_menu_requested` を emit。
 
         マスク編集は右ドラッグ=負例ボックスに使うため、右クリックメニューを出さない。
         ノード編集中の右クリックはノード削除に使うため同様に無視する。curve 下書き中に
@@ -442,6 +518,7 @@ class CanvasView(QGraphicsView):
             self._active_crop_item() is not None
             or self._active_mask_session() is not None
             or self._active_node_edit_item() is not None
+            or self._active_text_edit_item() is not None
         ):
             event.ignore()
             return
@@ -521,6 +598,9 @@ class CanvasView(QGraphicsView):
             )
             super().mousePressEvent(fake)
             event.accept()
+            return
+
+        if self._commit_text_edit_on_outside_press(event):
             return
 
         if self._commit_mask_on_outside_press(event):

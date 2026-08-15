@@ -132,6 +132,18 @@ def busy_state(window: MainWindow) -> dict[str, Any]:
             "detail": f"オブジェクト {oid} を曲線ノード編集中です",
             "retry_after_ms": 2000,
         }
+    # `active_text_edit_item` は `CanvasScene` 側の追加 API（担当B）のため、
+    # 未実装の scene でも壊れないようダックタイピングで判定する。
+    text_edit_getter = getattr(scene, "active_text_edit_item", None)
+    text_item = text_edit_getter() if callable(text_edit_getter) else None
+    if text_item is not None:
+        oid = getattr(getattr(text_item, "obj", None), "id", None)
+        return {
+            "busy": True,
+            "reason": "text_edit_mode",
+            "detail": f"オブジェクト {oid} をテキスト編集中です",
+            "retry_after_ms": 2000,
+        }
     return {"busy": False, "reason": None, "detail": "", "retry_after_ms": 0}
 
 

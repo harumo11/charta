@@ -1,8 +1,11 @@
-"""TextItem: text オブジェクトを描画する QGraphicsItem（M3契約 §3）。
+"""TextItem: text オブジェクトを描画する QGraphicsItem（M3契約 §3、インライン編集契約）。
 
 幾何モデルは `RectEllipseItem` と同一（x/y/width/height/rotation）。テキストは
 `QFont`/`QColor` を組み立て `drawText` の折返し矩形に描画する。ダブルクリックで
-複数行編集ダイアログを開き、確定は `commit_text` 経由で `SetPropertyCommand`
+キャンバス上のインプレース編集モードに入る（`begin_text_edit`。旧 `QDialog` 方式の
+`edit_text` は 2026-08-15 に廃止した。直接呼ぶテストが 0 件であることを確認済み）。
+編集中は子アイテム `TextEditorItem`（`text_editor_item.py`）が表示を担い、確定は
+`commit_text_edit` → 既存の `commit_text` 経由で `SetPropertyCommand`
 （必要なら同一マクロで高さ再算出の `SetGeometryCommand`）を push する。
 """
 
@@ -12,13 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QFontInfo, QFontMetricsF, QPen
-from PySide6.QtWidgets import (
-    QDialog,
-    QDialogButtonBox,
-    QGraphicsSceneMouseEvent,
-    QPlainTextEdit,
-    QVBoxLayout,
-)
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
 from app.export.text_outline import _VALIGN_FACTOR, text_to_path, valign_offset
 from app.model.objects import BaseObject
@@ -27,6 +24,7 @@ from app.scene.items.registry import register_item
 
 if TYPE_CHECKING:
     from app.model.document import Document
+    from app.scene.items.text_editor_item import TextEditorItem
 
 ALIGN_MAP: dict[str, Qt.AlignmentFlag] = {
     "left": Qt.AlignmentFlag.AlignLeft,
@@ -81,6 +79,8 @@ class TextItem(BoxItem):
         super().__init__(obj, document)
         self._export_outline: bool = False
         self._layout_rect_cache: tuple[tuple[Any, ...], QRectF] | None = None
+        self._text_edit_mode: bool = False
+        self._editor: TextEditorItem | None = None
 
     def set_export_outline(self, enabled: bool) -> None:
         """エクスポート用のアウトライン描画モードを切り替える（既定 False = 通常表示）。"""
@@ -135,7 +135,28 @@ class TextItem(BoxItem):
             rect = rect.united(self._text_layout_rect())
         return rect.adjusted(-1.0, -1.0, 1.0, 1.0)
 
+    def sync_from_model(self) -> None:
+        super().sync_from_model()
+        if self._text_edit_mode:
+            # BaseItem.sync_from_model が movable を locked のみから再設定するため、
+            # 編集中のモデル変更(プロパティパネル編集等)で移動禁止が解除されないよう
+            # 再適用する(CurveItem.sync_from_model と同型)。
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+
+    def _on_sync_geometry(self) -> None:
+        if self._text_edit_mode and self._editor is not None:
+            # 外部要因(プロパティパネルの数値入力・Ctrl+Z 等)で幅高さが変わると、
+            # エディタの折返し幅と valign オフセットが古いまま取り残される
+            # (CurveItem._on_sync_geometry と同じ理由)。
+            self._editor.sync_geometry()
+
     def paint(self, painter: Any, option: Any, widget: Any = None) -> None:
+        if self._text_edit_mode:
+            # 編集中は本体テキストを描かない(空テキストのプレースホルダ破線も含む)。
+            # エディタ(子アイテム)が唯一の描画源であることが方針b(見た目完全一致)の
+            # 前提であり、親が枠等を描き足すと編集中/非編集の render が一致しなく
+            # なる(ピクセル比較テストで固定済み)。二重描画防止のため何も描かない。
+            return
         rect = QRectF(0.0, 0.0, self._w, self._h)
         text = self.obj.text
         if not text:
@@ -181,30 +202,99 @@ class TextItem(BoxItem):
         if self.obj.locked:
             event.ignore()
             return
-        self.edit_text()
+        self.begin_text_edit()
         event.accept()
 
-    def edit_text(self) -> None:
-        """複数行編集ダイアログ（QDialog + QPlainTextEdit）を開き、OK なら確定する。
+    def begin_text_edit(self) -> bool:
+        """インプレース編集モードへ入る。成功で True。
 
-        テスト容易性のため、ダイアログを介さず `commit_text()` を直接呼ぶ経路も
-        常に有効（ヘッドレス環境ではこちらを使う）。
+        locked または既に編集中なら False。scene が他アイテムの crop/mask/
+        ノード編集/テキスト編集を追跡している場合は、先にそれを確定してから
+        自分のモードに入る（`CurveItem.begin_node_edit` と同型）。
         """
-        if self.obj.locked:
+        if self.obj.locked or self._text_edit_mode:
+            return False
+        scene = self.scene()
+        if scene is not None:
+            crop_getter = getattr(scene, "active_crop_item", None)
+            crop_item = crop_getter() if callable(crop_getter) else None
+            if crop_item is not None:
+                commit_crop = getattr(crop_item, "commit_crop", None)
+                if callable(commit_crop):
+                    commit_crop()
+            mask_getter = getattr(scene, "active_mask_session", None)
+            mask_session = mask_getter() if callable(mask_getter) else None
+            if mask_session is not None:
+                commit_mask = getattr(mask_session, "commit", None)
+                if callable(commit_mask):
+                    commit_mask()
+            node_getter = getattr(scene, "active_node_edit_item", None)
+            node_item = node_getter() if callable(node_getter) else None
+            if node_item is not None:
+                commit_node = getattr(node_item, "commit_node_edit", None)
+                if callable(commit_node):
+                    commit_node()
+            text_getter = getattr(scene, "active_text_edit_item", None)
+            other_text_item = text_getter() if callable(text_getter) else None
+            if other_text_item is not None and other_text_item is not self:
+                commit_other = getattr(other_text_item, "commit_text_edit", None)
+                if callable(commit_other):
+                    commit_other()
+        from app.scene.items.text_editor_item import TextEditorItem
+
+        self._text_edit_mode = True
+        self._hide_handles()
+        # 編集中は画像 crop/曲線ノード編集と同じ理由で本体の移動を無効化する。
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.update()
+        self._editor = TextEditorItem(self)
+        self._editor.setFocus()
+        self._notify_scene_text_edit(active=True)
+        return True
+
+    def commit_text_edit(self) -> None:
+        """編集内容を確定する。再入不可(既に編集中でなければ no-op)。
+
+        新テキストを先に取ってから `_end_text_edit()` でモードを閉じ、
+        `commit_text()` に委譲する(undo マクロ・高さ再採寸・valign アンカー維持は
+        既存実装をそのまま使う)。
+        """
+        if not self._text_edit_mode:
             return
-        dialog = QDialog()
-        dialog.setWindowTitle("テキストを編集")
-        layout = QVBoxLayout(dialog)
-        editor = QPlainTextEdit(self.obj.text)
-        layout.addWidget(editor)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.commit_text(editor.toPlainText())
+        editor = self._editor
+        new_text = editor.current_text() if editor is not None else self.obj.text
+        self._end_text_edit()
+        self.commit_text(new_text)
+
+    def cancel_text_edit(self) -> None:
+        """変更を破棄して編集モードを終了する(モデル不変)。"""
+        if not self._text_edit_mode:
+            return
+        self._end_text_edit()
+        self.sync_from_model()
+
+    def _end_text_edit(self) -> None:
+        self._text_edit_mode = False
+        if self._editor is not None:
+            self._editor.destroy()
+            self._editor = None
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not self.obj.locked)
+        self.update()
+        if self.isSelected():
+            self._show_handles()
+        self._notify_scene_text_edit(active=False)
+
+    def _notify_scene_text_edit(self, *, active: bool) -> None:
+        """テキスト編集モードの開始/終了を scene に登録する(CanvasView/ToolManager の参照用)。
+
+        scene 未所属や CanvasScene 以外(テスト用の素の QGraphicsScene 等)でも
+        動くよう、ダックタイピングで判定する(担当Bの `set_active_text_edit_item`
+        実装が無くても本アイテム単体で動く)。
+        """
+        scene = self.scene()
+        set_active = getattr(scene, "set_active_text_edit_item", None)
+        if callable(set_active):
+            set_active(self if active else None)
 
     def commit_text(self, new_text: str) -> None:
         """`text` を確定する。

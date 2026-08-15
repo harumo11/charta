@@ -301,6 +301,7 @@ class ToolManager(QObject):
         self._commit_active_crop()
         self._commit_active_mask()
         self._commit_active_node_edit()
+        self._commit_active_text_edit()
         self._finish_curve_draft_on_tool_change()
         self._tool = name
         self.tool_changed.emit(name)
@@ -334,6 +335,19 @@ class ToolManager(QObject):
         item = getter() if callable(getter) else None
         if item is not None:
             item.commit_node_edit()
+
+    def _commit_active_text_edit(self) -> None:
+        """テキストのインプレース編集中ならツール切替前に確定する。
+
+        （ダックタイピング、crop と同方針）`active_text_edit_item` は
+        `CanvasScene` 側の追加 API のため、未実装の scene でも壊れないよう
+        ダックタイピングで呼ぶ。`TextItem`（担当外）を直接 import せず
+        `commit_text_edit()` の呼び出しだけで連携する。
+        """
+        getter = getattr(self.scene, "active_text_edit_item", None)
+        item = getter() if callable(getter) else None
+        if item is not None:
+            item.commit_text_edit()
 
     def _clear_snap_guides(self) -> None:
         """スナップガイドを消す(M7契約 §7)。

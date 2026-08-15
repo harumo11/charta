@@ -39,6 +39,9 @@ class CanvasScene(QGraphicsScene):
     mask_mode_changed = Signal(bool)
     #: 曲線ノード編集モードの開始（True）/終了（False）。MainWindow のステータスバー表示用。
     node_edit_mode_changed = Signal(bool)
+    #: テキストのインプレース編集モードの開始（True）/終了（False）。MainWindow の
+    #: ステータスバー表示用（インライン編集契約 §B-1）。
+    text_edit_mode_changed = Signal(bool)
     #: `set_document()` で document が差し替わった（P3契約 §4.1）。`ToolManager` 等が
     #: 新 document へリスナー登録し直すために購読する。
     document_replaced = Signal()
@@ -74,6 +77,10 @@ class CanvasScene(QGraphicsScene):
         # 曲線ノード編集モード中の CurveItem（ビュー状態。crop の追跡と対称。
         # CurveItem を直接 import せず BaseItem として扱う）。
         self._active_node_edit_item: BaseItem | None = None
+
+        # テキストのインプレース編集モード中の TextItem（ビュー状態。crop の追跡と
+        # 対称。TextItem を直接 import せず BaseItem として扱う。インライン編集契約 §B-1）。
+        self._active_text_edit_item: BaseItem | None = None
 
         self.setSceneRect(
             0,
@@ -161,6 +168,7 @@ class CanvasScene(QGraphicsScene):
         self.set_active_crop_item(None)
         self._cancel_active_mask_session()
         self._cancel_active_node_edit()
+        self._cancel_active_text_edit()
         for item in list(self._items.values()):
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
@@ -291,6 +299,53 @@ class CanvasScene(QGraphicsScene):
         # `MainWindow._on_node_edit_mode_changed(False)` が呼ばれないままステータス
         # バーの案内が残り続ける。同値ガードがあるので正常経路は no-op のまま）。
         self.set_active_node_edit_item(None)
+
+    # ------------------------------------------------------------------
+    # テキストのインプレース編集モード追跡（crop モード追跡と対称。インライン編集契約 §B-1）
+    # ------------------------------------------------------------------
+    def set_active_text_edit_item(self, item: BaseItem | None) -> None:
+        """テキスト編集モード中の item を登録する（None で解除）。TextItem が begin/end で呼ぶ。
+
+        同値は no-op（emit しない）。
+        """
+        if item is self._active_text_edit_item:
+            return
+        self._active_text_edit_item = item
+        self.text_edit_mode_changed.emit(item is not None)
+
+    def active_text_edit_item(self) -> BaseItem | None:
+        """テキスト編集モード中の item を返す（無ければ None）。"""
+        return self._active_text_edit_item
+
+    def _cancel_active_text_edit(self, item: BaseItem | None = None) -> None:
+        """テキスト編集を cancel する。item 指定時は対象一致のときだけ。
+
+        `_cancel_active_node_edit` と同型で明示的に try/except する。
+        `MaskEditSession.cancel()` は内部で例外を吸収する作りだが
+        `TextItem.cancel_text_edit()`（担当外）はその保証を持たない一方、この
+        メソッドは `remove_item_for`/`rebuild`/`_detach` というオブジェクト削除・
+        シーン破棄の経路から呼ばれるため、ここで例外を伝播させると `QUndoStack`
+        のコマンド実行やシーン破棄そのものを止めかねない。握りつぶしをこの
+        メソッド自身の責務にする（「例外握りつぶし」という契約の要求を、
+        `_cancel_active_mask_session` の形ではなく、その保証を実際に満たす
+        `_cancel_active_node_edit` の形で満たす）。
+        """
+        target = self._active_text_edit_item
+        if target is None:
+            return
+        if item is not None and target is not item:
+            return
+        cancel = getattr(target, "cancel_text_edit", None)
+        if callable(cancel):
+            try:
+                cancel()  # cancel_text_edit() 内で set_active_text_edit_item(None) が呼ばれる
+            except Exception:  # noqa: BLE001 - 削除/破棄処理を止めないため握りつぶす
+                pass
+        # cancel が失敗しても参照は必ず切る。`set_active_text_edit_item(None)` を
+        # 経由することで `text_edit_mode_changed(False)` の emit も保証する
+        # （直接代入だと cancel() が例外を投げた失敗経路でシグナルが飛ばず、
+        # ステータスバーの案内が残り続ける。同値ガードがあるので正常経路は no-op のまま）。
+        self.set_active_text_edit_item(None)
 
     # ------------------------------------------------------------------
     # グリッド（M7契約 §5）
@@ -454,6 +509,7 @@ class CanvasScene(QGraphicsScene):
                 self.set_active_crop_item(None)
             self._cancel_active_mask_session(item)
             self._cancel_active_node_edit(item)
+            self._cancel_active_text_edit(item)
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
                 destroy_bindings()
@@ -475,6 +531,7 @@ class CanvasScene(QGraphicsScene):
         self.set_active_crop_item(None)
         self._cancel_active_mask_session()
         self._cancel_active_node_edit()
+        self._cancel_active_text_edit()
         for item in list(self._items.values()):
             self.removeItem(item)
         self._items.clear()
