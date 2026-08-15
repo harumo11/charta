@@ -348,33 +348,39 @@ def test_paint_placeholder_tracks_editor_live_text_not_frozen_model_text(qapp: A
 
 
 @pytest.mark.parametrize("align", ["center", "right"])
-def test_known_mismatch_long_unbreakable_token_exceeding_box_width(qapp: Any, align: str) -> None:
-    """既知の非一致を境界として固定する（契約オーナー判断待ち）。
+def test_long_unbreakable_token_wraps_and_matches_editor(qapp: Any, align: str) -> None:
+    """箱幅を超える分割不能トークンは途中で折られ、編集中も見た目が一致する。
 
-    根本解決（break-anywhere で3経路すべてを揃える）は行分割の仕様変更であり、
-    ユーザー判断が必要（レビュー所見1）。このテストは「解消していないこと」を
-    下限つきで固定し、将来 break-anywhere を実装したら本テストを置き換える
-    （下限が無いと閾値を緩めて事実上見なかったことにできてしまう）。
+    旧仕様（WordWrap）では 1 行のまま箱を水平にはみ出し、center/right で編集中のみ
+    整列が食い違う既知の非一致だった。2026-08-15 のユーザー決定で折返しモードを
+    `WrapAtWordBoundaryOrAnywhere` に全経路統一（`text_outline.WRAP_MODE`）し解消。
     """
-    scene, item, _obj = _make_scene_item(
-        "Supercalifragilisticexpialidocious",
+    token = "Supercalifragilisticexpialidocious"
+    scene, item, obj = _make_scene_item(
+        token,
         align=align,
         width=180.0,
         height=180.0,
         font_size=16.0,
     )
+    # 折返し自体の回帰: 途中で折られて複数行になり、各行は箱幅に収まる。
+    from app.export.text_outline import wrapped_lines
+    from app.scene.items.text_item import font_for
+
+    lines = wrapped_lines(token, font_for(obj), 180.0)
+    assert len(lines) >= 2, "箱幅超過トークンが途中で折られていない"
+    assert all(nw <= 180.0 + 1.0 for _t, nw, _top, _ascent in lines)
+
     render_rect = QRectF(-10.0, -10.0, 200.0, 200.0)
     normal = _render_scene(scene, render_rect, 200, 200)
+    assert int((normal[..., 3] > 0).sum()) > 0, "通常描画にインクがあること（空対空の合格防止）"
 
     assert item.begin_text_edit() is True
     item._editor.clearFocus()
     editing = _render_scene(scene, render_rect, 200, 200)
 
     frac = _mismatch_fraction(normal, editing)
-    assert 0.01 < frac < 0.10, (
-        f"align={align}: mismatch={frac:.4%}（既知の非一致の想定範囲 1%〜10%から外れた。"
-        "解消したなら本テストを更新/削除すること。悪化したなら要調査）"
-    )
+    assert frac < 0.005, f"align={align}: mismatch={frac:.4%} (threshold 0.5%)"
 
 
 # --------------------------------------------------------------------------
@@ -492,3 +498,26 @@ def test_external_text_change_during_edit_cancels_without_overwriting_draft(qapp
     ), "エディタの下書きで上書き確定してはいけない（外部変更をそのまま反映する）"
     assert stack.index() == idx_before + 1, "余計な undo ステップが積まれないこと"
     scene.close()
+
+
+def test_edit_mode_parity_with_fallback_font(qapp: Any) -> None:
+    """欧文フォント指定 + 日本語（CJK グリフはフォールバックフォントで拾われる）でも一致する。
+
+    行の実 ascent（`QTextLine.ascent()`、フォールバック込みで膨らむ）がプライマリ
+    フォントの `QFontMetricsF.ascent()` と食い違う構成。ベースラインを固定 ascent で
+    計算していた実装では編集中に本文が数 px 飛んだ（レビュー所見1の退行の再現条件。
+    `text_outline._layout_lines` が行ごとの ascent を返すことで解消）。
+    """
+    scene, item, obj = _make_scene_item(_MULTILINE_JA, width=220.0, height=220.0)
+    obj.font_family = "DejaVu Sans"
+    item.sync_from_model()
+
+    normal = _render_scene(scene, _RENDER_RECT, _RENDER_SIZE, _RENDER_SIZE)
+    assert int(np.count_nonzero(normal[..., 3] > 0)) > 0
+
+    assert item.begin_text_edit() is True
+    item._editor.clearFocus()
+    editing = _render_scene(scene, _RENDER_RECT, _RENDER_SIZE, _RENDER_SIZE)
+
+    frac = _mismatch_fraction(normal, editing)
+    assert frac < 0.005, f"fallback font: mismatch={frac:.4%} (threshold 0.5%)"

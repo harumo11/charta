@@ -1,10 +1,12 @@
 """TextEditorItem: `TextItem` のインプレース編集ビュー（インライン編集契約 §A-1）。
 
-`TextItem` の子 `QGraphicsTextItem` として乗り、`TextItem.paint`（`drawText` 経路）と
-**完全に同一のレイアウト条件**（documentMargin 0 / 同一 `QFont` / 同一
-`QTextOption`（alignment + WordWrap）/ 同一折返し幅 / 同一文字色 / `valign_offset` による
-手動 y オフセット）を与える。`drawText` も `QTextDocument` も内部は `QTextLayout` を
-使うため、これらの条件を揃えれば行分割・行送りが一致する（一致することはピクセル比較
+`TextItem` の子 `QGraphicsTextItem` として乗り、`TextItem.paint`
+（`text_outline.draw_text_block` = QTextLayout 経路）と**完全に同一のレイアウト条件**
+（documentMargin 0 / 同一 `QFont` / 同一 `QTextOption`（alignment +
+`text_outline.WRAP_MODE`）/ 同一折返し幅 / 同一文字色 / `valign_offset` による
+手動 y オフセット）を与える。paint も `QTextDocument` も同じ `QTextLayout`
+エンジン（行送り = `QTextLine.height()` 累積・ベースライン = 行ごとの
+`QTextLine.ascent()`）なので行分割・行送りが一致する（一致することはピクセル比較
 テスト `tests/test_text_editor_parity.py` で固定する）。
 
 モデルには一切書かない。確定/破棄の判断は持たず、親 `TextItem` の
@@ -20,7 +22,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QKeyEvent, QTextCursor, QTextOption
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsTextItem
 
-from app.export.text_outline import valign_offset
+from app.export.text_outline import WRAP_MODE, valign_offset
 from app.scene.items.text_item import ALIGN_MAP, font_for
 
 if TYPE_CHECKING:
@@ -48,13 +50,16 @@ class TextEditorItem(QGraphicsTextItem):
         document.setDocumentMargin(0.0)
         self.setFont(font_for(obj))
         option = QTextOption(ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft))
-        option.setWrapMode(QTextOption.WrapMode.WordWrap)
+        option.setWrapMode(WRAP_MODE)
         document.setDefaultTextOption(option)
         self.setTextWidth(max(float(text_item._w), 1.0))
         self.setDefaultTextColor(QColor(obj.color) if obj.color else QColor(0, 0, 0))
 
         document.contentsChanged.connect(self._sync_layout)
-        self.setPlainText(obj.text)
+        # 既存テキスト中のタブも共有エンジンの正規化（タブ=スペース1個）に合わせる。
+        # QTextDocument は既定タブ幅(80px)で展開するため、そのまま載せると編集中だけ
+        # 行送りが変わって見える。確定時はこの正規化済みテキストが書き戻る。
+        self.setPlainText(obj.text.replace("\t", " "))
 
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -97,7 +102,7 @@ class TextEditorItem(QGraphicsTextItem):
         document = self.document()
         self.setFont(font_for(obj))
         option = QTextOption(ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft))
-        option.setWrapMode(QTextOption.WrapMode.WordWrap)
+        option.setWrapMode(WRAP_MODE)
         document.setDefaultTextOption(option)
         self.setDefaultTextColor(QColor(obj.color) if obj.color else QColor(0, 0, 0))
         self.setTextWidth(max(float(self._text_item._w), 1.0))
@@ -117,10 +122,10 @@ class TextEditorItem(QGraphicsTextItem):
             event.accept()
             return
         if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
-            # `TextItem.paint`(drawText)は `Qt.TextFlag.TextExpandTabs` を付けず
-            # タブをほぼ1スペース幅で描く一方、`QTextDocument` は既定タブ幅で
-            # レイアウトするため、タブ文字のまま入れると行送りが食い違う(所見3)。
-            # 一致させるため、タブ文字ではなく単一スペースとして挿入する。
+            # 共有レイアウトエンジン(text_outline._layout_lines)はタブを
+            # スペース1個に正規化して扱う(QTextLayout の既定タブ展開 80px と
+            # 行単位描画のタブ≒1スペースが食い違うため)。QTextDocument は
+            # 既定タブ幅で展開してしまうので、エディタも入力段で同じ正規化をする。
             self.textCursor().insertText(" ")
             event.accept()
             return

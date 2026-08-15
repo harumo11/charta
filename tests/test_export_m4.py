@@ -355,7 +355,7 @@ def test_export_svg_writes_file(qapp: Any, project_dir: Path, tmp_path: Path) ->
 def test_svg_non_outline_text_font_size_matches_metrics_px(
     qapp: Any, project_dir: Path, tmp_path: Path
 ) -> None:
-    """非アウトライン<text>の font-size が **em サイズ**、行送りが lineSpacing であること。
+    """非アウトライン<text>の font-size が **em サイズ**、行送りがレイアウトエンジンと一致すること。
 
     2 段階の修正を経ている:
     1. 旧々実装はモデルの point-size 値をそのまま SVG user-unit(px) にしていた（DPI 換算漏れ）。
@@ -371,8 +371,13 @@ def test_svg_non_outline_text_font_size_matches_metrics_px(
     font = _build_text_font(text_obj)
     metrics = QFontMetricsF(font)
     expected_font_size_px = float(QFontInfo(font).pixelSize())
-    expected_line_spacing = metrics.lineSpacing()
-    expected_baseline = metrics.ascent()
+    # 行送りはレイアウトエンジン（text_outline）の行スロット位置と一致すること
+    # （QTextLine.height() 累積。lineSpacing 固定ではない — 2026-08-15 統一）。
+    from app.export.text_outline import wrapped_lines
+
+    wrapped = wrapped_lines(text_obj.text, font, text_obj.width)
+    expected_tops = [top + ascent for _t, _w, top, ascent in wrapped]
+    assert len(expected_tops) == 2
 
     # モデルのpoint-size値をそのままpxとして使う旧実装では、この程度のフォント
     # サイズではmetrics由来のpx値と大きく異なるはず（回帰防止の非退化チェック）。
@@ -392,8 +397,8 @@ def test_svg_non_outline_text_font_size_matches_metrics_px(
     assert len(tspans) == 2
     y0 = float(tspans[0].get("y"))
     y1 = float(tspans[1].get("y"))
-    assert y0 == pytest.approx(expected_baseline, abs=0.01)
-    assert (y1 - y0) == pytest.approx(expected_line_spacing, abs=0.01)
+    assert y0 == pytest.approx(expected_tops[0], abs=0.01)
+    assert (y1 - y0) == pytest.approx(expected_tops[1] - expected_tops[0], abs=0.01)
 
 
 def test_svg_color_with_embedded_quote_stays_well_formed_xml(
@@ -626,7 +631,11 @@ def _valign_svg_doc(
 
 
 def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
-    """折返し・改行混在で `text_block_height` == 実レイアウトの行数 × lineSpacing。"""
+    """折返し・改行混在で `text_block_height` == 実レイアウトの行数 × 実行送り。
+
+    実行送りは `QTextLine.height()`（切り上げ行高。画面の drawText/QTextDocument と
+    同じ積み方）であって `lineSpacing()` 固定ではない（2026-08-15 のエンジン統一）。
+    """
     from app.export.text_outline import _layout_lines, text_block_height
     from app.scene.items.text_item import font_for
 
@@ -638,10 +647,12 @@ def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
     wrap_width = 150.0
     lines, _metrics, total = _layout_lines(text, font, wrap_width)
     assert len(lines) >= 3, "前提: 折返しで複数行になっていること"
-    expected = len(lines) * metrics.lineSpacing()
+    line_h = lines[1][2] - lines[0][2]  # 連続する行スロットの実行送り
+    assert line_h >= metrics.lineSpacing() - 1e-6, "実行送りは lineSpacing の切り上げ"
+    expected = len(lines) * line_h
 
     assert text_block_height(text, font, wrap_width) == pytest.approx(expected)
-    assert total == pytest.approx(expected), "空行が無ければ総送り == 行数 × lineSpacing"
+    assert total == pytest.approx(expected), "空行が無ければ総送り == 行数 × 実行送り"
 
 
 def test_text_block_height_counts_blank_lines(qapp: Any) -> None:
@@ -658,8 +669,11 @@ def test_text_block_height_counts_blank_lines(qapp: Any) -> None:
     lines, _metrics, _total = _layout_lines(text, font, wrap_width)
     assert len(lines) == 2, "前提: 空行は描画対象の行としては落ちる"
 
-    # 実際には 3 行スロット分の高さを占める。
-    assert text_block_height(text, font, wrap_width) == pytest.approx(3 * metrics.lineSpacing())
+    # 実際には 3 行スロット分の高さを占める（実行送り = Hello と World の top 差 / 2。
+    # 間に空行スロットが 1 つ挟まるため）。
+    line_h = (lines[1][2] - lines[0][2]) / 2.0
+    assert line_h >= metrics.lineSpacing() - 1e-6
+    assert text_block_height(text, font, wrap_width) == pytest.approx(3 * line_h)
 
 
 def test_valign_bottom_keeps_text_with_blank_lines_inside_the_box(qapp: Any) -> None:
@@ -785,3 +799,32 @@ def test_pdf_text_position_matches_png_for_valign(
     w_px, _h_px = artboard_pixel_size(doc_png)
     deviation = max(abs(a - b) for a, b in zip(png, pdf, strict=True)) * w_px
     assert deviation < 3.0, f"PNG と PDF のずれが大きい(valign): {deviation:.2f}px"
+
+
+def test_svg_text_tspans_follow_wrapped_lines(qapp: Any, project_dir: Path, tmp_path: Path) -> None:
+    """非アウトライン `<text>` の tspan は折返し行単位で出力される。
+
+    以前は `"\\n"` 分割のみで折返しを再現しておらず、画面では折り返されている
+    テキストが `<text>` 出力だけ 1 行に伸びていた（2026-08-15 の
+    レイアウトエンジン統一で `text_outline.wrapped_lines` を通すよう修正）。
+    """
+    from app.export.text_outline import wrapped_lines
+    from app.scene.items.text_item import font_for
+
+    doc = _build_document(project_dir, tmp_path)
+    text_obj = next(obj for obj in doc.objects if obj.type == "text")
+    text_obj.text = "改行を含まないが箱幅を超えて折り返される長い日本語のテキスト"
+    text_obj.width = 150.0
+
+    font = _build_text_font(text_obj)
+    expected = wrapped_lines(text_obj.text, font, text_obj.width)
+    assert len(expected) >= 2, "前提: 折返しで複数行になること"
+    assert font_for(text_obj).pixelSize() == font.pixelSize(), "同一フォント解決"
+
+    svg = document_to_svg(doc, outline_text=False)
+    root = ET.fromstring(svg)
+    text_el = root.find(".//svg:text", _NS)
+    assert text_el is not None
+    tspans = text_el.findall("svg:tspan", _NS)
+    assert len(tspans) == len(expected)
+    assert "".join(t.text or "" for t in tspans) == text_obj.text.replace("\n", "")

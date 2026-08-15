@@ -1,7 +1,8 @@
 """TextItem: text オブジェクトを描画する QGraphicsItem（M3契約 §3、インライン編集契約）。
 
-幾何モデルは `RectEllipseItem` と同一（x/y/width/height/rotation）。テキストは
-`QFont`/`QColor` を組み立て `drawText` の折返し矩形に描画する。ダブルクリックで
+幾何モデルは `RectEllipseItem` と同一（x/y/width/height/rotation）。テキストの
+折返し・整列・行送り・採寸は `app/export/text_outline.py` の共有エンジン
+（`draw_text_block`/`measure_text`）に一本化されている。ダブルクリックで
 キャンバス上のインプレース編集モードに入る（`begin_text_edit`。旧 `QDialog` 方式の
 `edit_text` は 2026-08-15 に廃止した。直接呼ぶテストが 0 件であることを確認済み）。
 編集中は子アイテム `TextEditorItem`（`text_editor_item.py`）が表示を担い、確定は
@@ -14,10 +15,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QFontInfo, QFontMetricsF, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QFontInfo, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
-from app.export.text_outline import _VALIGN_FACTOR, text_to_path, valign_offset
+from app.export.text_outline import (
+    _VALIGN_FACTOR,
+    draw_text_block,
+    measure_text,
+    text_to_path,
+)
 from app.model.objects import BaseObject
 from app.scene.items.box_item import BoxItem
 from app.scene.items.registry import register_item
@@ -61,13 +67,15 @@ def font_for(obj: BaseObject) -> QFont:
 
 
 def default_text_size(text: str, font: QFont) -> tuple[float, float]:
-    """既定のテキストボックス寸法を算出する（QFontMetricsF ベース、最小寸法確保）。"""
-    metrics = QFontMetricsF(font)
+    """既定のテキストボックス寸法を算出する（`measure_text` ベース、最小寸法確保）。
+
+    採寸は描画（`draw_text_block`/`text_to_path`）と同一の `QTextLayout` エンジンを
+    通す（別式を書かないこと。折返しモードの単一定義は `text_outline.WRAP_MODE`）。
+    """
     content = text if text else " "
-    flags = int(Qt.TextFlag.TextWordWrap)
-    rect = metrics.boundingRect(QRectF(0.0, 0.0, 10000.0, 10000.0), flags, content)
-    width = max(rect.width() + TEXT_MARGIN, MIN_TEXT_WIDTH)
-    height = max(rect.height() + TEXT_MARGIN, MIN_TEXT_HEIGHT)
+    w, h = measure_text(content, font, 10000.0)
+    width = max(w + TEXT_MARGIN, MIN_TEXT_WIDTH)
+    height = max(h + TEXT_MARGIN, MIN_TEXT_HEIGHT)
     return (width, height)
 
 
@@ -114,13 +122,20 @@ class TextItem(BoxItem):
         if cached is not None and cached[0] == key:
             return cached[1]
         font = font_for(obj)
-        metrics = QFontMetricsF(font)
-        align = ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft)
-        flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
-        rect = metrics.boundingRect(
-            QRectF(0.0, 0.0, max(self._w, 1.0), 1_000_000.0), flags, obj.text
-        )
-        offset = valign_offset(obj.text, font, QRectF(0.0, 0.0, self._w, self._h), obj.valign)
+        wrap_width = max(self._w, 1.0)
+        # 採寸は描画と同一の QTextLayout エンジン（text_outline.measure_text）。
+        # 整列によるブロックの x は draw_text_block の行 x 計算（min 側）と一致させる。
+        block_w, block_h = measure_text(obj.text, font, wrap_width)
+        if obj.align == "center":
+            x = (wrap_width - block_w) / 2.0
+        elif obj.align == "right":
+            x = wrap_width - block_w
+        else:
+            x = 0.0
+        rect = QRectF(x, 0.0, block_w, block_h)
+        # valign_offset() を呼ぶと同じテキストをもう一度レイアウトするため、
+        # 既に得ている block_h から直接計算する（式は valign_offset と同一）。
+        offset = (self._h - block_h) * _VALIGN_FACTOR.get(obj.valign, 0.0)
         if offset:
             rect = rect.translated(0.0, offset)
         self._layout_rect_cache = (key, rect)
@@ -129,8 +144,9 @@ class TextItem(BoxItem):
     def boundingRect(self) -> QRectF:
         """箱に加え、箱からあふれたテキストの実描画領域も含める。
 
-        `paint` が `TextDontClip` であふれ分も描くため、`boundingRect` を箱のままに
-        すると部分再描画（Qt は boundingRect 単位で更新する）であふれ分が残像になる。
+        `paint`（`draw_text_block` の行単位描画）はクリップせずあふれ分も描くため、
+        `boundingRect` を箱のままにすると部分再描画（Qt は boundingRect 単位で
+        更新する）であふれ分が残像になる。
         """
         rect = QRectF(0.0, 0.0, self._w, self._h)
         if self.obj.text:
@@ -198,24 +214,13 @@ class TextItem(BoxItem):
             painter.fillPath(path, QBrush(color))
             return
         font = font_for(self.obj)
-        painter.setFont(font)
         painter.setPen(QPen(color))
-        align = ALIGN_MAP.get(self.obj.align, Qt.AlignmentFlag.AlignLeft)
-        # TextDontClip: 箱が行高より低いときにディセンダ（`_` や `y` の下）が
-        # ピクセル単位で切れるのを防ぐ。アウトライン経路（`text_to_path`、SVG/PDF）は
-        # 元からクリップしないので、これを付けないと**画面・PNG と SVG/PDF で
-        # 見た目が食い違う**（出力品質最優先の設計上これは許容できない）。
-        # 縦位置は Qt の AlignVCenter を使わず（Qt 内部の行高算出が text_outline.py の
-        # lineSpacing 積み上げとズレるため）、rect 自体を valign_offset() 分だけ
-        # 下げることで PDF アウトラインと一致させる（フラグは常に AlignTop のまま）。
-        flags = (
-            int(align)
-            | int(Qt.AlignmentFlag.AlignTop)
-            | int(Qt.TextFlag.TextWordWrap)
-            | int(Qt.TextFlag.TextDontClip)
-        )
-        offset = valign_offset(text, font, rect, self.obj.valign)
-        painter.drawText(rect.translated(0.0, offset), flags, text)
+        # 描画は text_outline.draw_text_block（QTextLayout エンジン）に一本化する。
+        # drawText(rect, flags, ...) を使わないのは、折返しモード
+        # WrapAtWordBoundaryOrAnywhere（箱幅超過トークンを途中で折る）がフラグでは
+        # 表現できないため。行ごとの点描画なのでクリップは発生せず（旧 TextDontClip と
+        # 同じ性質）、行送り・整列・valign は text_to_path（SVG/PDF）と同一関数を通る。
+        draw_text_block(painter, text, font, rect, self.obj.align, self.obj.valign)
 
     # ------------------------------------------------------------------
     # テキスト編集
@@ -366,13 +371,10 @@ class TextItem(BoxItem):
         from app.commands.commands import SetGeometryCommand, SetPropertyCommand
 
         font = font_for(self.obj)
-        metrics = QFontMetricsF(font)
         wrap_width = max(self.obj.width, MIN_TEXT_WIDTH)
-        flags = int(Qt.TextFlag.TextWordWrap)
-        rect = metrics.boundingRect(
-            QRectF(0.0, 0.0, wrap_width, 1_000_000.0), flags, new_text if new_text else " "
-        )
-        new_height = max(rect.height() + TEXT_MARGIN, MIN_TEXT_HEIGHT)
+        # 再採寸も描画と同一エンジン（text_outline.measure_text）を通す。
+        _bw, block_h = measure_text(new_text if new_text else " ", font, wrap_width)
+        new_height = max(block_h + TEXT_MARGIN, MIN_TEXT_HEIGHT)
         old_height = self.obj.height
 
         undo_stack.beginMacro("edit text")

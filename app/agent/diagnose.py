@@ -43,27 +43,21 @@ _RESIZABLE_TYPES = frozenset({"rect", "ellipse", "image", "text", "math", "freeh
 
 
 def _text_sizes(obj: BaseObject) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
-    """text の実レイアウト寸法と内容にちょうど合う寸法を `QFontMetricsF` で採る。
+    """text の実レイアウト寸法と内容にちょうど合う寸法を採る。
 
-    `TextItem._text_layout_rect` と**同じ経路**（`font_for` + 折返し付き
-    `boundingRect`）を通す。式を写すと DPI ピン留め規則がずれて、シーンに
-    出ている見た目と診断結果が食い違う。
+    `TextItem._text_layout_rect` と**同じ経路**（`font_for` +
+    `text_outline.measure_text` の QTextLayout エンジン）を通す。式を写すと
+    DPI ピン留め規則や折返しモードがずれて、シーンに出ている見た目と
+    診断結果が食い違う。
     """
-    from PySide6.QtCore import QRectF, Qt
-    from PySide6.QtGui import QFontMetricsF
-
-    from app.scene.items.text_item import ALIGN_MAP, default_text_size, font_for
+    from app.export.text_outline import measure_text
+    from app.scene.items.text_item import default_text_size, font_for
 
     if obj.type != "text" or not obj.text:
         return (None, None)
     font = font_for(obj)
-    metrics = QFontMetricsF(font)
-    align = ALIGN_MAP.get(obj.align, Qt.AlignmentFlag.AlignLeft)
-    flags = int(align) | int(Qt.AlignmentFlag.AlignTop) | int(Qt.TextFlag.TextWordWrap)
-    rect = metrics.boundingRect(
-        QRectF(0.0, 0.0, max(float(obj.width), 1.0), 1_000_000.0), flags, obj.text
-    )
-    return ((rect.width(), rect.height()), default_text_size(obj.text, font))
+    layout_size = measure_text(obj.text, font, max(float(obj.width), 1.0))
+    return (layout_size, default_text_size(obj.text, font))
 
 
 def _object_snapshot(

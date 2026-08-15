@@ -296,26 +296,29 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
   ではない）／**Ctrl+Enter・外側クリック・ツール切替=確定**／**Esc=キャンセル**
   （破棄）。確定は `commit_text_edit()` → 既存の `commit_text()` に委譲し、undo
   1 マクロ・高さ再採寸・valign アンカー維持は従来どおり。
-- **見た目完全一致（方針b）の実現方式**: `TextEditorItem` に `TextItem.paint`
-  （`drawText` 経路）と**完全に同一のレイアウト条件**を与える —
-  `document().setDocumentMargin(0.0)`（既定 4px マージンを殺す）／同一 `QFont`
-  （`font_for(obj)`、px 焼き込み済み）／同一 `QTextOption`（alignment + WordWrap）／
-  同一折返し幅（`setTextWidth`）／同一文字色／`text_outline.valign_offset()` に
-  よる手動 y オフセット（テキスト変化のたび再計算）。`drawText` も
-  `QTextDocument` も内部は `QTextLayout` を使うため、これらを揃えれば行分割・
-  行送りが一致する。**一致することはピクセル比較テストで固定する**
+- **見た目完全一致（方針b）の実現方式**: テキストの折返し・整列・行送り・採寸は
+  `app/export/text_outline.py` の **QTextLayout 共有エンジンに一本化**されている
+  （2026-08-15）— 画面は `draw_text_block`、採寸は `measure_text`、SVG/PDF
+  アウトラインは `text_to_path`、SVG `<text>` の tspan 行分割は `wrapped_lines`、
+  エディタは同一の折返しモード定数 `WRAP_MODE` を使う。折返しモードは
+  **`WrapAtWordBoundaryOrAnywhere`**（単語境界優先・箱幅に収まらない長い 1 トークン
+  は途中で折る。2026-08-15 ユーザー決定で WordWrap から変更、既存図の折返しが
+  変わることは承知の上）。このモードは `drawText` のフラグでは表現できないため、
+  `TextItem.paint` は `drawText(rect, flags, ...)` ではなく `draw_text_block`
+  （行単位の点描画）を使う。行送りは `QTextLine.height()` の累積・ベースラインは行ごとの
+  `QTextLine.ascent()`（いずれも Qt ネイティブの値）。`lineSpacing()`/`ascent()`
+  固定だった旧実装の「画面と SVG/PDF アウトラインの 1 行あたり ~0.3px ドリフト」
+  「フォールバックフォント（欧文フォント指定＋日本語）でのベースラインずれ」も
+  この統一で解消した。タブは全経路でスペース 1 個に正規化して扱う。
+  `TextEditorItem` には同一条件（documentMargin 0／同一 `QFont`／同一
+  `QTextOption`／同一折返し幅／同一文字色／`valign_offset()` の手動 y オフセット）
+  を与える。**一致することはピクセル比較テストで固定する**
   （`tests/test_text_editor_parity.py`: 通常描画と編集中描画を同一シーンで
   `QImage` へ render し不一致画素を 0.5% 未満に固定。日本語複数行 ×
-  align/valign/bold/font_size の代表ケースに加え、空テキストのプレースホルダ
-  破線一致・境界ケースも収録）。編集中は親 `TextItem.paint` が本体テキストを
+  align/valign/bold/font_size の代表ケース・箱幅超過トークン・空テキストの
+  プレースホルダ破線一致を収録）。編集中は親 `TextItem.paint` が本体テキストを
   描かず、エディタが唯一の描画源になる（空テキストのプレースホルダ破線のみ、
   親が編集中/非編集で共通に描く）。
-- **既知の非一致**: 箱幅より長い1トークン（改行不能な長い識別子等）× 中央/右揃え
-  は `QTextDocument` が行幅基準（実質左寄せ）で整列する一方、`paint`/
-  `text_to_path`/SVG/PDF は箱幅基準で中央/右揃えするため編集中だけ数%食い違う。
-  根本解決（3経路すべてを break-anywhere に揃える）は行分割の仕様変更でありユーザー
-  判断が必要なため、現状は境界を固定するテストで既知の限界として扱っている
-  （`test_known_mismatch_long_unbreakable_token_exceeding_box_width`）。
 - **編集中の外部モデル変更**: プロパティパネル等で font/color/align/幅高さが
   変わればエディタへ即座に再適用する。`text` 自体が外部から変わった場合は
   エディタの下書きで上書き確定せず、そのままキャンセルする（`TextItem._on_sync_geometry`）。

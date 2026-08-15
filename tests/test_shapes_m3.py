@@ -521,7 +521,7 @@ def _text_doc(height: float) -> Any:
 def test_text_descender_is_not_clipped_by_a_short_box(qapp: Any) -> None:
     """行高より低いボックスでも `_` や `y` の下が切れない。
 
-    `drawText` は既定で矩形クリップするため、外部（プロパティパネルでの
+    旧実装の `drawText(rect, flags)` は既定で矩形クリップしたため、外部（プロパティパネルでの
     font_size 変更・ハンドル縮小・エージェント API の任意 geometry）から
     行高未満の height が入ると文字が欠ける。アウトライン経路（SVG/PDF）は
     元からクリップしないので、放置すると**画面と書き出しで見た目が食い違う**。

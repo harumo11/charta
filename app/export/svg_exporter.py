@@ -21,9 +21,9 @@ from collections.abc import Callable
 from xml.sax.saxutils import escape, quoteattr
 
 from PySide6.QtCore import QRectF
-from PySide6.QtGui import QFont, QFontInfo, QFontMetricsF, QPainterPath
+from PySide6.QtGui import QFont, QFontInfo, QPainterPath
 
-from app.export.text_outline import text_to_path, valign_offset
+from app.export.text_outline import text_to_path, valign_offset, wrapped_lines
 from app.graphics import curves
 from app.graphics.arrows import (
     arrow_visible,
@@ -401,29 +401,36 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
     # ずれ（outline/画面/PDF の見た目と不一致）を解消する。
     # <text> と outline の valign は同じ font・同じ valign_offset() で揃える
     # （text_to_path と別式を書かないこと。CLAUDE.md 参照）。
-    metrics = QFontMetricsF(font)
     # SVG の font-size は **em サイズ**（= 解決後のピクセルサイズ）。
     # `ascent + descent` は行ボックスの高さであって em ではない（Noto Sans CJK では
     # 約 1.45em）。ここを取り違えると `<text>` だけ 1.45 倍で描かれ、
     # outline 版・画面・PDF と食い違う。
     font_size_px = float(QFontInfo(font).pixelSize())
-    line_spacing = metrics.lineSpacing()
-    baseline = metrics.ascent()
     offset = valign_offset(obj.text, font, rect, obj.valign)
 
-    lines = obj.text.split("\n") if obj.text else [""]
+    # 行分割は画面/アウトラインと同一エンジン（text_outline.wrapped_lines）を通す。
+    # 以前は "\n" 分割のみで折返しを再現しておらず、折り返されたテキストは
+    # <text> 出力だけ 1 行に伸びていた（2026-08-15 の折返し統一で修正）。
+    # 各行の y は行スロット位置（top）＋**その行の実 ascent**（フォールバック
+    # フォント込み。metrics.ascent() 固定だと欧文フォント指定＋日本語で数 px ずれる）。
+    lines = wrapped_lines(obj.text, font, max(obj.width, 1.0))
     anchor = _ALIGN_ANCHOR.get(obj.align, "start")
     x = {"left": 0.0, "center": obj.width / 2.0, "right": obj.width}.get(obj.align, 0.0)
     weight = ' font-weight="bold"' if obj.bold else ""
     style = ' font-style="italic"' if obj.italic else ""
     decoration = ' text-decoration="underline"' if obj.underline else ""
+    # 行末スペースは rstrip する: naturalTextWidth（= text-anchor の middle/end が
+    # 基準にすべき幅）は行末スペースを含まないため、preserve のまま残すと
+    # center/right 揃えがスペース分ずれる。行頭・行中の空白は xml:space="preserve"
+    # で保持する（折返し行の字下げ・連続スペースが SVG の既定空白処理で潰れないように）。
     tspans = "".join(
-        f'<tspan x="{_fmt(x)}" y="{_fmt(baseline + offset + i * line_spacing)}">'
-        f"{escape(line)}</tspan>"
-        for i, line in enumerate(lines)
+        f'<tspan x="{_fmt(x)}" y="{_fmt(offset + top + ascent)}">{escape(line_text.rstrip())}'
+        "</tspan>"
+        for line_text, _natural_width, top, ascent in lines
     )
     text_el = (
-        f'<text font-family={quoteattr(obj.font_family)} font-size="{_fmt(font_size_px)}"'
+        f'<text xml:space="preserve" font-family={quoteattr(obj.font_family)}'
+        f' font-size="{_fmt(font_size_px)}"'
         f" fill={quoteattr(obj.color)}"
         f' text-anchor="{anchor}"{weight}{style}{decoration}>{tspans}</text>'
     )
