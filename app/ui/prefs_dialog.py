@@ -253,6 +253,22 @@ class PrefsDialog(QDialog):
         self._routing_combo.setCurrentIndex(idx if idx >= 0 else 0)
         form.addRow("コネクタ routing", self._routing_combo)
 
+        # 数式フォント（項目6-wiring契約）。既存の math オブジェクトにも即時反映される
+        # ため「新規オブジェクトの既定」としては例外的だが、`_routing_combo` と同じ
+        # `addItem(label, value)` + `currentData()` 方式に揃える。
+        self._math_fontset_combo = QComboBox()
+        for value, label in (
+            ("cm", "Computer Modern（論文標準）"),
+            ("stix", "STIX（Times 系）"),
+            ("stixsans", "STIX Sans"),
+            ("dejavuserif", "DejaVu Serif"),
+            ("dejavusans", "DejaVu Sans（旧既定）"),
+        ):
+            self._math_fontset_combo.addItem(label, value)
+        idx = self._math_fontset_combo.findData(prefs.math_fontset)
+        self._math_fontset_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("数式フォント", self._math_fontset_combo)
+
         return group
 
     def _on_font_changed(self, _font: QFont) -> None:
@@ -376,6 +392,7 @@ class PrefsDialog(QDialog):
             default_font_size=self._font_size_spin.value(),
             default_stroke_width=self._stroke_width_spin.value(),
             default_connector_routing=self._routing_combo.currentData(),
+            math_fontset=self._math_fontset_combo.currentData(),
             artboard_width_px=self._artboard_width_spin.value(),
             artboard_height_px=self._artboard_height_spin.value(),
             artboard_width_mm=self._artboard_mm_spin.value(),
@@ -385,6 +402,12 @@ class PrefsDialog(QDialog):
             export_outline_text=self._outline_check.isChecked(),
             export_transparent_png=self._transparent_check.isChecked(),
             export_confirm=self._export_confirm_check.isChecked(),
+            # `copy_transparent` はこのダイアログに UI を持たない（ヘッダーバーの
+            # コピーボタンのドロップダウンから直接切り替える。項目7契約）ため、
+            # 渡された初期値をそのまま持ち越す（このメソッドは全フィールドを明示
+            # 列挙するため、書き忘れると環境設定で OK を押すたびに dataclass 既定
+            # （False）へ黙って戻ってしまう）。
+            copy_transparent=base.copy_transparent,
             window_geometry=base.window_geometry,
             grid_visible=base.grid_visible,
             snap_enabled=base.snap_enabled,

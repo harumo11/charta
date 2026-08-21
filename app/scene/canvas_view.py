@@ -517,6 +517,15 @@ class CanvasView(QGraphicsView):
         右クリックで確定した直後は、Qt が press の後に合成する QContextMenuEvent を
         1 回だけ抑止する（`consume_context_menu_suppression`。`is_interacting()` の
         判定より前に消費すること — 確定処理で下書きは既に無くなっているため）。
+
+        `is_interacting()` は左ボタンの press/release だけで立てる/降ろす
+        `_left_press_active` に基づく（項目5契約）。Linux の Qt は右ボタンの
+        press と release の**間**に本イベントを合成配送する（実測順:
+        press → contextMenuEvent → release）ため、右ボタンでも `is_interacting()`
+        を立てていた旧実装では、この合成イベントが届く時点でまだ press 中の
+        判定になり、右クリック1回目のメニューが必ず捨てられていた
+        （2回目は press が `MouseButtonDblClick` に変換されこのガードを経由しない
+        別経路になるため、たまたまメニューが出ていた）。
         """
         if self.tool_manager is not None and self.tool_manager.consume_context_menu_suppression():
             event.ignore()

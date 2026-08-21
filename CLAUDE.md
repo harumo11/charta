@@ -365,6 +365,19 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
 - 整列・分布（align/distribute）、グリッド、スナップガイド。
 - コピー/複製、z順操作 UI。
 - 自動保存: 一定間隔＋終了時に `project.json` 保存、クラッシュ用 `.autosave` を別途書き出し。
+- **画面/選択範囲を画像としてコピー**（2026-08-21 追加。項目7）: 「画面を画像としてコピー」
+  （`Ctrl+Shift+C`）と「選択範囲を画像としてコピー」（`Ctrl+Alt+C`。発見性の主要動線は
+  キャンバス右クリックメニュー）の 2 系統。どちらもクリップボード先はプロジェクト保存を
+  伴わないので **undo エントリを作らない**。`app/export/png_exporter.py` の
+  `render_artboard_image`/`render_region_image` が共有する `_render_scene_rect`（使い捨て
+  `CanvasScene` render・不透過時の全面先塗り・`artboard_export_scale` による実効 DPI 一致）
+  を経由するため、全面書き出しと領域コピーの見た目は構造的に揃う。選択範囲は
+  `ExportController.selected_region()`（選択中アイテムの `sceneBoundingRect()` の和。
+  矢じり・線幅のはみ出しを含む）。ヘッダーバーのコピーボタンはドロップダウンに
+  「選択範囲をコピー」「透過背景でコピー」を持つが、そのメニューは**共有 QAction では
+  なく `QToolButton.setMenu()`**（ボタン専用）に付ける——QAction が `menu()` を持つと
+  Qt はその項目（編集メニュー内の同名項目）を常にサブメニュー扱いにしてクリックで
+  `triggered` を出さなくなるため。
 
 ### 9.7 環境設定（Preferences）とカラーパレット（2026-08-15 追加）
 
@@ -421,6 +434,26 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
   実際に操作した（`currentFontChanged` を受けた）ときだけ新しい family を採用し、
   未操作なら渡された値をそのまま持ち越す（未インストールフォントの環境で開いた
   だけで既定フォントがファウンドリ接尾辞付きの別名に化けるのを防ぐ）。
+- **`math_fontset`**（2026-08-21 追加。既定 `"cm"` = Computer Modern、論文標準）:
+  選択肢は `"cm"/"stix"/"stixsans"/"dejavusans"/"dejavuserif"`。ホワイトリストは
+  `app/prefs.py` の `MATH_FONTSET_VALUES` と `app/math/mathtext_render.py` の
+  `MATH_FONTSETS` の**二重管理**（`app/math/` を設定層に依存させない既存の境界を
+  守るため prefs を import しない。値を変えるときは両方直すこと）。不正名は
+  matplotlib が `ValueError` を投げると `MathRenderError` に化けて**全数式が
+  プレースホルダになる**ため、このホワイトリストが防波堤。環境設定の変更は
+  `set_math_fontset()`（プロセス全体のモジュールレベル現在値。`app/ui/theme/
+  tokens.py` の `_set_current_theme` と同じ立場）→ `MainWindow.
+  _refresh_math_rendering()`（シーンの全 `MathItem` を `invalidate_render_cache()`
+  で再レンダリング）の経路で反映する。**モデル（`latex`/`font_size`）は触らない**
+  ため undo エントリは作らない。fontset で数式の自然アスペクト比は変わるが、
+  画面は `MathItem._natural_fit_rect` の箱内センターフィットで歪まず、SVG 出力側も
+  `preserveAspectRatio="xMidYMid meet"`（`"none"` ではない）で同じ扱いになる。
+- **`copy_transparent`**（2026-08-21 追加。既定 `False`）: 「画面/選択範囲を画像として
+  コピー」時の透過背景。`export_transparent_png`（ファイル書き出し用）とは**別
+  フィールド**——貼り付け先の PowerPoint は不透過が欲しい／ファイル書き出しは
+  透過が欲しい、が普通に併存するため。設定ダイアログに UI を持たず、コピー用
+  ドロップダウンメニューの「透過背景でコピー」トグルから `update_prefs(
+  copy_transparent=...)` で直接マージ保存する。
 
 ---
 

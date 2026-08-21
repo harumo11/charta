@@ -7,11 +7,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from PySide6.QtCore import QRectF
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 
 from app.export.pdf_exporter import export_pdf
-from app.export.png_exporter import export_png, render_artboard_image
+from app.export.png_exporter import export_png, render_artboard_image, render_region_image
 from app.export.svg_exporter import export_svg
 from app.prefs import Preferences
 from app.scene.canvas_scene import CanvasScene
@@ -137,19 +138,65 @@ class ExportController:
             == QMessageBox.StandardButton.Yes
         )
 
-    def copy_canvas_to_clipboard(self) -> None:
+    def _resolve_copy_transparent(self, transparent: bool | None) -> bool:
+        """`transparent` が `None` なら `prefs.copy_transparent` を使う（項目7契約）。
+
+        `prefs` が配線されていない（`None`）場合は従来どおり不透過（False）に
+        フォールバックし、既存の呼び出し元・テストへの回帰を無くす。
+        """
+        if transparent is not None:
+            return transparent
+        return self.prefs.copy_transparent if self.prefs is not None else False
+
+    def copy_canvas_to_clipboard(self, transparent: bool | None = None) -> None:
         """アートボード全体を高DPI画像としてクリップボードへコピーする。
 
         PNG エクスポートと同じレンダリング経路（`render_artboard_image`）を使う。
-        パワポ等へそのまま貼り付ける用途のため背景は不透過（アートボード背景色）。
+        `transparent` が `None`（既定）なら `prefs.copy_transparent` に従う。
+        `export_transparent_png`（ファイル書き出し用）とは別フィールドであり、
+        書き出し設定を変えてもコピーの挙動は変わらない（貼り付け先のPowerPoint
+        は不透過が欲しい／ファイル書き出しは透過が欲しい、が普通に併存するため）。
         成功時はオブジェクトのコピーと同様サイレント（ダイアログを出さない）。
         """
+        resolved = self._resolve_copy_transparent(transparent)
         try:
-            image = render_artboard_image(self._scene.document)
+            image = render_artboard_image(self._scene.document, transparent=resolved)
         except Exception as exc:  # noqa: BLE001 - ユーザーへのエラー表示のため捕捉
             QMessageBox.critical(self._window, "コピーに失敗しました", str(exc))
             return
         QGuiApplication.clipboard().setImage(image)
+
+    def copy_region_to_clipboard(self, region: QRectF, transparent: bool | None = None) -> None:
+        """`region`（アートボード座標）だけを高DPI画像としてクリップボードへコピーする。
+
+        `transparent` の解決方法は `copy_canvas_to_clipboard` と同じ。
+        """
+        resolved = self._resolve_copy_transparent(transparent)
+        try:
+            image = render_region_image(self._scene.document, region, transparent=resolved)
+        except Exception as exc:  # noqa: BLE001 - ユーザーへのエラー表示のため捕捉
+            QMessageBox.critical(self._window, "コピーに失敗しました", str(exc))
+            return
+        QGuiApplication.clipboard().setImage(image)
+
+    def selected_region(self) -> QRectF | None:
+        """選択中アイテムの `sceneBoundingRect()` の和（未選択なら None）。
+
+        `sceneBoundingRect()` を使う理由: 回転を含む正しい外接矩形が得られ、かつ
+        **矢じり・線幅のはみ出しを各 item の boundingRect が既に含む**（モデルの
+        p1/p2 bbox で切ると矢じりが切れる）。子アイテム（選択ハンドル・オーバーレイ）
+        が含まれないのは `sceneBoundingRect()` がアイテム自身の `boundingRect` のみを
+        シーン座標へ写像するため（`childrenBoundingRect` を混ぜると枠がハンドル分
+        膨らむ）。ハンドルはそもそも選択可能でないので `selectedItems()` にも
+        現れない。
+        """
+        items = self._scene.selectedItems()
+        if not items:
+            return None
+        union = items[0].sceneBoundingRect()
+        for item in items[1:]:
+            union = union.united(item.sceneBoundingRect())
+        return union
 
     def export_action(self, kind: ExportKind) -> None:
         """`kind`（"png"/"pdf"/"svg"）でエクスポートする（M4契約 §8）。"""

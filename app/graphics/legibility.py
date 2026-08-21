@@ -11,6 +11,12 @@
 
 from __future__ import annotations
 
+# px↔mm 換算の定数は `app/model/document.py` の `MM_PER_INCH` に一本化する
+# （レビュー所見対応: 私物の同値定数を持つと「唯一の真実源」という document.py 側の
+# docstring の主張が事実と食い違う。`app/graphics/` は `app/model/` に依存してよい
+# 層なのでこの import は規約違反ではない）。
+from app.model.document import MM_PER_INCH
+
 #: WCAG AA の下限。通常の文字。
 WCAG_AA_NORMAL = 4.5
 #: WCAG AA の下限。大きい文字（`LARGE_TEXT_PT` 以上）。
@@ -18,7 +24,6 @@ WCAG_AA_LARGE = 3.0
 #: 「大きい文字」とみなす実寸 pt。
 LARGE_TEXT_PT = 14.0
 
-_MM_PER_INCH = 25.4
 _PT_PER_INCH = 72.0
 
 
@@ -88,7 +93,7 @@ def effective_point_size(font_px: float, width_px: float, width_mm: float) -> fl
     ratio = px_per_mm(width_px, width_mm)
     if ratio <= 0.0:
         return 0.0
-    return font_px / ratio / _MM_PER_INCH * _PT_PER_INCH
+    return font_px / ratio / MM_PER_INCH * _PT_PER_INCH
 
 
 def point_size_to_px(target_pt: float, width_px: float, width_mm: float) -> float:
@@ -96,7 +101,7 @@ def point_size_to_px(target_pt: float, width_px: float, width_mm: float) -> floa
     ratio = px_per_mm(width_px, width_mm)
     if ratio <= 0.0:
         return 0.0
-    return target_pt / _PT_PER_INCH * _MM_PER_INCH * ratio
+    return target_pt / _PT_PER_INCH * MM_PER_INCH * ratio
 
 
 def readable_color(background: str) -> str:

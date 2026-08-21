@@ -41,6 +41,11 @@ STROKE_WIDTH_MAX = 50.0
 AUTOSAVE_INTERVAL_MIN = 0
 AUTOSAVE_INTERVAL_MAX = 600
 CONNECTOR_ROUTING_VALUES = ("orthogonal", "straight")
+#: `app/math/mathtext_render.py` の `MATH_FONTSETS` と同じ集合（値を変えるときは
+#: 両方直すこと。`app/prefs.py` は app 配下を一切 import しない独立モジュールなので
+#: 定数は共有できない）。不正名は matplotlib が `ValueError` を投げ `MathRenderError`
+#: に化けて**全数式がプレースホルダになる**ため、ここのホワイトリストがその防波堤。
+MATH_FONTSET_VALUES = ("cm", "stix", "stixsans", "dejavusans", "dejavuserif")
 _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
@@ -74,6 +79,11 @@ class Preferences:
     default_font_size: float = 18.0
     default_stroke_width: float = 2.0
     default_connector_routing: str = "orthogonal"  # "orthogonal" | "straight"
+    # 数式フォント（項目6-wiring契約）。`app.math.mathtext_render.current_math_fontset()`
+    # のプロセス全体の現在値を起動時/環境設定確定時にここから初期化する。新規オブジェクトの
+    # 既定と同じ節に置くが、実際には既存の math オブジェクトの見た目にも即時反映される
+    # （`MainWindow._refresh_math_rendering`）点が他の「新規作成の既定」フィールドと異なる。
+    math_fontset: str = "cm"
     # 新規アートボードの既定
     artboard_width_px: float = 1920.0
     artboard_height_px: float = 1080.0
@@ -85,6 +95,11 @@ class Preferences:
     export_outline_text: bool = False
     export_transparent_png: bool = False
     export_confirm: bool = True  # False = 確認ダイアログを出さず既定値で書き出す
+    # クリップボードコピーの透過（項目7契約）。`export_transparent_png` とは**別フィールド**
+    # （貼り付け先の PowerPoint は不透過が欲しい／ファイル書き出しは透過が欲しい、が普通に
+    # 併存するため）。設定ダイアログには出さず、ヘッダーバーのコピーボタンのドロップダウン
+    # メニュー（「透過背景でコピー」チェック項目）から直接切り替える。
+    copy_transparent: bool = False
     # 自動記憶（設定ダイアログには出さない）
     window_geometry: list[int] | None = None  # [x, y, w, h]
     grid_visible: bool = False
@@ -112,6 +127,10 @@ class Preferences:
         )
         if default_connector_routing not in CONNECTOR_ROUTING_VALUES:
             default_connector_routing = defaults.default_connector_routing
+
+        math_fontset = _coerce_str(d.get("math_fontset"), defaults.math_fontset)
+        if math_fontset not in MATH_FONTSET_VALUES:
+            math_fontset = defaults.math_fontset
 
         artboard_background = _coerce_str(
             d.get("artboard_background"), defaults.artboard_background
@@ -141,6 +160,7 @@ class Preferences:
                 STROKE_WIDTH_MAX,
             ),
             default_connector_routing=default_connector_routing,
+            math_fontset=math_fontset,
             artboard_width_px=_clamp_float(
                 _coerce_float(d.get("artboard_width_px"), defaults.artboard_width_px),
                 ARTBOARD_PX_MIN,
@@ -174,6 +194,7 @@ class Preferences:
                 d.get("export_transparent_png"), defaults.export_transparent_png
             ),
             export_confirm=_coerce_bool(d.get("export_confirm"), defaults.export_confirm),
+            copy_transparent=_coerce_bool(d.get("copy_transparent"), defaults.copy_transparent),
             window_geometry=_coerce_geometry(d.get("window_geometry"), defaults.window_geometry),
             grid_visible=_coerce_bool(d.get("grid_visible"), defaults.grid_visible),
             snap_enabled=_coerce_bool(d.get("snap_enabled"), defaults.snap_enabled),

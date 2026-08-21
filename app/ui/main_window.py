@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.commands.commands import SetStylesCommand
+from app.math.mathtext_render import set_math_fontset
 from app.model.document import Artboard, Document, Physical
 from app.model.objects import BaseObject
 from app.model.palettes import Palette, palette_by_id, palette_style_bundles
@@ -86,9 +87,14 @@ _CREATION_DEFAULT_PREF_KEYS: tuple[str, ...] = (
 # 環境設定ダイアログには出さない自動記憶フィールド（`app/prefs.py` の
 # Preferences docstring 参照）。`open_preferences` はこれらを除いたフィールド
 # だけをディスクへマージ保存する（`update_prefs`、所見: 全フィールド保存だと
-# 複数プロセス間で後勝ち上書きが起きる）。
+# 複数プロセス間で後勝ち上書きが起きる）。`copy_transparent`（項目7契約）も
+# ダイアログに UI を持たず、ヘッダーバーのコピーボタンのドロップダウンから
+# `update_prefs(copy_transparent=...)` で直接マージ保存するため、grid_visible/
+# snap_enabled と同じ理由でここに含める（含めないと、環境設定で OK を押した
+# 時点の self.prefs.copy_transparent（古いスナップショットの可能性がある）で
+# 他プロセスの最新値を後勝ちで上書きしてしまう）。
 _PREFS_AUTO_MEMORY_FIELDS: frozenset[str] = frozenset(
-    {"version", "window_geometry", "grid_visible", "snap_enabled"}
+    {"version", "window_geometry", "grid_visible", "snap_enabled", "copy_transparent"}
 )
 _PREFS_DIALOG_FIELDS: tuple[str, ...] = tuple(
     f.name for f in dataclasses.fields(Preferences) if f.name not in _PREFS_AUTO_MEMORY_FIELDS
@@ -155,6 +161,10 @@ class MainWindow(QMainWindow):
         # 環境設定（B契約 §B-2）。ウィンドウジオメトリの復元がこの直後に続くため、
         # 他の何より先に読み込む。
         self.prefs: Preferences = load_prefs()
+        # 数式フォントセット（項目6-wiring契約）は `apply_theme` と同じ立場の
+        # プロセス全体設定なので、prefs 読込直後に反映する（この後に構築される
+        # math item がすべて正しいフォントセットで初期レンダリングされるように）。
+        set_math_fontset(self.prefs.math_fontset)
         self._apply_initial_window_size()
 
         self.undo_stack: QUndoStack = QUndoStack(self)
@@ -519,10 +529,21 @@ class MainWindow(QMainWindow):
         copy_action = edit_menu.addAction("コピー", self.copy_selection)
         copy_action.setShortcut(QKeySequence("Ctrl+C"))
         # ヘッダーバーの専用ボタンからも同じ QAction を使い回す（undo/redo と同じ流儀）。
+        # `lambda: ...()` で 0 引数呼び出しにする（重要）: `copy_canvas_to_clipboard`
+        # は `transparent: bool | None = None` を持つため、`QAction.triggered(bool)`
+        # に直接繋ぐと PySide6 が `checked`（常に False）をそのまま渡してしまい、
+        # 「透過背景でコピー」のチェックを無視して常に不透過になる（項目7契約の
+        # 回帰）。`self.tool_manager.set_tool` の呼び出し（:628）と同じ回避策。
         self._copy_image_action = edit_menu.addAction(
-            "画面を画像としてコピー", self._export.copy_canvas_to_clipboard
+            "画面を画像としてコピー", lambda: self._export.copy_canvas_to_clipboard()
         )
         self._copy_image_action.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        # 選択範囲だけのコピー（項目7契約）。発見性の主要動線は右クリックメニュー
+        # 側（`_build_canvas_context_menu`）だが、キーボード操作のためここにも置く。
+        self._copy_region_action = edit_menu.addAction(
+            "選択範囲を画像としてコピー", self.copy_region_to_clipboard
+        )
+        self._copy_region_action.setShortcut(QKeySequence("Ctrl+Alt+C"))
         paste_action = edit_menu.addAction("貼付", self.paste_clipboard)
         paste_action.setShortcut(QKeySequence("Ctrl+V"))
         duplicate_action = edit_menu.addAction("複製", self.duplicate_selection)
@@ -619,8 +640,11 @@ class MainWindow(QMainWindow):
         self._import_action.setToolTip("画像を取り込み (Ctrl+I)")
         self._undo_action.setIcon(icons.icon("mdi6.undo"))
         self._redo_action.setIcon(icons.icon("mdi6.redo"))
-        self._copy_image_action.setIcon(icons.icon("mdi6.monitor-screenshot"))
+        # "monitor-screenshot" は「画面」を連想させクリップボードと結びつかない
+        # ため "content-copy" にする（項目7契約）。
+        self._copy_image_action.setIcon(icons.icon("mdi6.content-copy"))
         self._copy_image_action.setToolTip("画面を画像としてコピー (Ctrl+Shift+C)")
+        self._build_copy_menu()  # 呼んだ時点で self._copy_menu が生える
 
         export_action = QAction(icons.icon("mdi6.tray-arrow-up"), "書き出し", self)
         export_action.setToolTip("前回の設定で書き出し (Ctrl+E) / 初回はダイアログ")
@@ -638,12 +662,48 @@ class MainWindow(QMainWindow):
             self._undo_action,
             self._redo_action,
             self._copy_image_action,
+            self._copy_menu,
             export_action,
             self,
         )
         self.setMenuWidget(header_bar)
 
         self._connect_tool_changed()
+
+    def _build_copy_menu(self) -> None:
+        """コピー用ドロップダウンメニューを組む（項目7契約。レビュー所見で配線先を変更）。
+
+        本体クリック（ボタン本体 / Ctrl+Shift+C）は従来どおり「画面を画像として
+        コピー」のまま。ドロップダウンには「選択範囲をコピー」と、コピーの
+        透過を切り替える「透過背景でコピー」（`prefs.copy_transparent`）を持つ。
+
+        **`self._copy_image_action.setMenu(...)` はしない。** QAction が `menu()` を
+        持つと、Qt はそれを使う項目（編集メニューの「画面を画像としてコピー」も
+        同じ QAction を共有している）を常にサブメニュー扱いにし、クリックしても
+        `triggered` を出さなくなる（実測確認済み）。ここでは `self._copy_menu` に
+        保持するだけにして、ヘッダーバー側の `QToolButton.setMenu()`（アクションとは
+        独立なボタン専用メニュー）に付け替える（`_build_header_bar` 参照）。
+        """
+        copy_menu = QMenu(self)
+        self._copy_region_menu_action = copy_menu.addAction(
+            "選択範囲をコピー", self.copy_region_to_clipboard
+        )
+        self._copy_transparent_action = copy_menu.addAction("透過背景でコピー")
+        self._copy_transparent_action.setCheckable(True)
+        self._copy_transparent_action.setChecked(self.prefs.copy_transparent)
+        self._copy_transparent_action.toggled.connect(self._on_copy_transparent_toggled)
+        # メニューは起動時に1度しか組まれないため、`aboutToShow` で選択の有無に
+        # 追従させないと「選択範囲をコピー」の有効/無効が無言の no-op になる。
+        copy_menu.aboutToShow.connect(self._sync_copy_menu_enabled)
+        self._copy_menu = copy_menu
+
+    def _sync_copy_menu_enabled(self) -> None:
+        """コピーボタンのドロップダウンの「選択範囲をコピー」を選択状態に追従させる。"""
+        self._copy_region_menu_action.setEnabled(bool(self.scene.selected_objects()))
+
+    def _on_copy_transparent_toggled(self, checked: bool) -> None:
+        self.prefs.copy_transparent = checked
+        update_prefs(copy_transparent=checked)
 
     def _connect_tool_changed(self) -> None:
         """`tool_manager.tool_changed`(§8) をヘッダーバーのツールボタンのチェック状態に反映する。
@@ -665,6 +725,22 @@ class MainWindow(QMainWindow):
 
     def copy_selection(self) -> None:
         self._edit.copy_selection()
+
+    def copy_region_to_clipboard(self) -> None:
+        """選択範囲だけを高DPI画像としてクリップボードへコピーする（項目7契約）。
+
+        未選択なら何もコピーせず、ステータスバーに短く案内するだけの no-op にする
+        （成功ダイアログを出さない UI 最小主義と対称に、失敗時もダイアログにしない）。
+        `region.isEmpty()` も未選択と同じ扱いにする（面積 0 のオブジェクト単体選択時、
+        `scene.render` の `source` が `QRectF.isNull()` 相当になり Qt が全体を
+        source にフォールバックして「1px にシーン全体が潰れた画像」が黙って
+        コピーされる事故を避けるため。レビュー所見対応）。
+        """
+        region = self._export.selected_region()
+        if region is None or region.isEmpty():
+            self.statusBar().showMessage("コピーする範囲を選択してください", 2000)
+            return
+        self._export.copy_region_to_clipboard(region)
 
     def paste_clipboard(self) -> None:
         self._edit.paste_clipboard()
@@ -727,6 +803,13 @@ class MainWindow(QMainWindow):
         menu.addAction("コピー", self.copy_selection).setEnabled(n >= 1)
         menu.addAction("貼付", self.paste_clipboard).setEnabled(has_clipboard)
         menu.addAction("複製", self.duplicate_selection).setEnabled(n >= 1)
+        menu.addSeparator()
+        # 画像としてのコピー（項目7契約・発見性の主要動線）。0 引数呼び出しにする
+        # 理由は `_build_menus` の同種コメントを参照（`checked` の意図しない伝播回避）。
+        menu.addAction("画面を画像としてコピー", lambda: self._export.copy_canvas_to_clipboard())
+        menu.addAction("選択範囲を画像としてコピー", self.copy_region_to_clipboard).setEnabled(
+            n >= 1
+        )
         menu.addAction("削除", self.delete_selected).setEnabled(n >= 1)
         menu.addSeparator()
         menu.addAction("前面へ", self.bring_to_front).setEnabled(n >= 1)
@@ -813,6 +896,11 @@ class MainWindow(QMainWindow):
           読み込んだ後に他インスタンス（§15 のヘッドレス常駐等）が保存した分を
           後勝ちで消してしまう。ダイアログが実際に編集するフィールドだけを
           ディスクの最新値へ重ね書きする。
+        - **数式フォントセット**（項目6-wiring契約）: `_update_prefs_in_place` は
+          `self.prefs` の中身を丸ごと差し替えるため、比較は**その前**に行う。
+          変わっていれば `set_math_fontset` でプロセス全体の現在値を切り替え、
+          既存の math item を `_refresh_math_rendering()` で再描画する。モデルは
+          一切書き換えない（undo エントリを作らない）。
         """
         dialog = PrefsDialog(self.prefs, on_register_styles=self._register_palette_styles)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -822,12 +910,30 @@ class MainWindow(QMainWindow):
             getattr(self.prefs, key) != getattr(new_prefs, key)
             for key in _CREATION_DEFAULT_PREF_KEYS
         )
+        fontset_changed = new_prefs.math_fontset != self.prefs.math_fontset
         self._update_prefs_in_place(new_prefs)
         if defaults_changed:
             self.tool_manager.clear_style_memory()
+        if fontset_changed:
+            set_math_fontset(self.prefs.math_fontset)
+            self._refresh_math_rendering()
         self._apply_palette_swatches()
         self._configure_autosave_timer()
         update_prefs(**{name: getattr(self.prefs, name) for name in _PREFS_DIALOG_FIELDS})
+
+    def _refresh_math_rendering(self) -> None:
+        """数式フォントセットの変更後、既存の math item のレンダラを作り直す。
+
+        環境設定の変更は `DocumentListener` の通知を一切出さないため、
+        `sync_from_model` 経由では再描画されない。`scene.items()` を走査し
+        `invalidate_render_cache`（`MathItem` のみが持つ）をダックタイピングで
+        呼ぶ（他の型の item には存在しないため `getattr` で静かに無視する）。
+        モデルは触らない（環境設定は現在のドキュメントに触れないという既存契約）。
+        """
+        for item in self.scene.items():
+            invalidate = getattr(item, "invalidate_render_cache", None)
+            if callable(invalidate):
+                invalidate()
 
     def _update_prefs_in_place(self, new_prefs: Preferences) -> None:
         """`self.prefs` の中身を `new_prefs` の値で丸ごと置き換える（参照は保つ）。

@@ -57,6 +57,7 @@ def test_save_then_load_roundtrips_all_fields() -> None:
         default_font_size=24.0,
         default_stroke_width=3.5,
         default_connector_routing="straight",
+        math_fontset="stix",
         artboard_width_px=800.0,
         artboard_height_px=600.0,
         artboard_width_mm=85.0,
@@ -66,6 +67,7 @@ def test_save_then_load_roundtrips_all_fields() -> None:
         export_outline_text=True,
         export_transparent_png=True,
         export_confirm=False,
+        copy_transparent=True,
         window_geometry=[10, 20, 640, 480],
         grid_visible=True,
         snap_enabled=False,
@@ -211,6 +213,13 @@ def test_from_dict_clamps_out_of_range_numeric_fields() -> None:
 def test_from_dict_rejects_unknown_connector_routing() -> None:
     prefs = Preferences.from_dict({"default_connector_routing": "diagonal"})
     assert prefs.default_connector_routing == Preferences().default_connector_routing
+
+
+def test_from_dict_rejects_unknown_math_fontset() -> None:
+    """不正名は matplotlib が `ValueError` を投げ全数式がプレースホルダになるため、
+    ホワイトリスト（`MATH_FONTSET_VALUES`）が既定へ落とす防波堤になっていること。"""
+    prefs = Preferences.from_dict({"math_fontset": "comic-sans"})
+    assert prefs.math_fontset == Preferences().math_fontset
 
 
 def test_from_dict_rejects_invalid_colors() -> None:

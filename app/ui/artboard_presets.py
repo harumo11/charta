@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from app.model.document import px_from_mm
+
 # アートボードプリセット(§9): (表示名, width_mm, target_dpi, アスペクト比w, アスペクト比h)。
 ARTBOARD_PRESETS: list[tuple[str, float, int, int, int]] = [
     ("1カラム figure (84mm, 300dpi, 4:3)", 84.0, 300, 4, 3),
@@ -24,6 +26,6 @@ def preset_px_size(
     width_mm: float, target_dpi: int, aspect_w: int, aspect_h: int
 ) -> tuple[int, int]:
     """物理サイズプリセットから width_px/height_px を算出する。"""
-    width_px = round(width_mm / 25.4 * target_dpi)
+    width_px = px_from_mm(width_mm, target_dpi)
     height_px = round(width_px * aspect_h / aspect_w)
     return max(width_px, 1), max(height_px, 1)

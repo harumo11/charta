@@ -1,10 +1,11 @@
-"""MathItem: math オブジェクトを描画する QGraphicsItem（契約 M5 §2、CLAUDE.md §9.4）。
+"""MathItem: math オブジェクトを描画する QGraphicsItem（契約 M5 §2、CLAUDE.md §9.4/§9.7）。
 
 幾何モデルは `RectEllipseItem` と同一（x/y/width/height/rotation, BoxHandleSet）。
 SVG は `QSvgRenderer`（PySide6.QtSvg）で保持し、`paint` で `render()` することで
 ベクター描画を保つ（PDF の `scene.render()` 経路でもベクター保持される）。`latex` が
-再編集の真実源で、レンダラは `(latex, font_size, color)` をキャッシュ鍵として
-`sync_from_model` 時にのみ再生成する。
+再編集の真実源で、レンダラは `(latex, font_size, color, fontset)` をキャッシュ鍵として
+`sync_from_model` 時にのみ再生成する（`fontset` は環境設定の現在値。§9.7 の数式
+フォント切り替えに追従するため）。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.math.mathtext_render import MathRenderError, get_math_svg
+from app.math.mathtext_render import MathRenderError, current_math_fontset, get_math_svg
 from app.model.objects import BaseObject
 from app.scene.items.box_item import BoxItem
 from app.scene.items.registry import register_item
@@ -36,11 +37,18 @@ _MIN_MATH_SIZE = 10.0
 _RESIZE_EPS = 1.0
 
 
-def _cache_key_for(latex: str, font_size: float, color: str) -> tuple[str, float, str]:
-    return (latex, round(float(font_size), 3), color)
+def _cache_key_for(latex: str, font_size: float, color: str) -> tuple[str, float, str, str]:
+    """レンダラのキャッシュ鍵を組み立てる。
+
+    `current_math_fontset()`（環境設定の現在値）を必ず含める。含めないと、
+    環境設定で数式フォントを変えても `_ensure_renderer` が「キーが一致している」
+    と誤判定して early return し、画面が更新されない（`invalidate_render_cache`
+    はこの early return を正しく突破させるためだけに存在する）。
+    """
+    return (latex, round(float(font_size), 3), color, current_math_fontset())
 
 
-def _cache_key(obj: BaseObject) -> tuple[str, float, str]:
+def _cache_key(obj: BaseObject) -> tuple[str, float, str, str]:
     return _cache_key_for(obj.latex, obj.font_size, obj.color)
 
 
@@ -139,14 +147,14 @@ class MathItem(BoxItem):
     def __init__(self, obj: BaseObject, document: Document | None = None) -> None:
         super().__init__(obj, document)
         self._renderer: QSvgRenderer | None = None
-        self._cache_key: tuple[str, float, str] | None = None
+        self._cache_key: tuple[str, float, str, str] | None = None
         self._render_error: bool = False
-        self._failed_cache_key: tuple[str, float, str] | None = None
+        self._failed_cache_key: tuple[str, float, str, str] | None = None
         self._last_commit_error: str | None = None
         self._ensure_renderer()
 
     def _ensure_renderer(self) -> None:
-        """`obj` の `(latex, font_size, color)` が変化していればレンダラを再生成する。
+        """`obj` の `(latex, font_size, color, fontset)` が変化していればレンダラを再生成する。
 
         失敗時は例外を握りつぶさず warn し、`_render_error=True` を立てた上で
         直前の有効レンダラ/表示を維持する（無ければ `paint` がプレースホルダを描く、
@@ -198,6 +206,21 @@ class MathItem(BoxItem):
 
     def _on_sync_geometry(self) -> None:
         self._ensure_renderer()
+
+    def invalidate_render_cache(self) -> None:
+        """fontset 変更等でレンダラを作り直す（**モデルは触らない**＝undo エントリを作らない）。
+
+        環境設定の変更は `DocumentListener` の通知を一切出さないため `sync_from_model`
+        経由では再描画されない。呼び出し側（`MainWindow`）がシーンの全 item を
+        ダックタイピングで走査してこれを呼ぶ。
+
+        `_cache_key`/`_failed_cache_key` は `current_math_fontset()` を含むため、
+        `_ensure_renderer()` を呼ぶだけで「キー不一致 → 再レンダリング」が自然に起こる
+        （手で `_cache_key = None` に戻す必要はない）。box 寸法（`_w`/`_h`）は変えない
+        （`_natural_fit_rect` が箱内センターフィットするため歪まない）。
+        """
+        self._ensure_renderer()
+        self.update()
 
     def boundingRect(self) -> QRectF:
         return QRectF(0.0, 0.0, self._w, self._h).adjusted(-1.0, -1.0, 1.0, 1.0)

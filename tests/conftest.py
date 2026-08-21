@@ -8,10 +8,13 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from collections.abc import Iterator  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from app.math.mathtext_render import DEFAULT_MATH_FONTSET, set_math_fontset  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -31,3 +34,16 @@ def _isolated_prefs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     既存テスト全体が環境依存になり、テスト実行がユーザー設定を破壊してしまう。
     """
     monkeypatch.setenv("CHARTA_CONFIG_DIR", str(tmp_path / "charta-config"))
+
+
+@pytest.fixture(autouse=True)
+def _reset_math_fontset() -> Iterator[None]:
+    """数式フォントセットはモジュールグローバルなのでテスト間で漏れる。
+
+    `_isolated_prefs` と同じ立場（テストごとにプロセス全体状態を既定へ戻す）。
+    テスト本体より前に既定へ戻し、後始末としてテスト後にも既定へ戻す
+    （前のテストが異常終了して戻し忘れた場合の保険も兼ねる）。
+    """
+    set_math_fontset(DEFAULT_MATH_FONTSET)
+    yield
+    set_math_fontset(DEFAULT_MATH_FONTSET)

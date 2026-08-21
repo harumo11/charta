@@ -153,13 +153,13 @@ def test_modal_dialog_blocks_mutations_but_not_reads(host: AgentHost, window: An
 
 
 def test_canvas_interaction_blocks_mutations(host: AgentHost, window: Any) -> None:
-    window.tool_manager._press_active = True
+    window.tool_manager._left_press_active = True
     try:
         assert busy_state(window)["reason"] == "user_interacting"
         error = _error(host, "create_objects", objects=[{"type": "rect", "width": 5, "height": 5}])
         assert error["data"]["code"] == "busy"
     finally:
-        window.tool_manager._press_active = False
+        window.tool_manager._left_press_active = False
 
 
 def test_crop_mode_blocks_mutations(host: AgentHost, window: Any) -> None:
@@ -275,11 +275,11 @@ def test_exec_can_be_disabled(window: Any) -> None:
 
 
 def test_exec_is_blocked_by_the_busy_gate(host: AgentHost, window: Any) -> None:
-    window.tool_manager._press_active = True
+    window.tool_manager._left_press_active = True
     try:
         assert _error(host, "charta_exec", source="pass")["data"]["code"] == "busy"
     finally:
-        window.tool_manager._press_active = False
+        window.tool_manager._left_press_active = False
 
 
 # --------------------------------------------------------------------------

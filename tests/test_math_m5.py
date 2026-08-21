@@ -21,7 +21,14 @@ from PySide6.QtWidgets import QStyleOptionGraphicsItem
 from app.export.pdf_exporter import export_pdf
 from app.export.png_exporter import artboard_pixel_size, export_png
 from app.export.svg_exporter import document_to_svg, export_svg
-from app.math.mathtext_render import MathRenderError, get_math_svg, render_latex_to_svg
+from app.math.mathtext_render import (
+    DEFAULT_MATH_FONTSET,
+    MathRenderError,
+    current_math_fontset,
+    get_math_svg,
+    render_latex_to_svg,
+    set_math_fontset,
+)
 from app.model.document import Artboard, Document, Physical
 from app.model.objects import MathObject
 from app.model.serialize import load_document, save_document
@@ -482,3 +489,113 @@ def test_png_export_with_math_produces_expected_size(qapp: Any) -> None:
         export_png(doc, str(out_path), transparent=False)
         with Image.open(out_path) as img:
             assert img.size == (expected_w, expected_h)
+
+
+# --------------------------------------------------------------------------
+# 7. 数式フォントセット（項目6-core、CLAUDE.md §9.7）
+# --------------------------------------------------------------------------
+#
+# `conftest.py` の `_reset_math_fontset`（autouse）が各テストの前後で既定 "cm" に
+# 戻すため、ここで `set_math_fontset` を呼んでも他テストへ漏れない。
+
+
+def test_default_fontset_is_computer_modern(qapp: Any) -> None:
+    """既定は "cm"（Computer Modern。CLAUDE.md §9.7 の論文標準）で、実際に
+    Computer Modern 系のグリフ id（`Cmmi`/`Cmr` プレフィックス）が出力されること。
+    """
+    assert current_math_fontset() == "cm"
+    svg = get_math_svg(r"\alpha + \beta", 20.0, "#000000")
+    assert "Cmmi" in svg or "Cmr" in svg
+
+
+def test_same_latex_renders_differently_per_fontset(qapp: Any) -> None:
+    """同一 latex でもフォントセットが違えば SVG 出力(グリフ)が異なること。"""
+    set_math_fontset("cm")
+    svg_cm = get_math_svg(r"\theta + \Omega_{1}^{2}", 20.0, "#000000")
+    set_math_fontset("dejavusans")
+    svg_dejavusans = get_math_svg(r"\theta + \Omega_{1}^{2}", 20.0, "#000000")
+    assert svg_cm != svg_dejavusans
+
+
+def test_switching_fontset_back_returns_the_exact_same_svg(qapp: Any) -> None:
+    """A→B→A と切り替えても、A に戻した時点の出力は最初の A の出力とバイト一致すること
+    （`_render_cached` のキーに fontset が入っているため、同一キーは同一結果を返す）。
+    """
+    set_math_fontset("cm")
+    svg_a1 = get_math_svg(r"\gamma^{2}", 18.0, "#111111")
+    set_math_fontset("stix")
+    get_math_svg(r"\gamma^{2}", 18.0, "#111111")
+    set_math_fontset("cm")
+    svg_a2 = get_math_svg(r"\gamma^{2}", 18.0, "#111111")
+    assert svg_a1 == svg_a2
+
+
+def test_invalid_fontset_is_rejected_and_math_still_renders(qapp: Any) -> None:
+    """ホワイトリスト外の名前は既定へ落ち、例外を出さず数式が正常に描けること。"""
+    set_math_fontset("not-a-real-fontset")
+    assert current_math_fontset() == DEFAULT_MATH_FONTSET
+    svg = get_math_svg(r"\delta", 20.0, "#000000")
+    assert "<svg" in svg
+
+
+def test_math_item_repaints_after_fontset_change(qapp: Any) -> None:
+    """`invalidate_render_cache()` を呼ぶと、キャッシュ鍵の fontset 要素(index 3)が
+    新しい現在値へ変わり、レンダラの `defaultSize()` も変わること（環境設定で
+    フォントを変えたのに画面が古いまま、という §9.7 の不具合の再発防止）。
+    """
+    doc, obj = _make_math_document(latex=r"\Omega_{1}^{2} + \epsilon")
+    item = create_item(obj, doc)
+    assert isinstance(item, MathItem)
+    assert item._renderer is not None
+    old_key = item._cache_key
+    assert old_key is not None
+    old_size = item._renderer.defaultSize()
+
+    set_math_fontset("dejavusans")
+    item.invalidate_render_cache()
+
+    assert item._cache_key is not None
+    assert item._cache_key[3] == "dejavusans"
+    assert item._cache_key[3] != old_key[3]
+    assert item._renderer is not None
+    new_size = item._renderer.defaultSize()
+    assert (new_size.width(), new_size.height()) != (old_size.width(), old_size.height())
+
+
+def test_screen_and_svg_export_use_the_same_fontset(qapp: Any) -> None:
+    """MathItem の画面表示と `svg_exporter` の SVG 出力が同一 fontset の SVG を使うこと。
+
+    両者とも `get_math_svg`（単一の入口）を経由するため、レンダリング結果の
+    「内側」(`_split_matplotlib_svg` が返す inner)は完全一致するはず。
+    """
+    from app.export.svg_exporter import _split_matplotlib_svg
+
+    set_math_fontset("stixsans")
+    doc, obj = _make_math_document(latex=r"\theta + \Omega")
+    expected_svg = get_math_svg(obj.latex, obj.font_size, obj.color)
+    _attrs, expected_inner = _split_matplotlib_svg(expected_svg)
+
+    svg = document_to_svg(doc)
+    assert expected_inner in svg
+
+
+def test_svg_math_element_center_fits_like_the_screen_after_fontset_change(qapp: Any) -> None:
+    """レビュー所見対応: SVG の math ネスト `<svg>` は `preserveAspectRatio="none"`
+    （引き伸ばし）ではなく `"xMidYMid meet"`（アスペクト保持センターフィット）で
+    出力すること。
+
+    fontset を変えると matplotlib が生成する数式の自然アスペクト比が変わるが、
+    box（`obj.width`/`obj.height`）はプロパティパネルで個別に固定できる（このテストの
+    `_make_math_document` も width=120/height=60 の固定値）。画面側
+    (`MathItem._natural_fit_rect`) は box アスペクトと自然アスペクトがずれても
+    引き伸ばさず箱内センターフィットするため、SVG 側が "none" のままだと
+    fontset 変更後に画面と出力が食い違う。"xMidYMid meet" にすることで両者が揃う。
+    """
+    set_math_fontset("dejavusans")
+    doc, obj = _make_math_document(latex=r"\frac{\alpha}{\beta}+\Omega^{2}")
+    svg = document_to_svg(doc)
+    root = ET.fromstring(svg)
+    nested_svgs = root.findall(".//svg:svg", _NS)
+    assert len(nested_svgs) >= 1, "math のネスト <svg> が出力されていない"
+    for nested in nested_svgs:
+        assert nested.get("preserveAspectRatio") == "xMidYMid meet"

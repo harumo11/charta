@@ -19,7 +19,7 @@ from dataclasses import MISSING, fields
 from typing import Any
 
 from app.model import styles
-from app.model.document import Document
+from app.model.document import Document, px_from_mm
 from app.model.objects import OBJECT_REGISTRY, BaseObject
 from app.model.properties import PROPERTIES, PropSpec
 
@@ -270,7 +270,7 @@ def artboard_info(document: Document) -> dict[str, Any]:
     """アートボードの寸法情報（px / mm / 書き出し px）。"""
     artboard = document.artboard
     physical = artboard.physical
-    export_w = round(physical.width_mm / 25.4 * physical.target_dpi)
+    export_w = px_from_mm(physical.width_mm, physical.target_dpi)
     export_h = round(export_w * artboard.height_px / artboard.width_px)
     return {
         "width_px": artboard.width_px,

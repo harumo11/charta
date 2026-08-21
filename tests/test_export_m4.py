@@ -828,3 +828,294 @@ def test_svg_text_tspans_follow_wrapped_lines(qapp: Any, project_dir: Path, tmp_
     tspans = text_el.findall("svg:tspan", _NS)
     assert len(tspans) == len(expected)
     assert "".join(t.text or "" for t in tspans) == text_obj.text.replace("\n", "")
+
+
+# --------------------------------------------------------------------------
+# render_region_image / selected_region / クリップボードコピー（項目7契約）
+# --------------------------------------------------------------------------
+
+
+def test_render_region_image_uses_the_same_scale_as_full_export(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    from PySide6.QtCore import QRectF
+
+    from app.export.png_exporter import artboard_export_scale, render_region_image
+
+    doc = _build_document(project_dir, tmp_path)
+    scale = artboard_export_scale(doc)
+    region = QRectF(100.0, 100.0, 200.0, 150.0)
+
+    image = render_region_image(doc, region)
+
+    assert image.width() == max(1, round(region.width() * scale))
+    assert image.height() == max(1, round(region.height() * scale))
+
+
+def test_render_region_image_transparent_corners_are_alpha_zero(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    from PySide6.QtCore import QRectF
+
+    from app.export.png_exporter import render_region_image
+
+    doc = _build_document(project_dir, tmp_path)
+    # アートボード全体を包含しつつ外側へはみ出す領域にすることで、四隅が
+    # 「何も描かれていない透過領域」であることを保証する。
+    region = QRectF(-50.0, -50.0, doc.artboard.width_px + 100.0, doc.artboard.height_px + 100.0)
+
+    image = render_region_image(doc, region, transparent=True)
+    out_path = project_dir / "exports" / "region_transparent.png"
+    assert image.save(str(out_path), "PNG")
+
+    with Image.open(out_path) as img:
+        arr = np.asarray(img.convert("RGBA"))
+    h, w = arr.shape[0], arr.shape[1]
+    for cy, cx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
+        assert arr[cy, cx, 3] == 0, f"corner ({cy},{cx}) should be fully transparent"
+
+
+def test_render_region_image_opaque_fills_background_outside_the_artboard(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """`CanvasScene.drawBackground` は sceneRect との交差しか塗らないため、
+    region がアートボード外へはみ出す縁は `render_region_image` が事前に塗った
+    背景色のまま残ること（塗り忘れると縁が抜けて透明になる）。"""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor
+
+    from app.export.png_exporter import render_region_image
+
+    doc = _build_document(project_dir, tmp_path)
+    region = QRectF(-50.0, -50.0, doc.artboard.width_px + 100.0, doc.artboard.height_px + 100.0)
+
+    image = render_region_image(doc, region, transparent=False)
+    out_path = project_dir / "exports" / "region_opaque.png"
+    assert image.save(str(out_path), "PNG")
+
+    with Image.open(out_path) as img:
+        arr = np.asarray(img.convert("RGB"))
+    bg = QColor(doc.artboard.background)
+    corner = tuple(int(v) for v in arr[0, 0])
+    assert corner == (bg.red(), bg.green(), bg.blue())
+
+
+def test_render_region_image_excludes_selection_handles(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """`render_region_image` は使い捨てシーンをレンダリングするため、元のシーンで
+    選択されていても選択ハンドル（`#2979FF`）は一切写り込まない
+    （`render_artboard_image` と同じ設計）。"""
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QColor
+
+    from app.export.png_exporter import render_region_image
+    from app.scene.canvas_scene import CanvasScene
+
+    doc = _build_document(project_dir, tmp_path)
+    rect_obj = next(obj for obj in doc.objects if obj.type == "rect")
+
+    with CanvasScene(doc) as live_scene:
+        item = live_scene.item_for(rect_obj)
+        assert item is not None
+        item.setSelected(True)
+
+        region = QRectF(
+            rect_obj.x - 20.0, rect_obj.y - 20.0, rect_obj.width + 40.0, rect_obj.height + 40.0
+        )
+        image = render_region_image(doc, region)
+
+    out_path = project_dir / "exports" / "region_no_handles.png"
+    assert image.save(str(out_path), "PNG")
+    with Image.open(out_path) as img:
+        arr = np.asarray(img.convert("RGB"))
+    handle = QColor("#2979FF")
+    mask = np.all(arr == (handle.red(), handle.green(), handle.blue()), axis=-1)
+    assert int(mask.sum()) == 0
+
+
+def test_selected_region_is_union_of_scene_bounding_rects(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+    rect_obj = next(obj for obj in doc.objects if obj.type == "rect")
+    ellipse_obj = next(obj for obj in doc.objects if obj.type == "ellipse")
+    rect_obj.rotation = 30.0  # 回転オブジェクト込みで union が正しいことを確認する
+
+    with CanvasScene(doc) as scene:
+        controller = ExportController(None, scene, lambda: None)
+        assert controller.selected_region() is None, "未選択なら None"
+
+        rect_item = scene.item_for(rect_obj)
+        ellipse_item = scene.item_for(ellipse_obj)
+        assert rect_item is not None and ellipse_item is not None
+        rect_item.setSelected(True)
+        ellipse_item.setSelected(True)
+
+        expected = rect_item.sceneBoundingRect().united(ellipse_item.sceneBoundingRect())
+        region = controller.selected_region()
+
+    assert region is not None
+    assert region.x() == pytest.approx(expected.x())
+    assert region.y() == pytest.approx(expected.y())
+    assert region.width() == pytest.approx(expected.width())
+    assert region.height() == pytest.approx(expected.height())
+
+
+def test_selected_region_includes_arrowhead_of_a_selected_arrow(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """矢じり分のはみ出しがモデルの p1/p2 bbox で切られない（`sceneBoundingRect` 採用の理由）。"""
+    from PySide6.QtCore import QRectF
+
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+    arrow_obj = next(obj for obj in doc.objects if obj.type == "arrow")
+
+    with CanvasScene(doc) as scene:
+        controller = ExportController(None, scene, lambda: None)
+        item = scene.item_for(arrow_obj)
+        assert item is not None
+        item.setSelected(True)
+        region = controller.selected_region()
+
+    assert region is not None
+    p1x, p1y = arrow_obj.p1
+    p2x, p2y = arrow_obj.p2
+    stroke_half = arrow_obj.stroke_width / 2.0
+    # 線幅の膨らみだけを想定した素朴な bbox（水平な矢印なので高さは stroke_width 分だけ）。
+    naive_bbox = QRectF(
+        min(p1x, p2x) - stroke_half,
+        min(p1y, p2y) - stroke_half,
+        abs(p2x - p1x) + arrow_obj.stroke_width,
+        abs(p2y - p1y) + arrow_obj.stroke_width,
+    )
+    assert region.contains(naive_bbox)
+    # 矢じり(arrow_size=14)は線幅(stroke_width=3)だけの想定より明確に高さを広げる。
+    assert region.height() > naive_bbox.height() + 1.0
+
+
+def test_copy_region_to_clipboard_puts_region_sized_image(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    from PySide6.QtCore import QRectF
+    from PySide6.QtGui import QGuiApplication
+
+    from app.export.png_exporter import artboard_export_scale
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+    region = QRectF(50.0, 50.0, 120.0, 90.0)
+
+    with CanvasScene(doc) as scene:
+        controller = ExportController(None, scene, lambda: None)
+        QGuiApplication.clipboard().clear()
+        controller.copy_region_to_clipboard(region)
+        image = QGuiApplication.clipboard().image()
+
+    assert not image.isNull()
+    scale = artboard_export_scale(doc)
+    assert image.width() == max(1, round(region.width() * scale))
+    assert image.height() == max(1, round(region.height() * scale))
+
+
+def test_copy_canvas_to_clipboard_honours_copy_transparent_pref(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """`copy_transparent` と `export_transparent_png` は別フィールドであり、
+    書き出し設定を変えてもクリップボードコピーの透過は変わらないこと。"""
+    from PySide6.QtGui import QGuiApplication
+
+    from app.prefs import Preferences
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+
+    def _alpha_at_corners(image: Any) -> list[int]:
+        arr = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(
+            image.height(), image.bytesPerLine() // 4, 4
+        )[:, : image.width(), :]
+        h, w = arr.shape[0], arr.shape[1]
+        return [int(arr[cy, cx, 3]) for cy, cx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]]
+
+    with CanvasScene(doc) as scene:
+        transparent_controller = ExportController(
+            None, scene, lambda: None, prefs=Preferences(copy_transparent=True)
+        )
+        QGuiApplication.clipboard().clear()
+        transparent_controller.copy_canvas_to_clipboard()
+        transparent_alpha = _alpha_at_corners(QGuiApplication.clipboard().image())
+
+        # export_transparent_png を True にしても copy には効かない（別フィールド）。
+        opaque_controller = ExportController(
+            None,
+            scene,
+            lambda: None,
+            prefs=Preferences(copy_transparent=False, export_transparent_png=True),
+        )
+        QGuiApplication.clipboard().clear()
+        opaque_controller.copy_canvas_to_clipboard()
+        opaque_alpha = _alpha_at_corners(QGuiApplication.clipboard().image())
+
+    assert transparent_alpha == [0, 0, 0, 0]
+    assert opaque_alpha == [255, 255, 255, 255]
+
+
+def test_copy_image_action_trigger_honours_copy_transparent_toggle(qapp: Any) -> None:
+    """`画面を画像としてコピー` の QAction 起動（ヘッダーボタン本体クリック/
+    Ctrl+Shift+C と共有）が「透過背景でコピー」のチェックを反映すること。
+
+    `QAction.triggered(bool checked)` は `copy_canvas_to_clipboard` へ直接繋ぐと
+    PySide6 が `checked`（非チェック可能アクションでは常に False）をそのまま
+    `transparent` 引数へ渡してしまい、`_resolve_copy_transparent` が `None`
+    フォールバックへ進めず常に不透過になる回帰があった
+    （`main_window._build_menus`/`_build_canvas_context_menu` は
+    `lambda: self._export.copy_canvas_to_clipboard()` で 0 引数呼び出しにして防ぐ）。
+    """
+    import shiboken6
+    from PySide6.QtGui import QGuiApplication
+
+    from app.ui.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        window._copy_transparent_action.setChecked(True)
+        QGuiApplication.clipboard().clear()
+        window._copy_image_action.trigger()
+
+        image = QGuiApplication.clipboard().image()
+        assert not image.isNull()
+        arr = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(
+            image.height(), image.bytesPerLine() // 4, 4
+        )[:, : image.width(), :]
+        assert arr[0, 0, 3] == 0, "透過背景でコピーがチェックされているのに不透過でコピーされた"
+    finally:
+        if shiboken6.isValid(window):
+            window.close()
+
+
+def test_copy_region_action_is_disabled_without_selection(qapp: Any) -> None:
+    import shiboken6
+
+    from app.ui.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        # レビュー所見対応: 共有 QAction に setMenu すると Qt がその項目を
+        # サブメニュー扱いにしクリックで triggered を出さなくなるため、メニューは
+        # `window._copy_menu`（ボタン専用、QAction とは独立）に保持されている。
+        copy_menu = window._copy_menu
+        assert copy_menu is not None
+        assert window._copy_image_action.menu() is None, "共有 QAction にはメニューを付けない"
+        copy_menu.aboutToShow.emit()
+        assert not window._copy_region_menu_action.isEnabled()
+    finally:
+        if shiboken6.isValid(window):
+            window.close()

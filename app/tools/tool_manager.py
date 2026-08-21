@@ -151,9 +151,13 @@ class ToolManager(QObject):
         # 右クリック確定直後に Qt が合成する QContextMenuEvent を 1 回だけ抑止する
         # ワンショットフラグ(`consume_context_menu_suppression` 参照)。
         self._suppress_context_menu_once: bool = False
-        # press〜release の間 True（`is_interacting`）。ツール別の状態だけでは
+        # 左ボタンの press〜release の間 True（`is_interacting`）。ツール別の状態だけでは
         # 「押したが何も掴めなかった」ラバーバンド選択等を取りこぼすため別に持つ。
-        self._press_active: bool = False
+        # 右/中ボタンでは立てない: Linux の Qt は右ボタンの press と release の**間**に
+        # QContextMenuEvent を合成配送する(実測順: press → CTX → release)。ここをボタン
+        # 種別に関係なく立てていると、`CanvasView.contextMenuEvent` の `is_interacting()`
+        # ガードが右クリック1回目の合成イベントを常に捨ててしまう（項目5契約）。
+        self._left_press_active: bool = False
         # ツール名 → press/move/release ハンドラのディスパッチテーブル。
         # rect/ellipse/line/arrow(_DRAW_TOOLS)は同一の _draw_* 三つ組を共有する。
         self._handlers: dict[str, _ToolHandlers] = {
@@ -291,7 +295,7 @@ class ToolManager(QObject):
         self._text_start = None
         self._math_start = None
         self._connector_source_obj = None
-        self._press_active = False
+        self._left_press_active = False
         self._clear_snap_guides()
         if self._tool == name:
             return
@@ -370,11 +374,19 @@ class ToolManager(QObject):
         push するため、その間にモデルを書き換えると `old_geom` が陳腐化し、
         undo でオブジェクトがワープする。
 
+        右/中ボタンの押下はここでは追わない（`_left_press_active` は左ボタンの
+        press/release だけで立てる/降ろす。項目5契約 — Linux の Qt が右ボタンの
+        press と release の間に合成配送する `QContextMenuEvent` を、右クリック
+        1 回目から確実に通すため）。`app/agent/host.py` の busy 判定は
+        `QApplication.mouseButtons() != NoButton` をここより**前**に見ているので、
+        右/中ボタンが押されている間にモデルを書き換えられてしまう不変条件5（§15）
+        の懸念は生じない。
+
         ハンドルのドラッグは `ToolManager` を経由せず item のイベントで進むので、
         ここでは追えない。呼び出し側は `QApplication.mouseButtons()` も併せて見ること。
         """
         return (
-            self._press_active
+            self._left_press_active
             or self._select_press_pos is not None
             or self._draw_start is not None
             or self._freehand_points is not None
@@ -395,7 +407,8 @@ class ToolManager(QObject):
         handlers = self._handlers.get(self._tool)
         if handlers is None:
             return False
-        self._press_active = True
+        if self._is_left_press(event):
+            self._left_press_active = True
         return handlers.press(event, scene_pos)
 
     def handle_mouse_move(self, event: Any, scene_pos: QPointF) -> bool:
@@ -406,7 +419,12 @@ class ToolManager(QObject):
 
     def handle_mouse_release(self, event: Any, scene_pos: QPointF) -> bool:
         handlers = self._handlers.get(self._tool)
-        self._press_active = False
+        if self._is_left_press(event):
+            # 左 press 中に右 release が来ても状態を消さない（項目5契約）。
+            # 右クリック確定の合成イベント配送順(press → CTX → release)により
+            # release だけが来るケースがあり、そのボタンで無条件に降ろすと
+            # 「左ドラッグ中に右クリック」で busy ゲートが開いてしまう。
+            self._left_press_active = False
         if handlers is None:
             return False
         return handlers.release(event, scene_pos)
@@ -1004,6 +1022,19 @@ class ToolManager(QObject):
         """`event.button()` があれば呼んで返す（無ければ None。move イベント等）。"""
         button_getter = getattr(event, "button", None)
         return button_getter() if callable(button_getter) else None
+
+    @staticmethod
+    def _is_left_press(event: Any) -> bool:
+        """`event.button()` が左（または `button` 属性を持たない偽イベント）なら True。
+
+        `button` を持たないダックタイプを左扱いにするのは、テストの偽イベントや
+        move イベントを従来どおり受け付ける互換のため（`_select_press` の左ボタン
+        判定と同じ流儀）。
+        """
+        button_getter = getattr(event, "button", None)
+        if not callable(button_getter):
+            return True
+        return button_getter() == Qt.MouseButton.LeftButton
 
     def _curve_press(self, event: Any, scene_pos: QPointF) -> bool:
         button = self._curve_button(event)

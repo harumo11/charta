@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from app.model.objects import BaseObject
@@ -236,3 +236,66 @@ class Document:
             }
         doc.normalize_z()
         return doc
+
+
+#: 1 インチあたりのミリメートル数（px↔mm 変換の唯一の真実源）。
+MM_PER_INCH = 25.4
+
+#: アートボード px の値域。`app/prefs.py` の ARTBOARD_PX_MIN/MAX と同じ値
+#: （`app/prefs.py` は app 配下を一切 import しない独立モジュールなので定数は共有しない。
+#: 値を変えるときは両方直すこと）。
+ARTBOARD_PX_MIN = 1
+ARTBOARD_PX_MAX = 20000
+
+
+def px_from_mm(width_mm: float, target_dpi: int) -> int:
+    """物理サイズ(mm)と DPI から px を算出する（`mm/25.4*dpi` の唯一の真実源）。
+
+    既存の 3 箇所（`artboard_presets.preset_px_size` / `png_exporter.artboard_pixel_size` /
+    `schema.artboard_info`）が個別に書いていた同一の式を一本化する。丸めは
+    従来どおり四則演算の直後の `round` のみで、ここで値域クランプはしない
+    （呼び出し側の既存の挙動を 1px も変えないため）。
+    """
+    return round(width_mm / MM_PER_INCH * target_dpi)
+
+
+def mm_from_px(width_px: float, target_dpi: int) -> float:
+    """px と DPI から物理サイズ(mm)を算出する（`px_from_mm` の逆演算）。
+
+    `target_dpi <= 0` は「DPI 未設定」を意味しうる壊れた入力であり、0 除算を
+    避けるため 0.0 を返す（例外を投げて呼び出し側を落とさない）。
+    """
+    if target_dpi <= 0:
+        return 0.0
+    return width_px / target_dpi * MM_PER_INCH
+
+
+def clamp_artboard_px(value: float) -> int:
+    """アートボード px の値を `[ARTBOARD_PX_MIN, ARTBOARD_PX_MAX]` に丸めてクランプする。"""
+    clamped = max(float(ARTBOARD_PX_MIN), min(float(ARTBOARD_PX_MAX), value))
+    return int(round(clamped))
+
+
+def artboard_with_pixel_size(artboard: Artboard, width_px: float, height_px: float) -> Artboard:
+    """px 指定でアートボードを差し替えた新しい `Artboard` を返す（元は破壊しない）。
+
+    `physical.target_dpi` は維持し、`physical.width_mm` を
+    `mm_from_px(new_width_px, dpi)` で再計算する。`background` は引き継ぐ
+    （`dataclasses.replace` が明示しないフィールドをそのまま保持するため自動的に成立する）。
+
+    mm を「px からの逆算値」に置き換えるのは、`artboard_pixel_size`（png_exporter）が
+    書き出し px を `mm/25.4*dpi` で算出するため。mm をこの逆算で置いたときだけ
+    「アートボード px = 書き出し px」が成立する（2026-08-21 ユーザー決定）。
+    """
+    new_width_px = clamp_artboard_px(width_px)
+    new_height_px = clamp_artboard_px(height_px)
+    new_physical = replace(
+        artboard.physical,
+        width_mm=mm_from_px(new_width_px, artboard.physical.target_dpi),
+    )
+    return replace(
+        artboard,
+        width_px=new_width_px,
+        height_px=new_height_px,
+        physical=new_physical,
+    )

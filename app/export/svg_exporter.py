@@ -496,9 +496,17 @@ def _render_math(obj: BaseObject) -> str:
         return _xml_comment(f"math: invalid svg for latex={obj.latex!r}: {exc}")
 
     view_box = attrs.get("viewBox") or f"0 0 {_fmt(obj.width)} {_fmt(obj.height)}"
+    # レビュー所見対応: 画面（`MathItem._natural_fit_rect`）は box アスペクトと
+    # matplotlib が生成した自然アスペクトがずれても歪ませず、box 内センターフィット
+    # で描画する。ここを "none"（引き伸ばし）のままにすると、box アスペクトと自然
+    # アスペクトがずれた場合（fontset 変更後の再採寸前や、プロパティパネルで
+    # width/height を個別編集した場合）に画面と SVG 出力が食い違う。
+    # "xMidYMid meet" は SVG 標準のアスペクト保持センターフィットで、画面側の
+    # `_natural_fit_rect` と同じ挙動になる（box アスペクト == 自然アスペクトの
+    # 通常ケースでは見た目も出力バイトも変わらない）。
     return (
         f'<svg x="0" y="0" width="{_fmt(obj.width)}" height="{_fmt(obj.height)}"'
-        f' viewBox={quoteattr(view_box)} preserveAspectRatio="none"'
+        f' viewBox={quoteattr(view_box)} preserveAspectRatio="xMidYMid meet"'
         f" xmlns={quoteattr(_SVG_NS)}>{inner}</svg>"
     )
 

@@ -97,13 +97,23 @@ def test_editing_values_and_accept_updates_edited_prefs(qapp: Any) -> None:
 
 
 def test_accept_preserves_fields_not_shown_in_dialog(qapp: Any) -> None:
-    prefs = Preferences(window_geometry=[1, 2, 3, 4], grid_visible=True, snap_enabled=False)
+    # `copy_transparent` もダイアログに UI を持たない「素通り」フィールド
+    # （レビュー所見対応: `_collect_prefs` は全フィールドを明示列挙するため、
+    # ここでカバーしないと将来削っても誰も気づかず、環境設定で OK を押すたびに
+    # dataclass 既定 False へ黙って戻る回帰が再発する）。
+    prefs = Preferences(
+        window_geometry=[1, 2, 3, 4],
+        grid_visible=True,
+        snap_enabled=False,
+        copy_transparent=True,
+    )
     dialog = PrefsDialog(prefs)
     dialog.accept()
     edited = dialog.edited_prefs()
     assert edited.window_geometry == [1, 2, 3, 4]
     assert edited.grid_visible is True
     assert edited.snap_enabled is False
+    assert edited.copy_transparent is True
 
 
 def test_background_color_button_updates_edited_prefs(
@@ -183,6 +193,22 @@ def test_collect_font_family_strips_foundry_suffix_when_dirty(qapp: Any) -> None
 def test_collect_font_family_returns_unchanged_value_when_not_dirty(qapp: Any) -> None:
     dialog = PrefsDialog(Preferences())
     assert dialog._collect_font_family("kept-as-is") == "kept-as-is"
+
+
+# --------------------------------------------------------------------------
+# 数式フォント（項目6-wiring契約）
+# --------------------------------------------------------------------------
+
+
+def test_math_fontset_combo_round_trips_through_edited_prefs(qapp: Any) -> None:
+    dialog = PrefsDialog(Preferences(math_fontset="cm"))
+    idx = dialog._math_fontset_combo.findData("stix")
+    assert idx >= 0
+    dialog._math_fontset_combo.setCurrentIndex(idx)
+
+    dialog.accept()
+
+    assert dialog.edited_prefs().math_fontset == "stix"
 
 
 # --------------------------------------------------------------------------
@@ -313,6 +339,36 @@ def test_open_preferences_accept_persists_and_applies(
     # 即座に見える（`_update_prefs_in_place` の存在理由そのもの）。
     assert window.tool_manager.prefs is window.prefs
     assert window._export.prefs is window.prefs
+
+
+def test_open_preferences_applies_math_fontset_without_touching_the_undo_stack(
+    qapp: Any, window: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """数式フォントセットの変更はプロセス全体設定の切り替えであり、モデルを
+    一切書き換えない（undo エントリを作らない。項目6-wiring契約）。"""
+    from app.math.mathtext_render import current_math_fontset
+
+    assert current_math_fontset() == "cm"
+    undo_count_before = window.undo_stack.count()
+
+    class _FakeDialog:
+        def __init__(self, prefs: Preferences, on_register_styles: Any = None) -> None:
+            self._edited = Preferences(**{**prefs.to_dict(), "math_fontset": "stix"})
+
+        def exec(self) -> int:
+            return 1  # QDialog.DialogCode.Accepted
+
+        def edited_prefs(self) -> Preferences:
+            return self._edited
+
+    monkeypatch.setattr("app.ui.main_window.PrefsDialog", _FakeDialog)
+
+    window.open_preferences()
+
+    assert current_math_fontset() == "stix"
+    assert window.prefs.math_fontset == "stix"
+    assert load_prefs().math_fontset == "stix"
+    assert window.undo_stack.count() == undo_count_before
 
 
 def test_open_preferences_reject_leaves_prefs_unchanged(
