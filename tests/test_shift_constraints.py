@@ -341,3 +341,32 @@ def test_endpoint_handle_shift_uses_live_geometry_for_a_bound_opposite_endpoint(
         list(expected)
     ), "画面に見えている角度(実効p2)を軸に制約すること（陳腐化したモデル値ではない）"
     handles.end_drag("p1")
+
+
+# --------------------------------------------------------------------------
+# 軸方向は厳密値（浮動小数の誤差を残さない）
+# --------------------------------------------------------------------------
+
+
+def test_axis_constrained_result_is_exact_not_epsilon_off() -> None:
+    """水平/垂直に制約した結果が厳密に一致すること（`_exact_unit`）。
+
+    `math.cos(math.radians(90))` は 6.1e-17 なので、丸めが無いと「水平にした線」の
+    y が 200.00000000000003 になり、プロパティパネルの数値やエージェント API の
+    bbox、テストの等値比較が誤差付きになる（研究図では「厳密に水平」であることが
+    値として確認できる必要がある）。
+    """
+    # 水平（右向き）
+    assert constrain_to_axis_or_diagonal((100.0, 200.0), (300.0, 217.0)) == (300.0, 200.0)
+    # 水平（左向き）
+    assert constrain_to_axis_or_diagonal((300.0, 200.0), (100.0, 190.0)) == (100.0, 200.0)
+    # 垂直（下向き）
+    assert constrain_to_axis_or_diagonal((100.0, 200.0), (105.0, 400.0)) == (100.0, 400.0)
+    # 垂直（上向き）
+    assert constrain_to_axis_or_diagonal((100.0, 400.0), (95.0, 200.0)) == (100.0, 200.0)
+
+
+def test_diagonal_components_are_exactly_equal() -> None:
+    """45° 側は cos と sin が同一の浮動小数値なので dx == dy が厳密に成り立つこと。"""
+    x, y = constrain_to_axis_or_diagonal((100.0, 100.0), (300.0, 280.0))
+    assert (x - 100.0) == (y - 100.0)
