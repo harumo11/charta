@@ -31,6 +31,7 @@ from PIL import Image
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QGuiApplication
 
+from app.model.serialize import save_document
 from app.scene.handles import BoxHandleSet
 from app.ui.main_window import _MIN_WINDOW_H, _MIN_WINDOW_W, MainWindow
 
@@ -134,8 +135,38 @@ def test_first_drop_of_artboard_sized_image_fills_viewport(window: Any, tmp_path
     chrome を測ってウィンドウをリサイズすると、フィット後にスクロールバーが消えて
     ビューポートが広がり、左右へ数 px の余白が残っていた。スクロールバーの
     有無でビューポート寸法が変わらないこと（＝初回ドロップでも余白ゼロ）を検証する。
+
+    期待値は 2026-08-21 に (1920.0, 1080.0) から (3840.0, 2160.0) へ更新した:
+    このテストの `window` は未保存の空ドキュメントへの「最初の 1 枚」なので、
+    項目9のアートボード自動フィットが発火し、アートボードが画像の px 寸法
+    (3840x2160) へ合わせて広がる。`compute_default_size` はアートボードに
+    収まる画像を縮小しないため、画像は原寸のまま配置される。縮小経路
+    （保存済みプロジェクトで自動フィットが働かない場合に 1920x1080 の
+    アートボードへ収まるよう縮小される挙動）は
+    `test_second_or_saved_project_drop_of_oversized_image_shrinks_to_artboard` で
+    別途カバーする（カバレッジを失わないため）。
     """
-    # アートボード(1920x1080)と同アスペクトの大きい画像 → 全面 1920x1080 に配置される。
+    # アートボード(1920x1080)と同アスペクトの大きい画像 → 自動フィットで
+    # アートボードごと画像の原寸(3840x2160)へ広がる。
+    obj, _item = _drop_image(window, tmp_path, w=3840, h=2160)
+    assert (obj.width, obj.height) == (3840.0, 2160.0)
+    _assert_fills_viewport(window, QRectF(obj.x, obj.y, obj.width, obj.height))
+
+
+def test_second_or_saved_project_drop_of_oversized_image_shrinks_to_artboard(
+    window: Any, tmp_path: Path
+) -> None:
+    """自動フィットが働かない場合、アートボードより大きい画像は縦横比を保って縮小される。
+
+    `test_first_drop_of_artboard_sized_image_fills_viewport` が 2026-08-21 に
+    自動フィット込みの期待値へ更新されたため、旧来の「アートボードに収める縮小」
+    経路の検証をこちらへ退避した。保存済みプロジェクト（`_project_dir` 設定済み）
+    への取り込みは項目9の自動フィット対象外なので、既定アートボード(1920x1080)
+    に対して `compute_default_size` の縮小が働く。
+    """
+    proj = tmp_path / "proj"
+    save_document(window.scene.document, str(proj))
+    window._project_dir = str(proj)
     obj, _item = _drop_image(window, tmp_path, w=3840, h=2160)
     assert (obj.width, obj.height) == (1920.0, 1080.0)
     _assert_fills_viewport(window, QRectF(obj.x, obj.y, obj.width, obj.height))

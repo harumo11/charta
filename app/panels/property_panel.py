@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.commands.commands import SetArtboardCommand, SetGeometryCommand, SetPropertyCommand
-from app.model.document import Artboard, Physical
+from app.model.document import Artboard, Physical, artboard_with_pixel_size
 from app.model.objects import BaseObject
 from app.model.properties import PROPERTIES, PropSpec
 from app.ui.artboard_presets import ARTBOARD_CUSTOM_LABEL, ARTBOARD_PRESETS, preset_px_size
@@ -1494,21 +1494,47 @@ class PropertyPanel(QWidget):
 
             def on_field_changed(
                 _value: Any = None,
+                *,
+                source: str = "mm",
                 preset_combo: QComboBox = preset_combo,
                 width_mm_spin: QDoubleSpinBox = width_mm_spin,
                 dpi_spin: QSpinBox = dpi_spin,
                 width_px_spin: QSpinBox = width_px_spin,
                 height_px_spin: QSpinBox = height_px_spin,
             ) -> None:
+                """px↔mm の片方向連動（項目10レビュー major 所見・ユーザー決定）。
+
+                `source="px"`（px スピンの変更）: dpi を維持したまま
+                `artboard_with_pixel_size` で width_mm を再計算し、mm 欄へ
+                反映する。これをしないと「グリップ/自動フィットで作った
+                アートボード px = 書き出し px」の等式が、パネルで px を触った
+                瞬間に崩れる（px は変わるのに mm/dpi が古いまま＝書き出し px が
+                width_mm/25.4*dpi 経由で別の値になる）。
+
+                `source="mm"`（mm/dpi スピンの変更）: px は変えない（現状維持）。
+                「mm 欄は入稿寸法の指定で px 追従が自然」という双方向化の案も
+                あるが、契約の裁可は「迷ったら mm 入力では px を変えない」で
+                あり、この関数はその既定を採る。
+                """
                 if self._rebuilding:
                     return
                 old_artboard = self.scene.document.artboard
-                new_artboard = Artboard(
-                    width_px=width_px_spin.value(),
-                    height_px=height_px_spin.value(),
-                    physical=Physical(width_mm=width_mm_spin.value(), target_dpi=dpi_spin.value()),
-                    background=old_artboard.background,
-                )
+                if source == "px":
+                    new_artboard = artboard_with_pixel_size(
+                        old_artboard, float(width_px_spin.value()), float(height_px_spin.value())
+                    )
+                    width_mm_spin.blockSignals(True)
+                    width_mm_spin.setValue(new_artboard.physical.width_mm)
+                    width_mm_spin.blockSignals(False)
+                else:
+                    new_artboard = Artboard(
+                        width_px=width_px_spin.value(),
+                        height_px=height_px_spin.value(),
+                        physical=Physical(
+                            width_mm=width_mm_spin.value(), target_dpi=dpi_spin.value()
+                        ),
+                        background=old_artboard.background,
+                    )
                 if new_artboard == old_artboard:
                     return
                 preset_combo.blockSignals(True)
@@ -1539,10 +1565,10 @@ class PropertyPanel(QWidget):
                 push_artboard(new_artboard, text="背景色")
 
             preset_combo.currentIndexChanged.connect(on_preset_changed)
-            width_mm_spin.valueChanged.connect(on_field_changed)
-            dpi_spin.valueChanged.connect(on_field_changed)
-            width_px_spin.valueChanged.connect(on_field_changed)
-            height_px_spin.valueChanged.connect(on_field_changed)
+            width_mm_spin.valueChanged.connect(lambda _v: on_field_changed(source="mm"))
+            dpi_spin.valueChanged.connect(lambda _v: on_field_changed(source="mm"))
+            width_px_spin.valueChanged.connect(lambda _v: on_field_changed(source="px"))
+            height_px_spin.valueChanged.connect(lambda _v: on_field_changed(source="px"))
             bg_button.clicked.connect(on_bg_click)
 
             # 公開ヘルパ（row_for_key 等）が artboard モードでも引けるようにする。

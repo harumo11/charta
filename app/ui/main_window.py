@@ -202,6 +202,8 @@ class MainWindow(QMainWindow):
         )
         # キャンバス右クリックメニュー（P3契約 §3.3）。
         self.view.context_menu_requested.connect(self._show_canvas_context_menu)
+        # 紙の右下グリップドラッグ中の寸法プレビュー（項目10契約）。
+        self.view.artboard_resize_preview.connect(self._on_artboard_resize_preview)
 
         self.mask_edit_panel = MaskEditPanel()
         self._sam3_masking = Sam3MaskController(
@@ -449,9 +451,20 @@ class MainWindow(QMainWindow):
         引数は移設前と同一）。ウィンドウを画像サイズへ合わせてからビューを画像へ
         フィットさせる。margin_ratio=0: ウィンドウを画像の縦横比で決めているため、
         余白なしでビューポートを丁度満たす。
+
+        `clamp_min=False`（P3レビュー major 所見・2026-08-21 修正）:
+        `_resize_window_to_fit` は必要ズームを MAX_ZOOM 側でしかクランプしない
+        （MIN_ZOOM=0.1 未満は素通し）のに、続く `fit_to_rect` が既定で MIN_ZOOM に
+        下限クランプすると、必要倍率が 0.1 を下回る巨大な図（項目9の自動フィットで
+        アートボードが画像原寸まで広がった場合を含む）で実ズームが必要倍率より
+        大きくなり、画像がビューポートからはみ出す。ここでの目的は
+        `fit_to_artboard`（`canvas_view.py`）と同じ「全体が見えること」なので、
+        同様に下限クランプを外す（`tests/test_image_drop.py::
+        test_fit_to_artboard_shows_whole_huge_artboard` が同種の
+        `_zoom < MIN_ZOOM` 許容を既に前例として固定している）。
         """
         self._resize_window_to_fit(rect)
-        self.view.fit_to_rect(rect, margin_ratio=0.0)
+        self.view.fit_to_rect(rect, margin_ratio=0.0, clamp_min=False)
 
     def _on_undo_index_changed(self, _idx: int) -> None:
         self.property_panel.on_selection_changed()
@@ -472,6 +485,18 @@ class MainWindow(QMainWindow):
             f"{artboard.width_px}×{artboard.height_px} px"
             f" · {physical.width_mm:.1f} mm @ {physical.target_dpi} dpi"
         )
+
+    def _on_artboard_resize_preview(self, width_px: int, height_px: int) -> None:
+        """グリップドラッグ中の寸法をステータスバーに出す（確定時は通常表示へ戻す）。
+
+        ドラッグ中はモデルを変えない設計なので `sceneRectChanged` も
+        `_on_undo_index_changed` も飛ばず、パネル/ステータスバーは自力では追従しない。
+        確定後は `_on_undo_index_changed` 経由でアートボードフォームが mm/px 両方追従する。
+        """
+        if width_px < 0 or height_px < 0:
+            self._update_artboard_label()
+            return
+        self._artboard_label.setText(f"{width_px}×{height_px} px")
 
     # ------------------------------------------------------------------
     # メニュー構築

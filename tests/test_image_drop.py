@@ -137,6 +137,9 @@ def test_drag_enter_and_drop_emit_signal(window: Any, tmp_path: Path, qapp: Any)
 def test_dropped_image_centers_at_drop_point_and_is_undoable(window: Any, tmp_path: Path) -> None:
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    # 保存済みプロジェクトで作業中という状態に忠実にする（項目9のアートボード
+    # 自動フィットは project_dir が None の未保存ドキュメントだけに働くため）。
+    window._project_dir = str(proj)
     png = tmp_path / "src.png"
     _make_png(png)
 
@@ -160,6 +163,7 @@ def test_dropped_image_centers_at_drop_point_and_is_undoable(window: Any, tmp_pa
 def test_multiple_dropped_images_are_offset(window: Any, tmp_path: Path) -> None:
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    window._project_dir = str(proj)  # 保存済みプロジェクト作業中に忠実にする（項目9）
     p1, p2 = tmp_path / "a.png", tmp_path / "b.png"
     _make_png(p1)
     _make_png(p2)
@@ -190,6 +194,7 @@ def test_import_fits_view_to_image(window: Any, tmp_path: Path) -> None:
     """取り込み後、ビューが画像へズームフィットする（画像全体が見え、拡大される）。"""
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    window._project_dir = str(proj)  # 保存済みプロジェクト作業中に忠実にする（項目9）
     png = tmp_path / "src.png"
     _make_png(png)  # 40x30（アートボード 1920x1080 より十分小さい）
 
@@ -210,6 +215,7 @@ def test_fit_clamps_zoom_for_tiny_image(window: Any, tmp_path: Path) -> None:
     """極小画像でも MAX_ZOOM を超えず、画像中心にセンタリングされる。"""
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    window._project_dir = str(proj)  # 保存済みプロジェクト作業中に忠実にする（項目9）
     png = tmp_path / "tiny.png"
     _make_png(png, w=4, h=3)
 
@@ -366,6 +372,10 @@ def test_drop_signal_wiring_end_to_end(window: Any, tmp_path: Path, qapp: Any) -
     """
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    # 保存済みプロジェクトで作業中に忠実にする（項目9の自動フィットは project_dir が
+    # None の未保存ドキュメントだけに働く。これが無いと 1 枚目のドロップでアートボードが
+    # 画像寸法へ縮み、下記の厳密な座標一致が崩れる。契約の表に無いが同じ原則の適用）。
+    window._project_dir = str(proj)
     png = tmp_path / "a.png"
     _make_png(png)
     expected = window.view.mapToScene(QPoint(100, 120))
@@ -396,6 +406,7 @@ def test_menu_import_action_places_center_and_fits(
     """メニュー経路（import_image_action）: アートボード中央配置＋ビューフィット。"""
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    window._project_dir = str(proj)  # 保存済みプロジェクト作業中に忠実にする（項目9）
     png = tmp_path / "a.png"
     _make_png(png)
     monkeypatch.setattr(
@@ -426,6 +437,10 @@ def test_offboard_drop_is_clamped_and_stays_visible(window: Any, tmp_path: Path)
     """
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    # このテストは既定アートボード(1920x1080)を前提にクランプ挙動を検証したい。
+    # project_dir を保存済み扱いにして項目9の自動フィットを避け、意図を明示する
+    # （自動フィットが働くと画像サイズにアートボードごと縮んでしまい別の検証になる）。
+    window._project_dir = str(proj)
     png = tmp_path / "src.png"
     _make_png(png)
     for _ in range(6):
@@ -480,6 +495,7 @@ def test_broken_file_leaves_no_orphan_and_aggregates_errors(
     """壊れたファイルは assets/ に孤児複製を残さず、エラーは 1 ダイアログに集約される。"""
     proj = tmp_path / "proj"
     save_document(window.scene.document, str(proj))
+    window._project_dir = str(proj)  # 保存済みプロジェクト作業中に忠実にする（項目9・レビュー所見）
     png = tmp_path / "good.png"
     _make_png(png)
     bad = tmp_path / "bad.png"

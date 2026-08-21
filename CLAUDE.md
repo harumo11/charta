@@ -415,6 +415,42 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
   Qt はその項目（編集メニュー内の同名項目）を常にサブメニュー扱いにしてクリックで
   `triggered` を出さなくなるため。
 
+### 9.8 アートボードの自動フィットと直接リサイズ（2026-08-21 追加。項目9・10）
+
+**px を変えたら dpi 維持・mm を再計算**（ユーザー決定）。`artboard_pixel_size` が書き出し px を
+`mm/25.4*dpi` で出すため、mm をその逆算で置いたときだけ「**アートボード px = 書き出し px**」が
+成立する。換算は `app/model/document.py` の `px_from_mm` / `mm_from_px` / `clamp_artboard_px` /
+`artboard_with_pixel_size`（Qt 非依存）に一本化した（以前は同じ式が 5 箇所にコピーされていた）。
+適用範囲は **px を変える経路だけ**: 初回画像の自動フィット / 紙のグリップ / 右パネルの px スピン。
+**mm・dpi の手入力は px を変えない**（入稿寸法の指定を尊重し、キャンバスを勝手に拡縮しないため。
+この場合だけ px ≠ 書き出し px に戻る）。既定アートボード（1920px / 170mm @ 300dpi = 2008px）と
+既存プロジェクトの不整合は**そのまま残す**（既定を直すと新規ドキュメント全部の書き出し寸法が変わる）。
+
+- **初回画像でアートボードを合わせる**（`ImageImportController`）: 「まだ何も始まっていない空
+  ドキュメント」に限り、画像を原寸で (0,0) に置きアートボードを画像の px に合わせる
+  （`SetArtboardCommand` → `AddObjectCommand` の **1 undo マクロ**）。発火条件は
+  `objects` が空 / `next_id == 1` / `undo_stack.index() == 0` / `project_dir is None` の 4 つすべて。
+  `document.base_dir` は判定に使えない（未保存でも一時ディレクトリが黙って入る）。
+  `undo_stack.count()` ではなく `index()` を見るのは、複数同時ドロップの外側マクロが開いた時点で
+  `count()` が 1 個分予約されてしまい 1 枚目が常に不発になるため。
+  **アートボードを先に変えれば `compute_default_size` の縮小はバイパス不要**（収まるなら原寸を
+  返す実装なので原寸がそのまま返る）。巨大画像は `ARTBOARD_PX_MAX` 以内へ**アスペクト維持で**縮める。
+  `import_image_file(..., autofit_artboard=False)` の**既定 False は必須**——エージェントの
+  `place_image` が同じ関数を呼ぶので、既定を True にすると明示 `set_artboard` を持つ
+  クライアントの期待と衝突する（人間経路の 2 つだけが True を渡す）。
+- **紙の右下グリップでドラッグリサイズ**（`CanvasView`）: グリップは
+  **`CanvasView.drawForeground`** に描く。`drawBackground` に置くとアートボード全面を占める画像
+  （項目9 の主要ケース）に隠れ、シーンに item として置くと `scene.render()` 経由で
+  PNG/PDF/SVG に写り込む。`scene.render()` はビューの `drawForeground` を呼ばないので
+  構造的に書き出しへ漏れない（**`super().drawForeground()` を必ず先に呼ぶこと**——既定実装が
+  `scene.drawForeground`＝スナップガイドへ委譲している）。ドラッグ中は**モデルも `sceneRect` も
+  変えず破線プレビューだけ**を描き、release で `SetArtboardCommand` を 1 個 push する
+  （寸法が変わっていなければ push しない）。サイズはデバイス px 固定（ズーム非依存）、
+  Shift で開始時の縦横比維持、下限は UI 側の 16px、上限は `ARTBOARD_PX_MAX`。
+  crop / SAM3 マスク / ノード編集 / テキスト編集中は**押下も hover もアイコン描画も**抑止する
+  （反応しないのに操作できそうに見えるのはアフォーダンスの嘘）。`ZoomPill` と重なる位置では出さない
+  （浮遊ウィジェットがクリックを食う）。
+
 ### 9.7 環境設定（Preferences）とカラーパレット（2026-08-15 追加）
 
 `project.json`（プロジェクト固有）とは別に、**プロジェクトを跨いで生きるユーザー

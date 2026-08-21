@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -22,13 +22,15 @@ from PySide6.QtGui import (
     QTransform,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QGraphicsView
+from PySide6.QtWidgets import QGraphicsView, QWidget
 
+from app.commands.commands import SetArtboardCommand
+from app.model.document import ARTBOARD_PX_MAX, artboard_with_pixel_size
 from app.scene.canvas_scene import CanvasScene
 
 # 純データ（tokens）にのみ依存する。`app.ui.theme`（QApplication 依存の `apply_theme` を
 # 含むパッケージ）を経由すると app/scene → app/ui への逆依存が不要に重くなるため。
-from app.ui.theme.tokens import current_theme
+from app.ui.theme.tokens import Theme, current_theme
 
 if TYPE_CHECKING:
     from app.tools.tool_manager import ToolManager
@@ -39,6 +41,15 @@ class CanvasView(QGraphicsView):
 
     MIN_ZOOM = 0.1
     MAX_ZOOM = 20.0
+
+    # 紙の右下グリップ（項目10）。サイズ/パッド/インセットはいずれもデバイス px 固定
+    # （ズーム非依存。`_grip_rect_viewport` が scene→viewport の1点変換の後、
+    # 固定 px のオフセットだけで矩形を組み立てるため）。
+    _GRIP_SIZE_PX = 14
+    _GRIP_HIT_PAD_PX = 5  # 見た目より広いヒット領域（高ズーム時に1pxの狙いを要求しない）
+    _GRIP_INSET_PX = 3  # 紙の角に食い込ませて「紙の角」として読ませる
+    # ARTBOARD_PX_MIN(=1) だと 1x1 まで潰せて画面から消えるため、UI 側で別途下限を設ける。
+    _ARTBOARD_DRAG_MIN_PX = 16
 
     # 画像 D&D で受け付ける拡張子（import_image_action のファイルフィルタと揃える）
     IMAGE_DROP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -51,6 +62,9 @@ class CanvasView(QGraphicsView):
     cursor_moved = Signal(QPointF)
     #: キャンバス右クリック（scene座標, globalPos）。crop/マスク編集中・操作中は emit しない。
     context_menu_requested = Signal(QPointF, QPoint)
+    #: グリップドラッグ中の寸法プレビュー(width_px, height_px)。確定/キャンセル時は
+    #: (-1, -1) を emit してステータスバー表示を通常へ戻す合図にする。
+    artboard_resize_preview = Signal(int, int)
 
     def __init__(self, scene: CanvasScene) -> None:
         super().__init__(scene)
@@ -60,6 +74,16 @@ class CanvasView(QGraphicsView):
         self._space_panning = False
         self._middle_panning = False
         self._pre_pan_drag_mode = QGraphicsView.DragMode.RubberBandDrag
+
+        # 紙の右下グリップ（項目10）のドラッグ状態。`_grip_drag_origin_px` が
+        # None でない間だけ「ドラッグ中」（Esc/click-without-move の判定に使う）。
+        self._grip_drag_origin_px: tuple[int, int] | None = None
+        self._grip_preview_px: tuple[int, int] | None = None
+        # 押下位置と紙の角のズレ(scene単位)。`_begin_grip_drag`/`_update_grip_drag`
+        # 参照（項目10レビュー major 所見: オフセット未補正だと押下直後の1pxの
+        # 手ぶれで寸法が押下位置へ飛んでしまう）。
+        self._grip_grab_offset: tuple[float, float] | None = None
+        self._grip_hover: bool = False
 
         self.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform
@@ -119,6 +143,369 @@ class CanvasView(QGraphicsView):
         painter.restore()
 
         scene.drawBackground(painter, rect)
+
+    # -- 紙の右下グリップ（項目10: ドラッグでアートボードをリサイズ） -------------
+    #
+    # シーン item ではなくビュー側に置く（実装場所の判断は契約参照）: `scene.render()`
+    # は `QGraphicsItem` を必ず描くため、シーンに置くと PNG/PDF/SVG/エージェントの
+    # `render_canvas` 等の全経路で hide し忘れない保証が要る。ビュー側なら
+    # `scene.render()` が `view.drawForeground` を呼ばないという Qt の性質
+    # （前提1）により構造的に書き出しへ写り込まない。
+
+    def _zoom_pill_viewport_rect(self) -> QRect | None:
+        """ZoomPill（右下の浮遊ズームピル）の viewport 座標矩形。無ければ None。
+
+        `app.ui.overlays` は本モジュールに依存する向き（`ZoomPill` が `CanvasView` を
+        受け取って `view.viewport()` の子になる）なので、ここから import すると
+        逆向きの循環になる。`objectName("zoomPill")` でダックタイピング検出する。
+        """
+        for child in self.viewport().children():
+            if isinstance(child, QWidget) and child.objectName() == "zoomPill":
+                return child.geometry()
+        return None
+
+    def _grip_blocked_by_zoom_pill(self) -> bool:
+        """退避してもなお ZoomPill と重なるなら True（描画・ヒット判定を両方抑止）。
+
+        通常は `_grip_rect_viewport()` 自身が重なりを検知して紙の右辺沿いに
+        上へ退避するため（項目10レビュー major 所見: 全面抑止だと取り込み直後
+        （＝紙の角がビューポート角に一致する既定状態）で常にグリップが消え、
+        新機能のアフォーダンスが既定状態で不可視になっていた）、ここに来るのは
+        退避後もなお重なる異常系（極小ビューポート等）だけ。`isVisible()` は
+        見ない: offscreen 実行では常に非可視になり判定できなくなる上、実行環境でも
+        「見えないのに当たり判定だけ働く／見えるのに働かない」という不整合を
+        生む余地があるため、幾何の重なりだけで判定する。
+        """
+        pill_rect = self._zoom_pill_viewport_rect()
+        if pill_rect is None:
+            return False
+        return pill_rect.intersects(self._grip_hit_rect_viewport())
+
+    def _grip_rect_viewport(self) -> QRect:
+        """紙の右下角のグリップ矩形（viewport 座標、常にデバイス px 固定サイズ）。
+
+        ドラッグ中は `_grip_preview_px`（プレビュー寸法）の角を参照する。sceneRect
+        自体はドラッグ中は変えない設計（ライブプレビュー方式）なので、参照点を
+        ここで追従させないと掴んだ角がドラッグ中に画面上でずれてしまう。
+
+        ZoomPill と重なる場合は隠す代わりに紙の右辺沿いに上へ退避させる
+        （項目10レビュー major 所見）。`fit_to_rect(margin_ratio=0.0)` で紙の
+        右下角がビューポート右下角に一致する取り込み直後の既定状態では、
+        ZoomPill（同じ右下アンカー）と常に重なってしまい、退避なしだと
+        グリップが最も使いたい場面で恒久的に消える。
+        """
+        scene = self.scene()
+        if scene is None:
+            return QRect()
+        if self._grip_preview_px is not None:
+            w, h = self._grip_preview_px
+            corner_scene = QPointF(float(w), float(h))
+        else:
+            corner_scene = scene.sceneRect().bottomRight()
+        corner = self.mapFromScene(corner_scene)
+        size = self._GRIP_SIZE_PX
+        inset = self._GRIP_INSET_PX
+        pad = self._GRIP_HIT_PAD_PX
+        rect = QRect(corner.x() - inset - size, corner.y() - inset - size, size, size)
+        pill_rect = self._zoom_pill_viewport_rect()
+        if pill_rect is not None:
+            hit_rect = rect.adjusted(-pad, -pad, pad, pad)
+            if pill_rect.intersects(hit_rect):
+                # 退避量は ZoomPill の高さからではなく、ヒット領域の下端と
+                # ZoomPill の上端の実際の隙間から幾何的に導く（項目10レビュー
+                # major 所見・実測で確定: `pill.height() + 8` 式は本物の
+                # ZoomPill(134×30) では退避後もなお ~6px 重なってしまい、
+                # 取り込み直後の主要ケース（紙の角=ビューポート角）でグリップが
+                # 恒久的に消えていた。ZoomPill は紙の角より上に浮いて配置される
+                # ため、単純に「ピルの高さ」を退避量にすると、ピルの下端と紙の角
+                # の間の隙間の分だけ退避不足になる）。この式なら退避後は
+                # ヒット領域の下端が ZoomPill の上端の 8px 上に来ることが幾何的に
+                # 保証され、ZoomPill の実サイズに依存しない。
+                gap = 8
+                shift = hit_rect.bottom() - pill_rect.top() + gap + 1
+                shifted = rect.translated(0, -shift)
+                viewport_rect = self.viewport().rect()
+                if shifted.top() >= viewport_rect.top():
+                    rect = shifted
+                # else: 退避先が画面上端を越えるほど狭い（極小ビューポート等）
+                # 場合は退避せず元の位置に留まり、`_grip_blocked_by_zoom_pill`
+                # が重なりを検知して従来どおり抑止するフォールバックへ委ねる。
+        return rect
+
+    def _grip_hit_rect_viewport(self) -> QRect:
+        """グリップのヒット領域（見た目より広い。高ズーム時に1pxの狙いを要求しない）。"""
+        pad = self._GRIP_HIT_PAD_PX
+        return self._grip_rect_viewport().adjusted(-pad, -pad, pad, pad)
+
+    def _grip_edit_mode_blocks(self) -> bool:
+        """4 つの編集モード（crop/mask/ノード編集/テキスト編集）のいずれかがアクティブか。
+
+        アクティブ中はここで割り込まない: それぞれの「外側クリックで確定」という
+        既存の確立した優先度を譲らないため、モード解除は各専用ハンドラに任せる
+        （`mousePressEvent` 側で `_is_grip_press` はそれらの commit-on-outside-press
+        判定の**後**に呼ばれる）。押下だけでなく hover 判定・グリップの見た目
+        （アイコン描画）もこれで揃えて抑止する。押しても反応せず、hover しても
+        カーソルが変わらないのに絵だけ出ている、というアフォーダンスの嘘を防ぐため。
+        """
+        return (
+            self._active_crop_item() is not None
+            or self._active_mask_session() is not None
+            or self._active_node_edit_item() is not None
+            or self._active_text_edit_item() is not None
+        )
+
+    def _is_over_grip(self, pos: QPoint) -> bool:
+        """viewport 座標 `pos` がグリップのヒット領域内か。
+
+        編集モード中・ZoomPill 重なり中はグリップが存在しないものとして扱う。
+        """
+        if self.scene() is None:
+            return False
+        if self._grip_edit_mode_blocks():
+            return False
+        if self._grip_blocked_by_zoom_pill():
+            return False
+        return self._grip_hit_rect_viewport().contains(pos)
+
+    def _is_grip_press(self, event: QMouseEvent) -> bool:
+        """紙の右下グリップへの押下か判定する。
+
+        選択中オブジェクトのリサイズハンドル（`handles.py` の `_HandleItem`）が
+        カーソル位置に居るなら、グリップではなくハンドルへ譲る（項目10レビュー
+        major 所見）。アートボード全面のオブジェクト（=項目9の自動フィットが
+        作る既定形）では br ハンドルが紙の角ちょうどに来るため、譲らないと
+        「取り込んだ画像を右下ハンドルで縮める」という基本操作が効かなくなる。
+        `_HandleItem` は private のため import せず、`role` 属性の有無で
+        ダックタイピングする（`role` を持つのはハンドルだけ）。
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        if self._space_panning or self._middle_panning:
+            return False
+        pos = event.position().toPoint()
+        if not self._is_over_grip(pos):
+            return False
+        scene = self.scene()
+        if scene is not None:
+            hit = scene.itemAt(self.mapToScene(pos), self.transform())
+            if getattr(hit, "role", None) is not None:
+                return False
+        return True
+
+    def _begin_grip_drag(self, event: QMouseEvent) -> None:
+        """グリップドラッグを開始する。開始時点の寸法を `_grip_drag_origin_px` に記録する。
+
+        押下位置と紙の角とのズレを `_grip_grab_offset` に保存する（項目10レビュー
+        major 所見）。グリップのヒット領域は見た目より広い（`_GRIP_HIT_PAD_PX`）
+        ため、角そのものではなく領域内のどこを押しても始められる。このオフセットを
+        `_update_grip_drag` で足し戻さないと、押下直後にマウスが 1px 動いただけで
+        「押下位置」へ寸法が飛んでしまう（押下位置と角の距離ぶん、紙が瞬時に
+        縮む/伸びる）。
+        """
+        scene = self.scene()
+        if scene is None:
+            return
+        rect = scene.sceneRect()
+        origin = (round(rect.width()), round(rect.height()))
+        self._grip_drag_origin_px = origin
+        self._grip_preview_px = origin
+        press_scene = self.mapToScene(event.position().toPoint())
+        self._grip_grab_offset = (rect.width() - press_scene.x(), rect.height() - press_scene.y())
+        self._grip_hover = True
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.viewport().update()
+
+    def _clamp_drag_dim(self, value: float) -> int:
+        lower = float(self._ARTBOARD_DRAG_MIN_PX)
+        upper = float(ARTBOARD_PX_MAX)
+        return int(round(max(lower, min(upper, value))))
+
+    def _clamp_drag_dims_preserving_aspect(self, width: float, height: float) -> tuple[int, int]:
+        """Shift ドラッグ用: 単一スケールでクランプし、上限/下限到達時も縦横比を保つ。
+
+        軸ごとに独立クランプ（`_clamp_drag_dim`）すると、片方が先に上限/下限へ
+        当たった瞬間に比が崩れる（16:9 を Shift で上限まで引くと 1:1 になる等、
+        項目10レビュー minor 所見）。`_autofit_pixel_size`（image_import.py）と
+        同じ発想で、まず単一スケールで上限に収め、次に単一スケールで下限まで
+        持ち上げてから丸める。
+        """
+        lower = float(self._ARTBOARD_DRAG_MIN_PX)
+        upper = float(ARTBOARD_PX_MAX)
+        width = max(width, 1e-6)
+        height = max(height, 1e-6)
+        scale = min(1.0, upper / width, upper / height)
+        width *= scale
+        height *= scale
+        scale = max(1.0, lower / width, lower / height)
+        width *= scale
+        height *= scale
+        return (
+            int(round(max(lower, min(upper, width)))),
+            int(round(max(lower, min(upper, height)))),
+        )
+
+    def _update_grip_drag(self, event: QMouseEvent) -> None:
+        """マウス位置をアートボード px に換算し、プレビュー寸法を更新する（モデル非変更）。
+
+        アートボードの原点は常に scene 座標 (0, 0) のため、右下角の候補寸法は
+        本来「マウスの scene 座標」だが、`_grip_grab_offset`（押下位置と角の
+        ズレ）を足し戻すことで「押下位置からの相対移動」に揃える（項目10レビュー
+        major 所見）。
+        """
+        if self._grip_drag_origin_px is None:
+            return
+        scene_pos = self.mapToScene(event.position().toPoint())
+        offset_x, offset_y = self._grip_grab_offset or (0.0, 0.0)
+        free_w = max(0.0, scene_pos.x() + offset_x)
+        free_h = max(0.0, scene_pos.y() + offset_y)
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            w0, h0 = self._grip_drag_origin_px
+            if h0 > 0:
+                aspect = w0 / h0
+                # `_aspect_resize_edges`（handles.py, role="br"）と同じ語彙:
+                # 開始時点の縦横比を保ち、自由な幅・高さの大きい方に合わせる。
+                free_w = max(free_w, free_h * aspect)
+                free_h = free_w / aspect
+            width_px, height_px = self._clamp_drag_dims_preserving_aspect(free_w, free_h)
+        else:
+            width_px = self._clamp_drag_dim(free_w)
+            height_px = self._clamp_drag_dim(free_h)
+        self._grip_preview_px = (width_px, height_px)
+        self.artboard_resize_preview.emit(width_px, height_px)
+        self.viewport().update()
+
+    def _commit_grip_drag(self) -> bool:
+        """ドラッグを確定し、寸法が変わっていれば `SetArtboardCommand` を1個 push する。
+
+        push したら True、クリックのみ（寸法不変）で push しなければ False。
+        比較は px タプルのみで行う（mm は px からの逆算値のため、`Artboard` を
+        丸ごと比較すると丸め誤差で「クリックのみなのに変化あり」と誤判定しかねない）。
+        """
+        origin = self._grip_drag_origin_px
+        preview = self._grip_preview_px
+        self._grip_drag_origin_px = None
+        self._grip_preview_px = None
+        self._grip_grab_offset = None
+        self.artboard_resize_preview.emit(-1, -1)
+        self.viewport().update()
+        if origin is None or preview is None or preview == origin:
+            return False
+        scene = self.scene()
+        if scene is None or scene.undo_stack is None:
+            return False
+        document = scene.document
+        old_artboard = document.artboard
+        new_artboard = artboard_with_pixel_size(old_artboard, float(preview[0]), float(preview[1]))
+        scene.undo_stack.push(
+            SetArtboardCommand(
+                document, new_artboard, old_artboard, text="アートボードのサイズ変更"
+            )
+        )
+        return True
+
+    def _cancel_grip_drag(self) -> None:
+        """ドラッグをモデル変更なしで中止する（Esc、または自己修復のための強制終了）。"""
+        if self._grip_drag_origin_px is None:
+            return
+        self._grip_drag_origin_px = None
+        self._grip_preview_px = None
+        self._grip_grab_offset = None
+        self.artboard_resize_preview.emit(-1, -1)
+        self.viewport().update()
+
+    def _update_grip_cursor(self, pos: QPoint) -> None:
+        """グリップ上でカーソルを SizeFDiag に切り替える（外れたら既定へ戻す）。"""
+        hovering = self._is_over_grip(pos)
+        if hovering == self._grip_hover:
+            return
+        self._grip_hover = hovering
+        if hovering:
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        else:
+            self.unsetCursor()
+        self.viewport().update()
+
+    def _draw_grip_icon(self, painter: QPainter, theme: Theme) -> None:
+        """紙の角に食い込む小さな角丸四角＋斜め2本線のグリップアイコンを描く。"""
+        rect = self._grip_rect_viewport()
+        active = self._grip_hover or self._grip_drag_origin_px is not None
+        line_color = QColor(theme.accent) if active else QColor(theme.border_strong)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(theme.s2))
+        painter.drawRoundedRect(QRectF(rect), 3.0, 3.0)
+
+        pen = QPen(line_color)
+        pen.setWidthF(1.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        pad = 3.0
+        left, top = rect.left() + pad, rect.top() + pad
+        right, bottom = rect.right() - pad, rect.bottom() - pad
+        span_x, span_y = right - left, bottom - top
+        painter.drawLine(QPointF(right, top + span_y * 0.55), QPointF(left + span_x * 0.45, bottom))
+        painter.drawLine(QPointF(right, top + span_y * 0.15), QPointF(left + span_x * 0.15, bottom))
+
+    def _draw_drag_preview(self, painter: QPainter, theme: Theme) -> None:
+        """ドラッグ中の破線プレビュー矩形と寸法テキストを描く（sceneRect 自体は変えない）。"""
+        if self._grip_preview_px is None:
+            return
+        w, h = self._grip_preview_px
+        top_left = self.mapFromScene(QPointF(0.0, 0.0))
+        bottom_right = self.mapFromScene(QPointF(float(w), float(h)))
+        preview_rect = QRectF(QPointF(top_left), QPointF(bottom_right)).normalized()
+
+        pen = QPen(QColor(theme.accent))
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setWidthF(1.5)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(preview_rect)
+
+        label = f"{w} × {h} px"
+        metrics = painter.fontMetrics()
+        text_rect = QRectF(metrics.boundingRect(label)).adjusted(-6.0, -3.0, 6.0, 3.0)
+        text_rect.moveBottomRight(
+            QPointF(
+                bottom_right.x() - self._GRIP_INSET_PX,
+                bottom_right.y() - self._GRIP_INSET_PX - self._GRIP_SIZE_PX - 4.0,
+            )
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(theme.s2))
+        painter.drawRoundedRect(text_rect, 3.0, 3.0)
+        painter.setPen(QColor(theme.fg))
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, label)
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        """紙の右下グリップ（ドラッグリサイズのアフォーダンス、項目10）を描く。
+
+        `super().drawForeground()` を必ず先に呼ぶ: 既定実装が
+        `CanvasScene.drawForeground`（スナップガイド）へ委譲しているため、
+        省略するとスナップガイドが画面から消える（`tests/test_artboard_grip_resize.py`
+        の `test_view_foreground_still_draws_scene_snap_guides` で固定）。
+        """
+        super().drawForeground(painter, rect)
+        scene = self.scene()
+        if scene is None:
+            return
+        theme = current_theme()
+        painter.save()
+        painter.setWorldMatrixEnabled(False)
+        if self._grip_drag_origin_px is not None and self._grip_preview_px is not None:
+            self._draw_drag_preview(painter, theme)
+        if not self._grip_blocked_by_zoom_pill() and not self._grip_edit_mode_blocks():
+            self._draw_grip_icon(painter, theme)
+        painter.restore()
+
+    def leaveEvent(self, event: QEvent) -> None:
+        """viewport の外へマウスが出たら、グリップの hover とカーソルを戻す。"""
+        if self._grip_hover and self._grip_drag_origin_px is None:
+            self._grip_hover = False
+            self.unsetCursor()
+            self.viewport().update()
+        super().leaveEvent(event)
 
     # -- ShortcutOverride ガード ----------------------------------------------
 
@@ -291,6 +678,17 @@ class CanvasView(QGraphicsView):
         if self._handle_crop_key(event):
             return
         if self._handle_node_edit_key(event):
+            return
+        # curve 下書きの Esc/Enter より前に置く（項目10レビュー minor 所見）:
+        # 4 つの編集モード（上記）はグリップと共存できない（`_grip_edit_mode_blocks`
+        # がグリップ側で先に締め出す）が、curve 下書きだけは tool_manager 側の
+        # 状態でありグリップと共存し得る。ここより後ろだと Esc が
+        # `_handle_curve_draft_key` に先に取られ、curve 下書きだけがキャンセルされて
+        # グリップドラッグが生き残り、直後の release でアートボードが確定してしまう
+        # （ユーザーは「キャンセルした」つもりなのにモデルが変わる静かな破綻）。
+        if self._grip_drag_origin_px is not None and event.key() == Qt.Key.Key_Escape:
+            self._cancel_grip_drag()
+            event.accept()
             return
         if self._handle_curve_draft_key(event):
             return
@@ -513,7 +911,10 @@ class CanvasView(QGraphicsView):
         `context_menu_requested` を emit。
 
         マスク編集は右ドラッグ=負例ボックスに使うため、右クリックメニューを出さない。
-        ノード編集中の右クリックはノード削除に使うため同様に無視する。curve 下書き中に
+        ノード編集中の右クリックはノード削除に使うため同様に無視する。グリップ
+        ドラッグ中も無視する（項目10レビュー major 所見: モーダルメニューが
+        ポップアップグラブを取ると左リリースが届かずドラッグがゾンビ化するため、
+        そもそも開かせない）。curve 下書き中に
         右クリックで確定した直後は、Qt が press の後に合成する QContextMenuEvent を
         1 回だけ抑止する（`consume_context_menu_suppression`。`is_interacting()` の
         判定より前に消費すること — 確定処理で下書きは既に無くなっているため）。
@@ -535,6 +936,7 @@ class CanvasView(QGraphicsView):
             or self._active_mask_session() is not None
             or self._active_node_edit_item() is not None
             or self._active_text_edit_item() is not None
+            or self._grip_drag_origin_px is not None
         ):
             event.ignore()
             return
@@ -628,6 +1030,15 @@ class CanvasView(QGraphicsView):
         if self._commit_node_edit_on_outside_press(event):
             return
 
+        # グリップは紙の外側の chrome 的アフォーダンスであり、ラバーバンド選択や
+        # 描画ツールに食われてはいけないため、tool_manager への委譲より前で奪う
+        # （4つの編集モードの「外側クリックで確定」は上記で既に処理済みなので、
+        # その確立した優先度は譲っていない）。
+        if self._is_grip_press(event):
+            self._begin_grip_drag(event)
+            event.accept()
+            return
+
         if self.tool_manager is not None:
             scene_pos = self.mapToScene(event.pos())
             if self.tool_manager.handle_mouse_press(event, scene_pos):
@@ -666,6 +1077,24 @@ class CanvasView(QGraphicsView):
             event.accept()
             return
 
+        if self._grip_drag_origin_px is not None:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self._update_grip_drag(event)
+                event.accept()
+                return
+            # 左ボタンの release を取りこぼした自己修復（項目10レビュー major 所見）:
+            # モーダルなコンテキストメニューがポップアップグラブを取ると、押しっぱなしの
+            # 左リリースがビューへ届かないままドラッグ状態だけが生き残り、次の無関係な
+            # 左クリックで意図しない `SetArtboardCommand` が push される。ここで
+            # 「押されているはずの左ボタンが実際には離れている」ことを検知し、
+            # モデル変更なしで黙ってキャンセルする。
+            self._cancel_grip_drag()
+        # ドラッグ中でない間だけ hover カーソルを再評価する。他のボタンドラッグ
+        # （ラバーバンド選択・図形の描画等）がグリップの上を通過しただけで
+        # カーソルが SizeFDiag に化けないようにするため。
+        if event.buttons() == Qt.MouseButton.NoButton:
+            self._update_grip_cursor(event.position().toPoint())
+
         if self.tool_manager is not None:
             scene_pos = self.mapToScene(event.pos())
             if self.tool_manager.handle_mouse_move(event, scene_pos):
@@ -687,6 +1116,14 @@ class CanvasView(QGraphicsView):
             self._middle_panning = False
             if not self._space_panning:
                 self._end_temp_pan()
+            event.accept()
+            return
+
+        if self._grip_drag_origin_px is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._commit_grip_drag()
+            # release 位置がまだグリップ上なら hover/カーソルを保ったままにする
+            # （そうしないと次の mouseMove まで既定カーソルへ戻ってちらつく）。
+            self._update_grip_cursor(event.position().toPoint())
             event.accept()
             return
 

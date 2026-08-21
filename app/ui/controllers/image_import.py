@@ -18,8 +18,9 @@ from PIL import Image
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-from app.commands.commands import AddObjectCommand
+from app.commands.commands import AddObjectCommand, SetArtboardCommand
 from app.graphics.image_pipeline import compute_default_size
+from app.model.document import ARTBOARD_PX_MAX, artboard_with_pixel_size
 from app.model.objects import BaseObject, ImageObject
 from app.model.serialize import import_image
 
@@ -41,6 +42,21 @@ def _clamp_span(pos: float, size: float, bound: float) -> float:
 
 def _object_rect(obj: BaseObject) -> QRectF:
     return QRectF(obj.x, obj.y, obj.width, obj.height)
+
+
+def _autofit_pixel_size(width_px: float, height_px: float) -> tuple[float, float]:
+    """自動フィット用に画像 px をアートボード上限内へ収める（縦横比を維持）。
+
+    `artboard_with_pixel_size` 内部の `clamp_artboard_px` は縦横を独立にクランプ
+    するため、片方だけ上限を超える巨大画像（例: 40000x20000）を渡すと比が崩れる
+    （20000x20000 になってしまう）。自動フィットは「取り込んだ画像に見た目を
+    合わせる」操作である以上ここだけは縦横比維持を優先し、渡す前に
+    `scale = min(MAX/w, MAX/h)` で縮小しておく。
+    """
+    if width_px <= ARTBOARD_PX_MAX and height_px <= ARTBOARD_PX_MAX:
+        return width_px, height_px
+    scale = min(ARTBOARD_PX_MAX / width_px, ARTBOARD_PX_MAX / height_px)
+    return width_px * scale, height_px * scale
 
 
 class ImageImportController:
@@ -82,18 +98,66 @@ class ImageImportController:
             document.base_dir = self._window._temp_autosave_path()
         return True
 
+    def _should_autofit_artboard(self) -> bool:
+        """「まだ何も始まっていない空ドキュメント」だけで自動調整する。
+
+          - len(document.objects) == 0      … 図がまだ無い
+          - document.next_id == 1           … id を 1 つも払い出していない（消した跡も無い）
+          - undo_stack.index() == 0         … アートボード設定・スタイル登録すら未実施
+          - project_io.project_dir is None  … 保存済みプロジェクトを開いたのではない
+
+        `document.base_dir` は判定に使えない（未保存でも `_ensure_base_dir_for_import` が
+        一時ディレクトリを黙って入れる）。dirty フラグは存在しないため
+        「まだ何も操作していない」の代理として undo スタックの状態を使う。
+
+        `count()` ではなく `index()` を見るのは、`QUndoStack.beginMacro()` が
+        まだ 1 つも子コマンドを push していない時点で `count()` を直ちに 1 個分
+        予約してしまうため（前提3・実測確認済み）。`_import_dropped_images` は
+        複数ファイル同時ドロップを 1 undo に集約するため呼び出し前に外側マクロを
+        開いており、`count()==0` のままだと 1 枚目の自動フィットが常に不発になる。
+        `index()` はマクロが確定（`endMacro()` 完了）するまで動かないため、
+        「外側マクロを開いただけでまだ何も確定していない」を正しく 0 のまま読める。
+        一方で実際に確定済みのコマンドが 1 つでもあれば `index()` は必ず動くため、
+        アートボード設定・スタイル登録済みのドキュメントは変わらず対象外になる。
+        保存済みの空プロジェクトを除外するのは、ユーザーが意図して設定して保存した
+        アートボードを黙って書き換えないため。
+
+        `self._window._project_dir`（`ProjectIOController.project_dir` への
+        委譲プロパティ）を読むのは、本コントローラが `project_io` 自体を
+        保持していないため（`ExportController` も同型のニーズを
+        `lambda: self._window._project_dir` で解決しており、同じ流儀に揃えた
+        レビュー所見）。
+        """
+        document = self._scene.document
+        return (
+            len(document.objects) == 0
+            and document.next_id == 1
+            and self._undo_stack.index() == 0
+            and self._window._project_dir is None
+        )
+
     def import_image_file(
         self,
         path: str,
         center: tuple[float, float] | None = None,
         errors: list[str] | None = None,
         select: bool = True,
+        *,
+        autofit_artboard: bool = False,
     ) -> ImageObject | None:
         """1 ファイルを `assets/` に複製し `ImageObject` を追加する(成功で当該オブジェクト)。
 
         `center` はアートボード座標での配置中心（None ならアートボード中央）。
         アートボード外はスクロール到達不能になるため、画像が収まる位置へクランプする。
         `errors` を渡すと失敗をダイアログではなくそこへ蓄積する（複数取り込みの集約用）。
+
+        `autofit_artboard` は「まだ何も始まっていない空ドキュメント」への取り込み時に
+        アートボードを画像の px 寸法へ合わせるかどうか（項目9）。**既定 False が必須**:
+        この関数は `app/agent/api.py` の `place_image` からも呼ばれており、エージェントが
+        黙ってアートボードを書き換えると明示 `set_artboard` を持つクライアントの期待と
+        衝突し MCP パリティも壊れる。`True` を渡すのは人間経路の `import_image_action` /
+        `_import_dropped_images` の 2 箇所だけでよい（実際に自動調整するかは
+        `_should_autofit_artboard()` の 4 条件で最終判定する）。
 
         ダイアログを開かないヘッドレス安全な取り込み経路。外部（エージェント制御
         サーバ `app/agent/`）はこれを `errors=[]` 付きで呼ぶ。事前に
@@ -121,22 +185,49 @@ class ImageImportController:
             _fail("取り込みに失敗しました", exc)
             return None
 
-        artboard = document.artboard
-        width, height = compute_default_size(
-            src_w, src_h, float(artboard.width_px), float(artboard.height_px)
-        )
-        if center is None:
-            center = (artboard.width_px / 2.0, artboard.height_px / 2.0)
-        obj = ImageObject(
-            id=document.new_id(),
-            src=rel,
-            x=_clamp_span(center[0] - width / 2.0, width, float(artboard.width_px)),
-            y=_clamp_span(center[1] - height / 2.0, height, float(artboard.height_px)),
-            width=width,
-            height=height,
-        )
+        # マクロを開くのは import_image() 成功の後（空マクロ＝無操作の undo エントリを
+        # 残さないため）。判定は import_image 成功後の document 状態で行う
+        # （id 払い出し前なのでこの時点ではまだ 4 条件は変化しない）。
+        autofit = autofit_artboard and self._should_autofit_artboard()
+        if autofit:
+            self._undo_stack.beginMacro("画像を取り込み（アートボードを合わせる）")
+        try:
+            if autofit:
+                fit_w, fit_h = _autofit_pixel_size(float(src_w), float(src_h))
+                old_artboard = document.artboard
+                self._undo_stack.push(
+                    SetArtboardCommand(
+                        document,
+                        artboard_with_pixel_size(old_artboard, fit_w, fit_h),
+                        old_artboard,
+                        text="アートボードを画像に合わせる",
+                    )
+                )
 
-        self._undo_stack.push(AddObjectCommand(document, obj))
+            # ★ autofit で document.artboard が差し替わっている可能性があるため
+            # 必ず読み直す（読み直さないと縮小前の旧アートボード基準で配置してしまう）。
+            artboard = document.artboard
+            # 前提5: compute_default_size はアートボードに収まるなら原寸を返す。
+            # autofit 済みならアートボードは画像寸法ちょうどに揃っているため、ここで
+            # 原寸がそのまま返る（=収まる）。そのためバイパス分岐は不要。
+            width, height = compute_default_size(
+                src_w, src_h, float(artboard.width_px), float(artboard.height_px)
+            )
+            if center is None:
+                center = (artboard.width_px / 2.0, artboard.height_px / 2.0)
+            obj = ImageObject(
+                id=document.new_id(),
+                src=rel,
+                x=_clamp_span(center[0] - width / 2.0, width, float(artboard.width_px)),
+                y=_clamp_span(center[1] - height / 2.0, height, float(artboard.height_px)),
+                width=width,
+                height=height,
+            )
+
+            self._undo_stack.push(AddObjectCommand(document, obj))
+        finally:
+            if autofit:
+                self._undo_stack.endMacro()
 
         if select:
             new_item = self._scene.item_for(obj)
@@ -154,10 +245,13 @@ class ImageImportController:
         )
         if not path:
             return
-        obj = self.import_image_file(path)
+        obj = self.import_image_file(path, autofit_artboard=True)
         if obj is not None:
             # 取り込んだ画像がそのまま作業対象になるよう、ウィンドウを画像サイズへ
             # 合わせてからビューを画像へフィットさせる。
+            # ★ push（アートボード変更含む）より後でなければならない: _on_imported
+            # （_resize_window_to_fit + fit_to_rect）は新しい sceneRect を見るため、
+            # 逆にすると autofit 前の旧アートボード基準でフィットしてしまう。
             rect = _object_rect(obj)
             self._on_imported(rect)
 
@@ -193,6 +287,11 @@ class ImageImportController:
                     (scene_pos.x() + offset, scene_pos.y() + offset),
                     errors=errors,
                     select=False,
+                    # autofit_artboard=True を渡すだけでよい。複数同時ドロップの
+                    # 分岐は書かない: 2 枚目以降は最初の画像追加で
+                    # len(objects) == 1 になり `_should_autofit_artboard()` が
+                    # 自然に False を返す。
+                    autofit_artboard=True,
                 )
                 if obj is not None:
                     imported.append(obj)
@@ -203,6 +302,9 @@ class ImageImportController:
 
         if imported:
             # 取り込んだ全画像を選択し、ウィンドウを外接矩形へ合わせてからフィットさせる。
+            # ★ ループ（push を含む）の外＝すべての push が終わった後で呼ぶこと。
+            # autofit でアートボードが変わった場合、_on_imported が新しい sceneRect を
+            # 見る必要があるため、push より前に動かしてはならない。
             self._scene.clearSelection()
             rect = _object_rect(imported[0])
             for obj in imported:
