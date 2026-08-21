@@ -345,14 +345,29 @@ class ConnectorItem(BaseItem):
         """`point`（scene 座標）直下の「接続可能」な最前面 item を返す。
 
         `.obj` を持ち、type が "connector" でなく自分自身でもない `BaseItem` を探す。
-        `ToolManager._topmost_item_at`/`_pick_connectable` と同じヒットテスト方式。
+        選択とは役割を分け（項目11）、箱型図形（`live_geometry()` が
+        x/y/width/height を返す rect/ellipse/image/text/math/freehand/curve）は
+        `shape()`（辺の帯）ではなくモデルの論理 box（`logical_box_for_item`）への
+        点包含判定（`point_in_obb`）を主とする。「塗りなし矩形の内部でドロップ
+        しても接続できる」ことを保つため。line/arrow は対象外のまま従来どおり
+        `shape()` を使う（斜め線の bbox は広大／水平線は bbox の高さが 0 になり、
+        bbox 判定にすると逆に壊れるため）。`ToolManager._pick_connectable` と
+        同じ役割分担・同じ判定方式。
+
+        box 判定は `shape()`（辺の帯）と OR で合流させる（レビュー所見。
+        `ToolManager._pick_connectable` と同一の理由）: box はモデルのちょうどの
+        x/y/width/height なので、太い線の外側半分（box の外に描かれるインク）が
+        box だけでは掴めず、「選択はできるのに接続はできない」当たり判定の穴が
+        できる。OR にすることで接続可能領域が選択可能領域の上位集合になる。
         """
+        from app.graphics.boxes import point_in_obb
+
         scene_pos = QPointF(point[0], point[1])
         views = scene.views()
         transform = views[0].transform() if views else QTransform()
         items = scene.items(
             scene_pos,
-            Qt.ItemSelectionMode.IntersectsItemShape,
+            Qt.ItemSelectionMode.IntersectsItemBoundingRect,
             Qt.SortOrder.DescendingOrder,
             transform,
         )
@@ -362,7 +377,20 @@ class ConnectorItem(BaseItem):
             obj = getattr(item, "obj", None)
             if obj is None or obj.type == "connector":
                 continue
-            return item
+            live_geometry = getattr(item, "live_geometry", None)
+            geom = live_geometry() if callable(live_geometry) else {}
+            if "width" in geom and "height" in geom:
+                box = logical_box_for_item(item)
+                if box is None:
+                    continue
+                rotation = float(geom.get("rotation", 0.0))
+                if point_in_obb(point, box, rotation) or item.shape().contains(
+                    item.mapFromScene(scene_pos)
+                ):
+                    return item
+                continue
+            if item.shape().contains(item.mapFromScene(scene_pos)):
+                return item
         return None
 
     def _snap_scene_threshold(self) -> float:

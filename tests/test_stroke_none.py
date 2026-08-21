@@ -190,9 +190,22 @@ def test_pen_for_still_strokes_a_normal_line(qapp: Any) -> None:
     assert pen.style() != Qt.PenStyle.NoPen
 
 
-def test_bounding_rect_has_no_stroke_margin_when_unstroked(qapp: Any) -> None:
-    """rect/ellipse/freehand: stroke=None・stroke_width=0 のどちらでも
-    boundingRect が自然サイズ (0,0,w,h) のままで、線幅分の膨らみを持たないこと。"""
+def test_bounding_rect_keeps_a_minimum_hit_band_when_unstroked_for_rect_and_ellipse(
+    qapp: Any,
+) -> None:
+    """rect/ellipse: stroke=None・stroke_width=0 のどちらでも boundingRect は
+    自然サイズに戻らず、_MIN_HIT_WIDTH(=8.0) 由来の 4.0 の下限マージンを持つこと。
+
+    P2 契約時点では「線なしなら boundingRect は自然サイズ (0,0,w,h)」だったが、
+    P4/P5 契約の項目11（塗りなし矩形の内部素通し）で「線なしでも掴める帯を
+    残す」ことが要件になり、rect/ellipse の boundingRect はヒット判定帯の
+    下限を確保するため常に 4.0 のマージンを持つよう変更された（P2 契約の
+    ゼロマージン保証はここで撤回）。このマージンはヒット判定専用であり、
+    SVG/PDF/PNG のインク境界には影響しない
+    （`RectEllipseItem.ink_rect()` が実インク境界を別に返す。
+    `app/ui/controllers/export_controller.py` の `selected_region()` は
+    `ink_rect()` を使うため、選択範囲コピーの出力はこのマージンで膨らまない）。
+    """
     stroked = RectEllipseItem(
         RectObject(id=1, x=0.0, y=0.0, width=40.0, height=30.0, stroke="#000000", stroke_width=10.0)
     )
@@ -208,25 +221,36 @@ def test_bounding_rect_has_no_stroke_margin_when_unstroked(qapp: Any) -> None:
                 id=3, x=0.0, y=0.0, width=40.0, height=30.0, stroke="#000000", stroke_width=0.0
             )
         ),
-        FreehandItem(
-            FreehandObject(
-                id=4,
-                x=0.0,
-                y=0.0,
-                width=40.0,
-                height=30.0,
-                points=[[0.0, 0.0], [1.0, 1.0]],
-                stroke="#000000",
-                stroke_width=0.0,
-            )
-        ),
     ]
     for item in cases:
         rect = item.boundingRect()
-        assert rect.left() == pytest.approx(0.0)
-        assert rect.top() == pytest.approx(0.0)
-        assert rect.width() == pytest.approx(40.0)
-        assert rect.height() == pytest.approx(30.0)
+        assert rect.left() == pytest.approx(-4.0)
+        assert rect.top() == pytest.approx(-4.0)
+        assert rect.width() == pytest.approx(40.0 + 8.0)
+        assert rect.height() == pytest.approx(30.0 + 8.0)
+
+
+def test_bounding_rect_has_no_stroke_margin_when_unstroked_for_freehand(qapp: Any) -> None:
+    """freehand: 項目11の対象外（帯の下限を持たない）なので、P2 契約どおり
+    stroke=None・stroke_width=0 で boundingRect が自然サイズ (0,0,w,h) のまま
+    であること（未変更の回帰確認）。"""
+    item = FreehandItem(
+        FreehandObject(
+            id=4,
+            x=0.0,
+            y=0.0,
+            width=40.0,
+            height=30.0,
+            points=[[0.0, 0.0], [1.0, 1.0]],
+            stroke="#000000",
+            stroke_width=0.0,
+        )
+    )
+    rect = item.boundingRect()
+    assert rect.left() == pytest.approx(0.0)
+    assert rect.top() == pytest.approx(0.0)
+    assert rect.width() == pytest.approx(40.0)
+    assert rect.height() == pytest.approx(30.0)
 
 
 def test_curve_bounding_rect_margin_shrinks_when_unstroked(qapp: Any) -> None:

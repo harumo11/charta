@@ -17,6 +17,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
+from app.graphics.constraints import constrain_to_axis_or_diagonal
 from app.graphics.routing import Point
 
 if TYPE_CHECKING:
@@ -364,6 +365,9 @@ class BoxHandleSet:
         # 自由リサイズするが、Shift 押下中はドラッグ開始時点の縦横比を保つ。
         # 比の基準を live ではなく開始時ジオメトリに取るのは、ドラッグ途中で
         # Shift を押しても比がその瞬間の歪んだ値へ流れないようにするため。
+        # rect/ellipse の角度制約（項目2）はスコープ外: Shift は既にここで
+        # 「縦横比維持」（項目1）に割り当て済みで、同じ修飾キーに2つの意味を
+        # 持たせるとユーザーの意図が曖昧になる。
         aspect: float | None = None
         if getattr(parent, "aspect_locked", False):
             aspect_ratio_fn = getattr(parent, "aspect_ratio", None)
@@ -495,6 +499,15 @@ class EndpointHandleSet:
             return
         # LineItem の pos は常に (0,0)・rotation は常に 0 のため scene座標=ローカル座標。
         local = self.parent_item.mapFromScene(scene_pos)
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            # 反対側の端点を軸の起点にする（P4/P5契約 (A)）。基準はドラッグ開始時の
+            # モデル値(`self._old_geom`)を使う——ライブ値だと、ドラッグ途中でShiftを
+            # 押した瞬間の歪んだ位置が基準になり角度が流れる
+            # （`BoxHandleSet._drag_resize` の縦横比ロックと同じ思想）。
+            other = "p2" if role == "p1" else "p1"
+            anchor = (self._old_geom[other][0], self._old_geom[other][1])
+            constrained = constrain_to_axis_or_diagonal(anchor, (local.x(), local.y()))
+            local = QPointF(constrained[0], constrained[1])
         if role == "p1":
             self.parent_item.set_live_points(p1=[local.x(), local.y()])
         elif role == "p2":

@@ -153,10 +153,17 @@ def window(qapp: Any) -> Any:
         w.close()
 
 
-def _add_rect(window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0) -> RectObject:
+def _add_rect(
+    window: Any, x: float, y: float, w: float = 100.0, h: float = 80.0, fill: str | None = "#DDDDDD"
+) -> RectObject:
+    # fill 既定を塗りありにする（項目11レビュー所見）: 塗りなし矩形は内部が
+    # 素通しになる（shape_item.RectEllipseItem.shape）ため、このファイルの
+    # move/undo/グループ移動テストが select ツールで矩形の内部を press しても
+    # 掴めなくなる。ここは hit-test の検証ではなく move/undo の検証なので、
+    # fixture を塗りありにして「内部を掴めること」を前提のまま保つ。
     scene = window.scene
     stack = window.undo_stack
-    rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
+    rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h, fill=fill)
     stack.push(AddObjectCommand(scene.document, rect))
     return rect
 

@@ -77,6 +77,17 @@ class BaseItem(QGraphicsObject):
     def boundingRect(self) -> QRectF:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    def ink_rect(self) -> QRectF:
+        """実際にインクが乗る矩形（アイテムローカル座標）。既定は `boundingRect()`。
+
+        `boundingRect()` は当たり判定用の掴める帯（`_MIN_HIT_WIDTH` 等）を含むため
+        ズームで拡張されることがあり、そのままでは「選択範囲をクリップボードへ
+        コピー」（`ExportController.selected_region()`）の切り出し範囲が実際の
+        描画より広がってしまう（項目11レビュー所見）。ヒット判定用の帯を持つ
+        サブクラス（`RectEllipseItem`）だけがこれを override し、実インク境界を返す。
+        """
+        return self.boundingRect()
+
     def paint(
         self,
         painter: Any,

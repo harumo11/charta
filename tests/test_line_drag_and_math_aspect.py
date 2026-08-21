@@ -122,7 +122,12 @@ def test_mixed_selection_box_moves_via_qt_line_follows_via_tool_both_commit_on_r
     stack = window.undo_stack
     tm = window.tool_manager
 
-    rect = RectObject(id=scene.document.new_id(), x=300.0, y=300.0, width=100.0, height=80.0)
+    # fill あり（項目11レビュー所見）: 塗りなし矩形は内部が素通しになるため、
+    # press_pos(350,340)（rect 本体上）を select ツールで掴む前提が崩れる。
+    # ここは move/undo の検証であり hit-test の検証ではないので塗りありにする。
+    rect = RectObject(
+        id=scene.document.new_id(), x=300.0, y=300.0, width=100.0, height=80.0, fill="#DDDDDD"
+    )
     stack.push(AddObjectCommand(scene.document, rect))
     rect_item = scene.item_for(rect)
     assert rect_item is not None

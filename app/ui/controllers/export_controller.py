@@ -180,22 +180,37 @@ class ExportController:
         QGuiApplication.clipboard().setImage(image)
 
     def selected_region(self) -> QRectF | None:
-        """選択中アイテムの `sceneBoundingRect()` の和（未選択なら None）。
+        """選択中アイテムの実インク境界（`ink_rect()`）の和をシーン座標で返す
+        （未選択なら None）。
 
-        `sceneBoundingRect()` を使う理由: 回転を含む正しい外接矩形が得られ、かつ
-        **矢じり・線幅のはみ出しを各 item の boundingRect が既に含む**（モデルの
-        p1/p2 bbox で切ると矢じりが切れる）。子アイテム（選択ハンドル・オーバーレイ）
-        が含まれないのは `sceneBoundingRect()` がアイテム自身の `boundingRect` のみを
-        シーン座標へ写像するため（`childrenBoundingRect` を混ぜると枠がハンドル分
-        膨らむ）。ハンドルはそもそも選択可能でないので `selectedItems()` にも
-        現れない。
+        `item.boundingRect()` そのもの（旧: `sceneBoundingRect()`）ではなく
+        `ink_rect()` を経由するのは、`RectEllipseItem.boundingRect()` が項目11
+        （塗りなし矩形の内部素通し）以降、当たり判定用の掴める帯
+        （`_MIN_HIT_WIDTH` 下限）ぶん膨らんでいるため。ヒット判定帯をそのまま
+        使うと「選択範囲をクリップボードへコピー」の切り出し範囲が実際の
+        インクより最大 4px/辺 広がってしまう（レビュー所見）。`ink_rect()` の
+        既定実装（`BaseItem.ink_rect`）は `boundingRect()` を返すので、
+        override していない他の item（LineItem 等）は従来どおり
+        **矢じり・線幅のはみ出しを含む** boundingRect がそのまま使われる
+        （モデルの p1/p2 bbox で切ると矢じりが切れるため、これは意図した保持）。
+        `mapToScene` で写すのは回転を含む正しい外接矩形を得るため。
+        子アイテム（選択ハンドル・オーバーレイ）が含まれないのは `ink_rect()`/
+        `boundingRect()` がアイテム自身の矩形のみでハンドルの
+        `childrenBoundingRect` を混ぜないため（ハンドルは選択不可なので
+        そもそも `selectedItems()` にも現れない）。
         """
         items = self._scene.selectedItems()
         if not items:
             return None
-        union = items[0].sceneBoundingRect()
+
+        def _ink_rect_in_scene(item: Any) -> QRectF:
+            ink_rect = getattr(item, "ink_rect", None)
+            local = ink_rect() if callable(ink_rect) else item.boundingRect()
+            return item.mapToScene(local).boundingRect()
+
+        union = _ink_rect_in_scene(items[0])
         for item in items[1:]:
-            union = union.united(item.sceneBoundingRect())
+            union = union.united(_ink_rect_in_scene(item))
         return union
 
     def export_action(self, kind: ExportKind) -> None:

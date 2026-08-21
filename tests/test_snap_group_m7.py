@@ -93,10 +93,17 @@ def window(qapp: Any) -> Any:
         w.close()
 
 
-def _add_rect(window: Any, x: float, y: float, w: float = 50.0, h: float = 50.0) -> RectObject:
+def _add_rect(
+    window: Any, x: float, y: float, w: float = 50.0, h: float = 50.0, fill: str | None = "#DDDDDD"
+) -> RectObject:
+    # fill 既定を塗りありにする（項目11レビュー所見）: 塗りなし矩形は内部が
+    # 素通しになる（shape_item.RectEllipseItem.shape）ため、select ツールで
+    # 矩形の内部を press するテスト（グループ移動・スナップガイド）が
+    # 掴めなくなる。ここは move/undo/スナップの検証であり hit-test の検証
+    # ではないので fixture を塗りありにして「内部を掴めること」を保つ。
     scene = window.scene
     stack = window.undo_stack
-    rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
+    rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h, fill=fill)
     stack.push(AddObjectCommand(scene.document, rect))
     return rect
 
@@ -316,6 +323,12 @@ def test_snap_guides_cleared_on_select_release(window: Any) -> None:
 
     tm.set_tool("select")
     tm.handle_mouse_press(_FakeEvent(), QPointF(5.0, 5.0))
+    # 本体ドラッグが実際にアームされたことを固定する（レビュー所見）:
+    # `_select_release` は arm 判定より前に無条件で `_clear_snap_guides()` を
+    # 呼ぶため、press が空振り（矩形を掴めていない）でもこのテストは偽陰性で
+    # 緑になってしまう。fixture を塗りありに変えただけでは再発を防げないので
+    # ここで明示的に固定する。
+    assert tm._select_start, "press が矩形を掴めていない（本体ドラッグが未アーム）"
     item.setPos(23.0, 0.0)  # snaps -> guides populated
     assert scene.snap_guides != []
 

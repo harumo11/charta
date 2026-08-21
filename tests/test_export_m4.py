@@ -934,9 +934,19 @@ def test_render_region_image_excludes_selection_handles(
     assert int(mask.sum()) == 0
 
 
-def test_selected_region_is_union_of_scene_bounding_rects(
+def test_selected_region_is_union_of_ink_rects(
     qapp: Any, project_dir: Path, tmp_path: Path
 ) -> None:
+    """複数選択・回転込みで union が正しく取れること。
+
+    比較対象は `sceneBoundingRect()`（当たり判定用に膨らんだ boundingRect）では
+    なく `ink_rect()`（実インク境界）にする。項目11以降 rect/ellipse の
+    `boundingRect()` はヒット判定帯ぶん膨らんでいるため、`sceneBoundingRect()`
+    を比較対象にすると `selected_region()` がヒット帯を出力に漏らしていない
+    ことを検出できなくなる（レビュー所見）。ヒット帯が実際に漏れていないことは
+    下の `test_selected_region_excludes_the_hit_test_band_of_a_thin_stroked_rect`
+    などモデル値から直接期待値を作るテストが固定する。
+    """
     from app.scene.canvas_scene import CanvasScene
     from app.ui.controllers.export_controller import ExportController
 
@@ -955,7 +965,8 @@ def test_selected_region_is_union_of_scene_bounding_rects(
         rect_item.setSelected(True)
         ellipse_item.setSelected(True)
 
-        expected = rect_item.sceneBoundingRect().united(ellipse_item.sceneBoundingRect())
+        expected = rect_item.mapToScene(rect_item.ink_rect()).boundingRect()
+        expected = expected.united(ellipse_item.mapToScene(ellipse_item.ink_rect()).boundingRect())
         region = controller.selected_region()
 
     assert region is not None
@@ -963,6 +974,76 @@ def test_selected_region_is_union_of_scene_bounding_rects(
     assert region.y() == pytest.approx(expected.y())
     assert region.width() == pytest.approx(expected.width())
     assert region.height() == pytest.approx(expected.height())
+
+
+def test_selected_region_excludes_the_hit_test_band_of_a_thin_stroked_rect(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """`stroke_width=2.0` の塗りなし矩形は selected_region が ±1.0 に収まること
+    （boundingRect のヒット判定帯 4.0 が漏れていないことの固定。レビュー所見）。"""
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+    rect_obj = RectObject(
+        id=doc.new_id(),
+        x=400.0,
+        y=400.0,
+        width=100.0,
+        height=60.0,
+        fill=None,
+        stroke="#000000",
+        stroke_width=2.0,
+    )
+    doc.add_object(rect_obj)
+
+    with CanvasScene(doc) as scene:
+        controller = ExportController(None, scene, lambda: None)
+        item = scene.item_for(rect_obj)
+        assert item is not None
+        item.setSelected(True)
+        region = controller.selected_region()
+
+    assert region is not None
+    assert region.x() == pytest.approx(rect_obj.x - 1.0)
+    assert region.y() == pytest.approx(rect_obj.y - 1.0)
+    assert region.width() == pytest.approx(rect_obj.width + 2.0)
+    assert region.height() == pytest.approx(rect_obj.height + 2.0)
+
+
+def test_selected_region_of_an_unfilled_unstroked_rect_matches_the_model_box(
+    qapp: Any, project_dir: Path, tmp_path: Path
+) -> None:
+    """塗りなし・線なし矩形は selected_region がモデルの x/y/width/height と
+    ちょうど一致すること（インク無しの4px余白が付かないことの固定。レビュー所見）。"""
+    from app.scene.canvas_scene import CanvasScene
+    from app.ui.controllers.export_controller import ExportController
+
+    doc = _build_document(project_dir, tmp_path)
+    rect_obj = RectObject(
+        id=doc.new_id(),
+        x=100.0,
+        y=300.0,
+        width=200.0,
+        height=100.0,
+        fill=None,
+        stroke=None,
+        stroke_width=2.0,
+    )
+    doc.add_object(rect_obj)
+
+    with CanvasScene(doc) as scene:
+        controller = ExportController(None, scene, lambda: None)
+        item = scene.item_for(rect_obj)
+        assert item is not None
+        item.setSelected(True)
+        region = controller.selected_region()
+
+    assert region is not None
+    assert region.x() == pytest.approx(rect_obj.x)
+    assert region.y() == pytest.approx(rect_obj.y)
+    assert region.width() == pytest.approx(rect_obj.width)
+    assert region.height() == pytest.approx(rect_obj.height)
 
 
 def test_selected_region_includes_arrowhead_of_a_selected_arrow(

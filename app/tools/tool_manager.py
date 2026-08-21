@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from app.commands.commands import AddObjectCommand, SetGeometryCommand, SetPropertyCommand
 from app.graphics import curves
+from app.graphics.constraints import constrain_to_axis_or_diagonal
 from app.model.objects import (
     BaseObject,
     ConnectorObject,
@@ -102,6 +103,23 @@ def _dataclass_field_default(f: Any) -> Any:
     if f.default_factory is not MISSING:  # type: ignore[misc]
         return f.default_factory()
     return None
+
+
+def _event_modifiers(event: Any) -> Qt.KeyboardModifier:
+    """`event.modifiers()` を安全に読む。
+
+    テストの疑似イベント（`_FakeEvent`）は `button()` しか持たないため、素で呼ぶと
+    AttributeError で既存テストが落ちる（P4/P5契約 (A)）。
+    """
+    modifiers = getattr(event, "modifiers", None)
+    if modifiers is None:
+        return Qt.KeyboardModifier.NoModifier
+    return modifiers()
+
+
+def _shift_pressed(event: Any) -> bool:
+    """Shift 押下中かどうか（`_event_modifiers` のガード込み）。"""
+    return bool(_event_modifiers(event) & Qt.KeyboardModifier.ShiftModifier)
 
 
 class _ToolHandlers(NamedTuple):
@@ -663,9 +681,26 @@ class ToolManager(QObject):
         self._preview_item = item
         return True
 
+    def _draw_end_point(self, event: Any, scene_pos: QPointF) -> QPointF:
+        """line/arrow の作図中の終点。Shift 押下中は45°刻みへ制約する（項目2）。
+
+        `_draw_move`（プレビュー）と `_draw_release`（確定）の**両方**がこれを通す。
+        片方だけだと「見た目は45°なのにできた線は斜め」になる。
+        rect/ellipse は対象外（正方形/正円はユーザー要望に無い）。
+        """
+        if self._tool not in ("line", "arrow") or self._draw_start is None:
+            return scene_pos
+        if not _shift_pressed(event):
+            return scene_pos
+        anchor = (self._draw_start.x(), self._draw_start.y())
+        point = (scene_pos.x(), scene_pos.y())
+        constrained = constrain_to_axis_or_diagonal(anchor, point)
+        return QPointF(constrained[0], constrained[1])
+
     def _draw_move(self, event: Any, scene_pos: QPointF) -> bool:
         if self._draw_start is None or self._preview_item is None:
             return True
+        scene_pos = self._draw_end_point(event, scene_pos)
         if self._tool in ("line", "arrow"):
             line_item: QGraphicsLineItem = self._preview_item  # type: ignore[assignment]
             line_item.setLine(
@@ -677,6 +712,10 @@ class ToolManager(QObject):
         return True
 
     def _draw_release(self, event: Any, scene_pos: QPointF) -> bool:
+        # `_cancel_preview()` は `_draw_start` を None にするため、制約の適用は
+        # 必ずそれより前に行う（P4/P5契約 (A)。順序を誤るとプレビューは45°
+        # なのに確定した線は斜め、というずれが生まれる）。
+        scene_pos = self._draw_end_point(event, scene_pos)
         start = self._draw_start
         self._cancel_preview()
         if start is None:
@@ -949,12 +988,61 @@ class ToolManager(QObject):
     # release で target 候補を解決し ConnectorObject を生成する(§5/§9.3)。
     # ------------------------------------------------------------------
     def _pick_connectable(self, scene_pos: QPointF) -> BaseObject | None:
-        """scene_pos 直下の「接続可能」なオブジェクトを返す(.obj 持ち, type!='connector')。"""
-        hit = self._topmost_item_at(scene_pos)
-        obj = getattr(hit, "obj", None)
-        if obj is None or obj.type == "connector":
-            return None
-        return obj
+        """scene_pos 直下の「接続可能」なオブジェクトを返す(.obj 持ち, type!='connector')。
+
+        選択（`_topmost_item_at`）は `shape()`（辺の帯）でヒットさせるが、コネクタの
+        始点/終点は「塗りなし矩形の内部でも掴める」ことが要件（項目11。
+        `tests/test_routing_avoid.py` が実際にそれをやっている）。ここだけ役割を
+        分け、箱型図形（`live_geometry()` が x/y/width/height を返す
+        rect/ellipse/image/text/math/freehand/curve）はモデルの論理 box
+        （`connector_item.logical_box_for_item`）への点包含判定
+        （`app.graphics.boxes.point_in_obb`）を主とする。**選択は辺のみ・
+        接続は箱全体**。line/arrow は対象外のまま従来どおり `shape()` を使う
+        （p1/p2 の軸並行 bbox は斜め線で広大になり水平線で高さ0になるため、
+        bbox 判定に切り替えると逆に取りこぼす／誤って広く拾いすぎる）。
+
+        box 判定には `shape()`（辺の帯）を OR で合流させる（レビュー所見）:
+        box はモデルのちょうどの x/y/width/height なので、太い線（stroke_width>0）
+        の場合ストロークは境界を挟んで内外均等に描かれ、その外側半分は box の
+        外に出る。box だけだと「選択はできる（shape() が拾う）のに接続はできない
+        （box が拾わない）」という、見た目には区別のつかない当たり判定の穴が
+        できる。OR にすることで接続可能領域が選択可能領域の**上位集合**になる
+        （box ⊇ 旧仕様、shape() ⊆ 選択領域、なので接続 = box ∪ shape ⊇ 選択）。
+        """
+        from app.graphics.boxes import point_in_obb
+        from app.scene.items.connector_item import logical_box_for_item
+
+        views = self.scene.views()
+        transform = views[0].transform() if views else QTransform()
+        # 広い一次候補は sceneBoundingRect（Qt の BSP を使った高速な絞り込み）で
+        # 取り、実際の採否は箱型なら point_in_obb（+ shape() の帯）、それ以外は
+        # shape() のみで決める。
+        items = self.scene.items(
+            scene_pos,
+            Qt.ItemSelectionMode.IntersectsItemBoundingRect,
+            Qt.SortOrder.DescendingOrder,
+            transform,
+        )
+        point = (scene_pos.x(), scene_pos.y())
+        for item in items:
+            obj = getattr(item, "obj", None)
+            if obj is None or obj.type == "connector":
+                continue
+            live_geometry = getattr(item, "live_geometry", None)
+            geom = live_geometry() if callable(live_geometry) else {}
+            if "width" in geom and "height" in geom:
+                box = logical_box_for_item(item)
+                if box is None:
+                    continue
+                rotation = float(geom.get("rotation", 0.0))
+                if point_in_obb(point, box, rotation) or item.shape().contains(
+                    item.mapFromScene(scene_pos)
+                ):
+                    return obj
+                continue
+            if item.shape().contains(item.mapFromScene(scene_pos)):
+                return obj
+        return None
 
     def _connector_press(self, event: Any, scene_pos: QPointF) -> bool:
         if (
