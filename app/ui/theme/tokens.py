@@ -33,6 +33,11 @@ class Theme:
     hover_bg: str
     radius: int = 6
     radius_sm: int = 4
+    # 右プロパティパネルの 1 行あたりのコントロール高さ(px)。全種別のフォーム行をこの 1 値に
+    # 揃える（QSS 側で種別ごとの内部余白を差し引いて min-height にする）。
+    # 32 の根拠: テーマ適用下で最も背の高い素のコントロール QDoubleSpinBox が 31px。
+    # それ未満にすると min-height が効かず不揃いに戻る。
+    control_h: int = 32
 
 
 LIGHT: Theme = Theme(
@@ -56,6 +61,7 @@ LIGHT: Theme = Theme(
     hover_bg="rgba(0, 0, 0, 11)",
     radius=6,
     radius_sm=4,
+    control_h=32,
 )
 
 # 現在適用中のテーマ（既定 LIGHT）。`apply_theme` が `_set_current_theme` 経由で差し替える。

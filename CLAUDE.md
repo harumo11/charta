@@ -145,10 +145,15 @@ myproject/
 | フィールド | 型 | 説明 |
 |---|---|---|
 | `fill` | str or null | 塗り色 `#RRGGBB` / null=透明 |
-| `stroke` | str | 線色 |
-| `stroke_width` | float | 線幅 |
+| `stroke` | str or null | 線色。**null=線なし**（`fill` の塗りなしと対称。2026-08-21 項目12） |
+| `stroke_width` | float | 線幅。**0 も線なし**（画面・SVG ともに描かない。判定は `app/graphics/strokes.is_stroked` に一本化） |
 | `dash` | str | "solid"/"dash"/"dot" |
 | `corner_radius` | float | rect のみ・角丸半径 |
+
+> 注釈: line/arrow/freehand/connector の `stroke` は非 null（`str`）のまま。線そのものが
+> 実体のオブジェクトを不可視にすると「削除すべきものが図に残る」だけになるため
+> （`visible` と `stroke_width=0` に既に「線を消す」語彙がある）。curve は rect/ellipse と
+> 同型（§7.2 curve の行を参照。`str or null`）。
 
 **line / arrow**
 | フィールド | 型 | 説明 |
@@ -221,6 +226,10 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - image → `<image>` に Base64 埋め込み。クロップ・補正を反映した最終ビットマップを埋める。
 - math → matplotlib が生成した数式 SVG を `<g transform=...>` として**そのまま入れ子挿入**（ベクター保持）。
 - z順は要素の出力順で表現。回転・不透明度は `transform` / `opacity` 属性。
+- 線なし（`stroke=null` または `stroke_width=0`）は `stroke="none"` を明示出力する（`stroke-width`
+  属性自体は省略する）。`QPen.setWidthF(0)` は画面では cosmetic 1px のヘアラインを描くが SVG は
+  `stroke-width="0.000"` で線を消してしまう不一致があったため、画面/SVG 双方の判定を
+  `app/graphics/strokes.is_stroked` に一本化してある。
 
 > 注釈（批判的観点・トレードオフ）: テキストのアウトライン化は「他環境・入稿で確実に再現」できる反面、出力後にテキスト編集できず SVG が重くなり、**投稿規定（Nature: "no outlining permitted"）に抵触する**。このため既定は OFF（編集可能なテキスト）とし、フォント埋め込みを受け付けない入稿先向けに ON を選べるようにする（2026-08-02 反転）。
 
@@ -240,6 +249,31 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 ### 9.2 プロパティパネル
 - 選択オブジェクトの型に応じてフィールドを動的生成。**数値直接入力**（x/y/幅/高さ/回転/線幅）を必須とする（ドラッグに加え厳密指定できることが研究図で重要）。
 - 変更は必ず `QUndoCommand` 経由でモデルに適用（パネルから直接モデルを書き換えない）。
+- **行の体裁（2026-08-21 項目3・4）**: セクション見出し（「変形」「スタイル」「アートボード」）は
+  `QFormLayout.addRow(widget)` の**独立スパン行**として出す。以前はラベル欄に縦 2 段で埋め込んで
+  いたため（旧 `_HeaderedLabel`）、その行だけ**ラベル文字の中心が入力欄より 22px 下にずれて**いた
+  （`QFormLayout` は行がフィールドより高いときフィールドを上寄せする）。見出しの位置は
+  `PropSpec.section`（`app/model/properties.py`・Qt 非依存）で**データとして持つ**——
+  従来の「`COMMON_PROPS` に無い最初のキー」という推論は x/y を持たない line/arrow で
+  「スタイル」を始点（`p1`）行に付けてしまっていた。
+  行高は `Theme.control_h`（32px）と `#propertyPanelForm` スコープの QSS の種別別 `min-height`
+  で全行揃える（Qt の QSS の `min-height` は内容矩形の高さなので、種別ごとの固有余白を
+  差し引いた値を与える。実測値の根拠は `qss.py` のコメント参照）。
+  **検証は `tests/test_panel_row_metrics.py` が全 10 型 + multi + artboard で
+  「ラベルと入力欄の中心が ±1px」「行高が全行同一」を実測で固定する。**
+- **行番号を外から引くのは公開ヘルパ経由**（`row_for_key` / `field_widget_for` /
+  `label_widget_for` / `keys_in_form` / `section_rows`）。見出しがスパン行になった結果、
+  `itemAt(row, FieldRole)` の index 引きは見出し行で見出しラベル自身を返すため、
+  「`PROPERTIES[type]` の並び順 == 行番号」という以前の前提はもう成り立たない。
+- **色の指定は単一のスウォッチボタン**（2026-08-21 項目12）。`kind="color_opt"`（null 可）は
+  クリックで小さな `QMenu`（「色を選択…」/ `PropSpec.null_label`）を出す。以前の
+  「透明」`QCheckBox` + ボタンの 2 部品は廃止した——1 プロパティ 2 部品は UI を増やすうえ、
+  チェックボックスは QSS 上の高さが他の入力欄と違って行高不揃いの一因であり、
+  「なし」解除時に直前の色を復元する隠し状態がトグル往復で色を失う回帰も起こしていた。
+  ボタン面に hex テキストは出さない（`sizeHint` が値依存になると行高・行幅が色を変える
+  たびに揺れる）。現在値は tooltip に出す。
+  複数選択では `color` と `color_opt` を互換扱いにし、実効 kind を狭い方（`color`）へ寄せる
+  ——rect と line を同時選択したときに「線色」行が消えるのを防ぐため。
 
 ### 9.3 コネクタ（図形追従）
 - コネクタは端点座標ではなく `source_id`/`target_id`＋アンカーを保持。
@@ -344,7 +378,9 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
 - 確定/キャンセル: Enter・対象外側クリック・ツール切替・パネル確定で commit、Esc/キャンセルで破棄（`CanvasScene.active_mask_session` / `mask_mode_changed`、`CanvasView._handle_mask_key`/`_commit_mask_on_outside_press`、`ToolManager._commit_active_mask` — いずれも crop 追跡と対称）。
 - 確定処理: 採用候補の論理和マスクを `assets/mask_NNN.png`（mode "L"、crop 前の元画像座標、255=対象物）として保存し、undo マクロ「SAM3 マスク」で `mask_src`/`mask_color`/`mask_opacity`/`mask_enabled`/`mask_prompt` を `SetPropertyCommand` 群として push（`Sam3MaskController.commit_mask` — ヘッドレステスト可能な公開 API）。キャンセル時はファイルを残さない。
 - 合成: `app/graphics/image_pipeline.py` の `apply_mask_overlay()`（crop → brightness/contrast → mask の順、`apply_mask_if_any()` で共有)。**覆い色 null = 透明 = 切り取り**（対象外 alpha を落とす)。キャンバス表示・SVG・PNG/PDF の全経路が同一関数を通るため出力が一致する。
-- 事後編集: プロパティパネル（`mask_color`=color_opt「透明」チェック、`mask_opacity`、`mask_enabled`。`PropSpec.requires="mask_src"` で mask 保有時のみ表示）。再推論なしで変更可能。
+- 事後編集: プロパティパネル（`mask_color`=color_opt。単一の色スウォッチのメニューから「色を選択…」/
+  `PropSpec.null_label`「透明（切り取り）」を選ぶ。`mask_opacity`、`mask_enabled`。
+  `PropSpec.requires="mask_src"` で mask 保有時のみ表示）。再推論なしで変更可能。
 - 推論層: `app/ai/sam3.py`（`Sam3Engine` シングルトン、`is_available()`、遅延 import、Qt 非依存）。CLI 検証は `scripts/smoke_sam3.py`。
 
 ### 9.6a 曲線とノード編集モード（2026-08 追加）

@@ -204,7 +204,89 @@ QSplitter::handle {{
 QLabel[role="section"] {{
     color: {t.fg_muted};
     font-size: 9pt;
-    padding-top: 8px;
+    padding-top: 10px;
+    padding-bottom: 2px;
+}}
+
+/* ---- PropertyPanel フォームのスクロール領域（objectName="propertyPanelFormScroll"、
+   レビュー所見対応） ----
+   ドックがフォームの sizeHint 未満の高さしか与えないとき（1366×768/1200×900 の
+   ような常用ウィンドウで text/rect フォームは容易にこれを超える）、行を圧縮せず
+   縦スクロールに逃がすための QScrollArea を導入した（`PropertyPanel.__init__`）。
+   QScrollArea の既定はビューポートに QPalette::Base を敷くため、無地のままだと
+   フォームだけ別の箱として浮いて見える。ボーダー無し・背景透過にしてパネルへ
+   同化させる（`> QWidget` は直接の子＝ビューポートだけを狙い、その孫である
+   `#propertyPanelForm` 自体には影響しない）。 */
+#propertyPanelFormScroll, #propertyPanelFormScroll > QWidget {{
+    background: transparent;
+    border: none;
+}}
+
+/* ---- PropertyPanel 行高の統一（objectName="propertyPanelForm"、P2契約 担当A） ----
+   QSS の min-height は「内容矩形」の高さで、border/padding は別に加算される。
+   種別ごとに内容矩形の自然な高さが違うため、Theme.control_h からその種別固有の
+   枠線・padding 分を差し引いた値を min-height に与えることで、どの kind の
+   フィールドも最終的な外形高さが control_h に揃う（実測値は QT_QPA_PLATFORM=
+   offscreen かつテーマ適用下、tests/test_panel_row_metrics.py で固定）。
+
+   **QSpinBox/QDoubleSpinBox/QCheckBox は QSS 係数だけでは不十分**: 実測では
+   Fusion スタイルの min-height 計算結果がウィジェットに割り当てられている
+   「幅」次第で変わる（point 行の圧縮や縦スクロールバーの出現/消失で幅が
+   変わるたびに 29/32/35/37px のように揺れた、レビュー所見）。そのため
+   `app/panels/property_panel.py::_pin_control_height` がこの2種には
+   `setFixedHeight(control_h)` を明示的に適用しており、実際の外形高さは
+   そちらが決める。ここでの min-height は QSS だけが効く場面（万一
+   `_pin_control_height` を適用し忘れた場合の下限）のための保険。
+
+   スコープ鍵は PropertyPanel 自身（#propertyPanel）ではなく、フォーム内容だけを
+   包む内側のコンテナ（#propertyPanelForm）にしている。`QColorDialog` は
+   `PropertyPanel` 自身を親にとって開かれるため、`#propertyPanel` を鍵にすると
+   子孫セレクタがダイアログ内部の OK/Cancel/「画面上の色を選択」ボタンや RGB/HSV
+   スピンにまで届いてしまい、幅108px固定でラベル文字がクリップされる（実測で
+   確認済みの回帰）。ダイアログは `#propertyPanelForm` の子孫ではないため、
+   このスコープなら実際にフォームへ配置されたコントロールだけに効く。 */
+#propertyPanelForm QLineEdit, #propertyPanelForm QComboBox {{
+    /* border 1px×2 + padding 3px×2 = 8px。control_h - 8 が内容矩形の高さ。 */
+    min-height: {t.control_h - 8}px;
+}}
+#propertyPanelForm QSpinBox, #propertyPanelForm QDoubleSpinBox {{
+    /* 実際の外形高さは `_pin_control_height`（`setFixedHeight`）が決める
+       （上の注記参照）。ここは保険の下限。border 1px×2 + padding 3px×2 = 8px。 */
+    min-height: {t.control_h - 8}px;
+}}
+#propertyPanelForm QPushButton {{
+    /* 色スウォッチ。既定の QPushButton は padding 5px 14px で他コントロールより
+       1 行分高くなるため、ここだけ padding を 3px 8px に縮める
+       （border 1px×2 + padding 3px×2 = 8px、QLineEdit と同じ内訳に揃える）。
+       border はこのセレクタで再度明示しておく（実測では上の汎用 QPushButton
+       規則からも継承され描画自体はされているが、`setStyleSheet(
+       "background-color: ...")` をウィジェット単位で当てる箇所なので、汎用規則
+       の border が将来変わってもスウォッチの見た目がここ 1 か所の変更で
+       自己完結するようにする。レビュー所見: 白/淡色スウォッチと空の入力欄
+       （どちらも背景 {t.s2}）は境界線の色が同じだと見分けづらく、hex は
+       tooltip 頼みになる — 完全解消ではないが自己完結にはしておく）。 */
+    border: 1px solid {t.border};
+    padding: 3px 8px;
+    min-height: {t.control_h - 8}px;
+    /* color_opt の null_label（"なし"/"透明（切り取り）"）と色ありの空文字とで
+       テキスト長が変わっても sizeHint が揺れないよう、幅も明示的に固定する
+       （QSS で width を明示すると、その種別の sizeHint はテキスト内容に関わらず
+       常にこの値になる。テキストが収まる余裕を持たせた値。実測は
+       tests/test_panel_row_metrics.py::test_color_swatch_width_is_independent_of_color_value）。 */
+    min-width: 108px;
+    max-width: 108px;
+}}
+#propertyPanelForm QPushButton::menu-indicator {{
+    /* スピンの▲▼を width:0 で隠しているのと同じ方針。メニュー矢印が色面の
+       右端に食い込んで色が見えづらくなるのを防ぐ（メニューはクリックで開ける）。 */
+    width: 0px;
+    image: none;
+}}
+#propertyPanelForm QCheckBox {{
+    /* 実際の外形高さは `_pin_control_height`（`setFixedHeight`）が決める
+       （上の QSpinBox 注記と同じ理由）。ここは保険の下限。border/padding を
+       持たないため min-height をそのまま渡す。 */
+    min-height: {t.control_h}px;
 }}
 
 /* ---- ZoomPill（objectName="zoomPill"、P3契約 §2/§5） --------------------- */

@@ -40,6 +40,7 @@ from app.graphics.routing import (
     connector_endpoints_from_model,
     endpoint_direction,
 )
+from app.graphics.strokes import is_stroked
 from app.math.mathtext_render import MathRenderError, get_math_svg
 from app.model.document import Document
 from app.model.objects import BaseObject
@@ -66,13 +67,39 @@ def _fill_attr(fill: str | None) -> str:
 
 
 def _dash_attr(dash: str, stroke_width: float) -> str:
-    """dash 種別を `stroke-dasharray` 属性文字列にする（solid は空文字）。"""
+    """dash 種別を `stroke-dasharray` 属性文字列にする（solid は空文字）。
+
+    下限クランプ 0.1 は幅 0（線なし）を想定したものではない
+    （`_stroke_attrs` が線なしなら早期リターンしここへ到達させない）。
+    0 < stroke_width < 0.1 の極細線でもダッシュ間隔が 0 にならないようにするため
+    のガードであり、線なし判定とは独立に残す。
+    """
     sw = max(float(stroke_width), 0.1)
     if dash == "dash":
         return f' stroke-dasharray="{_fmt(sw * 4.0)},{_fmt(sw * 2.0)}"'
     if dash == "dot":
         return f' stroke-dasharray="{_fmt(sw)},{_fmt(sw * 2.0)}"'
     return ""
+
+
+def _stroke_attrs(obj: BaseObject, *, dash: bool = True) -> str:
+    """stroke / stroke-width / stroke-dasharray をまとめた属性文字列。
+
+    線を描かない（stroke=None または幅 0）なら `stroke="none"` だけを返す
+    — 幅 0 を素通しすると SVG では線が消えるのに画面は cosmetic 1px を描く、
+    という画面/出力の食い違いになる（`app.graphics.strokes.is_stroked` が判定）。
+    属性を省略せず明示するのは、将来 <g> に stroke を持たせても継承されないように
+    するためと、テストで grep できるようにするため。
+
+    `dash=False` は `dash` フィールドを持たないオブジェクト種別
+    （freehand）向け。フィールドが無いのに `obj.dash` を読むと落ちる。
+    """
+    if not is_stroked(obj):
+        return ' stroke="none"'
+    attrs = f' stroke={quoteattr(obj.stroke)} stroke-width="{_fmt(obj.stroke_width)}"'
+    if dash:
+        attrs += _dash_attr(obj.dash, obj.stroke_width)
+    return attrs
 
 
 def _xml_comment(text: str) -> str:
@@ -150,11 +177,7 @@ def _render_rect(obj: BaseObject) -> str:
     corner_radius = getattr(obj, "corner_radius", 0.0)
     if corner_radius > 0:
         attrs += f' rx="{_fmt(corner_radius)}"'
-    attrs += (
-        f" fill={quoteattr(_fill_attr(obj.fill))} stroke={quoteattr(obj.stroke)}"
-        f' stroke-width="{_fmt(obj.stroke_width)}"'
-    )
-    attrs += _dash_attr(obj.dash, obj.stroke_width)
+    attrs += f" fill={quoteattr(_fill_attr(obj.fill))}" + _stroke_attrs(obj)
     return f"<rect {attrs}/>"
 
 
@@ -162,10 +185,9 @@ def _render_ellipse(obj: BaseObject) -> str:
     w, h = obj.width, obj.height
     attrs = (
         f'cx="{_fmt(w / 2.0)}" cy="{_fmt(h / 2.0)}" rx="{_fmt(w / 2.0)}" ry="{_fmt(h / 2.0)}"'
-        f" fill={quoteattr(_fill_attr(obj.fill))} stroke={quoteattr(obj.stroke)}"
-        f' stroke-width="{_fmt(obj.stroke_width)}"'
+        f" fill={quoteattr(_fill_attr(obj.fill))}"
     )
-    attrs += _dash_attr(obj.dash, obj.stroke_width)
+    attrs += _stroke_attrs(obj)
     return f"<ellipse {attrs}/>"
 
 
@@ -201,9 +223,8 @@ def _render_freehand(obj: BaseObject) -> str:
     if d is None:
         return _xml_comment("freehand: insufficient points, skipped")
     return (
-        f'<path d="{d}" fill="none" stroke={quoteattr(obj.stroke)}'
-        f' stroke-width="{_fmt(obj.stroke_width)}" stroke-linecap="round"'
-        f' stroke-linejoin="round"/>'
+        f'<path d="{d}" fill="none"{_stroke_attrs(obj, dash=False)}'
+        ' stroke-linecap="round" stroke-linejoin="round"/>'
     )
 
 
@@ -237,10 +258,9 @@ def _render_curve(obj: BaseObject) -> str:
     # SVG の既定は nonzero のため、明示しないと自己交差する曲線で塗りが食い違う）。
     attrs = (
         f'd="{d}" fill={quoteattr(_fill_attr(obj.fill))} fill-rule="evenodd"'
-        f' stroke={quoteattr(obj.stroke)} stroke-width="{_fmt(obj.stroke_width)}"'
+        f"{_stroke_attrs(obj)}"
         f' stroke-linecap="round" stroke-linejoin="round"'
     )
-    attrs += _dash_attr(obj.dash, obj.stroke_width)
     return f"<path {attrs}/>"
 
 
@@ -303,11 +323,9 @@ def _render_line(obj: BaseObject) -> str:
             shorten = shorten_amount(obj.arrow_start, arrow_size)
             lx1, ly1 = x1 + dx * shorten, y1 + dy * shorten
 
-    stroke_width_attr = f' stroke-width="{_fmt(obj.stroke_width)}"'
     body = (
         f'<path d="M {_fmt(lx1)} {_fmt(ly1)} L {_fmt(lx2)} {_fmt(ly2)}" fill="none"'
-        f" stroke={quoteattr(obj.stroke)}{stroke_width_attr}"
-        f'{_dash_attr(obj.dash, obj.stroke_width)} stroke-linecap="round"/>'
+        f'{_stroke_attrs(obj)} stroke-linecap="round"/>'
     )
     parts = [body]
     if direction is not None:
@@ -353,11 +371,7 @@ def _render_connector(document: Document, obj: BaseObject) -> str:
     d = " ".join(
         f"{'M' if i == 0 else 'L'} {_fmt(x)} {_fmt(y)}" for i, (x, y) in enumerate(line_points)
     )
-    body = (
-        f'<path d="{d}" fill="none" stroke={quoteattr(obj.stroke)}'
-        f' stroke-width="{_fmt(obj.stroke_width)}"'
-        f'{_dash_attr(obj.dash, obj.stroke_width)} stroke-linecap="round"/>'
-    )
+    body = f'<path d="{d}" fill="none"{_stroke_attrs(obj)} stroke-linecap="round"/>'
     parts = [body]
     if arrow_visible(obj.arrow_end, arrow_size):
         dx, dy = endpoint_direction(points)

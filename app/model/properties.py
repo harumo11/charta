@@ -32,11 +32,20 @@ class PropSpec:
     # オブジェクトの当該属性が truthy のときのみパネルに行を表示する
     # （SAM3 選択的マスキング §9.5: mask_src が無い間は色/不透明度/有効行を隠す）。
     requires: str | None = None
+    # この行の直前に挿入するセクション見出し（None = 見出しなし）。
+    # なぜデータで持つか: COMMON_PROPS / _LINE_PROPS は型をまたいで共有されるので
+    # 「型ごとの行番号」では表現できない。従来の「COMMON_PROPS に無い最初の key」という
+    # 推論は x/y を持たない line/arrow で「スタイル」を p1（始点）行に付けてしまう
+    # （実測で確認したユーザー報告の一因）。
+    section: str | None = None
+    # null 値の表示ラベル（kind == "color_opt" のみ）。mask_color の null は
+    # 「なし」ではなく「透明＝切り取り」という操作の意味を持つため（CLAUDE.md §9.5）。
+    null_label: str = "なし"
 
 
 COMMON_PROPS: list[PropSpec] = [
     PropSpec(key="name", label="名前", kind="text"),
-    PropSpec(key="x", label="X", kind="number"),
+    PropSpec(key="x", label="X", kind="number", section="変形"),
     PropSpec(key="y", label="Y", kind="number"),
     PropSpec(key="width", label="幅", kind="number", minimum=0.0),
     PropSpec(key="height", label="高さ", kind="number", minimum=0.0),
@@ -74,24 +83,27 @@ _DASH_OPTIONS: tuple[str, ...] = ("solid", "dash", "dot")
 _ARROW_OPTIONS: tuple[str, ...] = ("none", "triangle", "open", "circle")
 
 _RECT_PROPS: list[PropSpec] = [
-    PropSpec(key="fill", label="塗り", kind="color_opt"),
-    PropSpec(key="stroke", label="線色", kind="color"),
+    PropSpec(key="fill", label="塗り", kind="color_opt", section="スタイル"),
+    # rect.stroke は None（線なし）を許容する（項目12）。fill と対称に
+    # "color_opt" にし、null 選択で線を消せるようにする。
+    PropSpec(key="stroke", label="線色", kind="color_opt"),
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),
     PropSpec(key="corner_radius", label="角丸半径", kind="number", minimum=0.0),
 ]
 
 _ELLIPSE_PROPS: list[PropSpec] = [
-    PropSpec(key="fill", label="塗り", kind="color_opt"),
-    PropSpec(key="stroke", label="線色", kind="color"),
+    PropSpec(key="fill", label="塗り", kind="color_opt", section="スタイル"),
+    # rect と同じ理由（項目12）で ellipse.stroke も null 可にする。
+    PropSpec(key="stroke", label="線色", kind="color_opt"),
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),
 ]
 
 _LINE_PROPS: list[PropSpec] = [
-    PropSpec(key="p1", label="始点", kind="point"),
+    PropSpec(key="p1", label="始点", kind="point", section="変形"),
     PropSpec(key="p2", label="終点", kind="point"),
-    PropSpec(key="stroke", label="線色", kind="color"),
+    PropSpec(key="stroke", label="線色", kind="color", section="スタイル"),
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),
     PropSpec(key="arrow_start", label="始端矢じり", kind="enum", options=_ARROW_OPTIONS),
@@ -108,6 +120,7 @@ _IMAGE_PROPS: list[PropSpec] = [
         maximum=1.0,
         step=0.05,
         decimals=2,
+        section="スタイル",
     ),
     PropSpec(
         key="contrast",
@@ -119,7 +132,13 @@ _IMAGE_PROPS: list[PropSpec] = [
         decimals=2,
     ),
     # SAM3 選択的マスキング（§9.5）。mask_src が付与されているときのみ表示する。
-    PropSpec(key="mask_color", label="マスク覆い色", kind="color_opt", requires="mask_src"),
+    PropSpec(
+        key="mask_color",
+        label="マスク覆い色",
+        kind="color_opt",
+        requires="mask_src",
+        null_label="透明（切り取り）",
+    ),
     PropSpec(
         key="mask_opacity",
         label="マスク不透明度",
@@ -137,7 +156,7 @@ _ALIGN_OPTIONS: tuple[str, ...] = ("left", "center", "right")
 _VALIGN_OPTIONS: tuple[str, ...] = ("top", "middle", "bottom")
 
 _FREEHAND_PROPS: list[PropSpec] = [
-    PropSpec(key="stroke", label="線色", kind="color"),
+    PropSpec(key="stroke", label="線色", kind="color", section="スタイル"),
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(
         key="smoothing",
@@ -151,7 +170,7 @@ _FREEHAND_PROPS: list[PropSpec] = [
 ]
 
 _TEXT_PROPS: list[PropSpec] = [
-    PropSpec(key="text", label="テキスト", kind="text"),
+    PropSpec(key="text", label="テキスト", kind="text", section="スタイル"),
     PropSpec(key="font_family", label="フォント", kind="text"),
     PropSpec(key="font_size", label="サイズ", kind="number", minimum=0.01),
     PropSpec(key="bold", label="太字", kind="bool"),
@@ -163,7 +182,7 @@ _TEXT_PROPS: list[PropSpec] = [
 ]
 
 _MATH_PROPS: list[PropSpec] = [
-    PropSpec(key="latex", label="LaTeX", kind="text"),
+    PropSpec(key="latex", label="LaTeX", kind="text", section="スタイル"),
     PropSpec(key="font_size", label="サイズ", kind="number", minimum=0.01),
     PropSpec(key="color", label="色", kind="color"),
 ]
@@ -171,8 +190,9 @@ _MATH_PROPS: list[PropSpec] = [
 _ROUTING_OPTIONS: tuple[str, ...] = ("straight", "orthogonal")
 
 _CURVE_PROPS: list[PropSpec] = [
-    PropSpec(key="fill", label="塗り", kind="color_opt"),
-    PropSpec(key="stroke", label="線色", kind="color"),
+    PropSpec(key="fill", label="塗り", kind="color_opt", section="スタイル"),
+    # rect/ellipse と同じ理由（項目12）で curve.stroke も null 可にする。
+    PropSpec(key="stroke", label="線色", kind="color_opt"),
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),
     PropSpec(key="closed", label="閉じる", kind="bool"),
@@ -193,7 +213,13 @@ _CURVE_PROPS: list[PropSpec] = [
 # アンカー(source_anchor/target_anchor)はパネルの enum ウィジェットではなく
 # オンキャンバスのアンカードットで選択する（種類別アンカー契約 §4）。
 _CONNECTOR_PROPS: list[PropSpec] = [
-    PropSpec(key="routing", label="ルーティング", kind="enum", options=_ROUTING_OPTIONS),
+    PropSpec(
+        key="routing",
+        label="ルーティング",
+        kind="enum",
+        options=_ROUTING_OPTIONS,
+        section="スタイル",
+    ),
     PropSpec(key="stroke", label="線色", kind="color"),
     PropSpec(key="stroke_width", label="線幅", kind="number", minimum=0.0),
     PropSpec(key="dash", label="線種", kind="enum", options=_DASH_OPTIONS),

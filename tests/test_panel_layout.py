@@ -23,11 +23,10 @@ from typing import Any
 
 import pytest
 import shiboken6
-from PySide6.QtWidgets import QDoubleSpinBox, QFormLayout, QWidget
+from PySide6.QtWidgets import QDoubleSpinBox, QWidget
 
 from app.commands.commands import AddObjectCommand
 from app.model.objects import new_object
-from app.model.properties import PROPERTIES
 from app.panels.property_panel import _PANEL_FIXED_WIDTH
 from app.ui.main_window import MainWindow
 
@@ -72,13 +71,14 @@ def _add(env: dict[str, Any], obj: Any) -> Any:
 
 
 def _field_widget(panel: Any, obj_type: str, key: str) -> QWidget:
-    specs = PROPERTIES[obj_type]
-    row = next(i for i, s in enumerate(specs) if s.key == key)
-    item = panel._form.itemAt(row, QFormLayout.ItemRole.FieldRole)
-    assert item is not None, f"field widget not found for {obj_type}.{key}"
-    widget = item.widget()
-    assert widget is not None
-    return widget
+    """`panel.field_widget_for(key)` への薄い委譲（obj_type は互換のため受け取って捨てる）。
+
+    見出し行を独立スパン行にした（`_HeaderedLabel` 廃止）ことで「PROPERTIES[type] の
+    並び順 == QFormLayout の行番号」という前提が崩れたため、生の index 引きではなく
+    公開ヘルパを経由する。
+    """
+    del obj_type
+    return panel.field_widget_for(key)
 
 
 # 全9種別を1つずつ用意するための最小限のコンストラクタ引数。

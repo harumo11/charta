@@ -13,6 +13,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QBrush, QPainterPath, QPainterPathStroker
 
 from app.graphics import curves
+from app.graphics.strokes import stroke_margin
 from app.scene.items.box_item import BoxItem
 from app.scene.items.registry import register_item
 from app.scene.items.shape_item import pen_for
@@ -36,7 +37,7 @@ class FreehandItem(BoxItem):
     """freehand オブジェクトを描画するアイテム。BoxHandleSet で変形する。"""
 
     def boundingRect(self) -> QRectF:
-        margin = max(float(self.obj.stroke_width), 0.0) / 2.0
+        margin = stroke_margin(self.obj)
         return QRectF(0.0, 0.0, self._w, self._h).adjusted(-margin, -margin, margin, margin)
 
     def _build_local_path(self) -> QPainterPath | None:

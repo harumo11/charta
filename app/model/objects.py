@@ -89,7 +89,8 @@ class BaseObject:
 class RectObject(BaseObject):
     type: str = "rect"
     fill: str | None = None
-    stroke: str = "#000000"
+    # None = 線なし（fill=None の「塗りなし」と対称。P2 契約 §担当C・項目12）。
+    stroke: str | None = "#000000"
     stroke_width: float = 2.0
     dash: str = "solid"
     corner_radius: float = 0.0
@@ -101,7 +102,8 @@ class RectObject(BaseObject):
 class EllipseObject(BaseObject):
     type: str = "ellipse"
     fill: str | None = None
-    stroke: str = "#000000"
+    # None = 線なし（fill=None の「塗りなし」と対称。P2 契約 §担当C・項目12）。
+    stroke: str | None = "#000000"
     stroke_width: float = 2.0
     dash: str = "solid"
 
@@ -226,7 +228,8 @@ class CurveObject(BaseObject):
     closed: bool = False
     tension: float = 0.5
     fill: str | None = None
-    stroke: str = "#000000"
+    # None = 線なし（fill=None の「塗りなし」と対称。P2 契約 §担当C・項目12）。
+    stroke: str | None = "#000000"
     stroke_width: float = 2.0
     dash: str = "solid"
 

@@ -100,6 +100,8 @@ _ANCHOR_NOTE = (
 #: 個別に補うキー注記（エージェントが最も間違えやすい箇所）。
 _KEY_NOTES: dict[str, str] = {
     "fill": "null = 塗りなし",
+    "stroke": "null = 線なし（rect/ellipse/curve のみ）",
+    "stroke_width": "0 = 線なし（画面・SVG ともに描かない）",
     "mask_color": "null = 透明 = 対象外領域を切り抜く",
     "crop": "[x, y, w, h]（元画像座標）または null",
     "points": "[[x, y], ...] 絶対アートボード px",

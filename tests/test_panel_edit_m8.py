@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
-    QFormLayout,
     QLineEdit,
     QPushButton,
     QWidget,
@@ -48,7 +47,6 @@ from app.model.objects import (
     TextObject,
     new_object,
 )
-from app.model.properties import PROPERTIES
 from app.ui.main_window import MainWindow
 
 # --------------------------------------------------------------------------
@@ -94,14 +92,14 @@ def _add(env: dict[str, Any], obj: Any) -> Any:
 
 
 def _field_widget(panel: Any, obj_type: str, key: str) -> QWidget:
-    """PROPERTIES[obj_type] の並び順から `key` に対応するフィールド側ウィジェットを返す。"""
-    specs = PROPERTIES[obj_type]
-    row = next(i for i, s in enumerate(specs) if s.key == key)
-    item = panel._form.itemAt(row, QFormLayout.ItemRole.FieldRole)
-    assert item is not None, f"field widget not found for {obj_type}.{key}"
-    widget = item.widget()
-    assert widget is not None
-    return widget
+    """`panel.field_widget_for(key)` への薄い委譲（obj_type は互換のため受け取って捨てる）。
+
+    見出し行を独立スパン行にした（`_HeaderedLabel` 廃止）ことで「PROPERTIES[type] の
+    並び順 == QFormLayout の行番号」という前提が崩れたため、生の index 引きではなく
+    公開ヘルパを経由する。
+    """
+    del obj_type
+    return panel.field_widget_for(key)
 
 
 def _first(widget: QWidget, cls: type) -> Any:
@@ -164,46 +162,45 @@ def test_rect_geometry_number_edit_width(env: dict[str, Any]) -> None:
     assert spin.value() == pytest.approx(50.0)
 
 
-def test_rect_color_opt_edit_fill_checkbox_and_button(
+def test_rect_fill_color_menu_sets_color_and_none(
     env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """P2契約(担当C): 「透明」QCheckBox + QPushButton の2部品を廃止し、単一の
+    色ボタン（color_opt なら QMenu 付き）に統合した。ヘッドレスからは
+    `button.menu().actions()[i].trigger()` で駆動する（`exec()` は呼ばない）。
+    """
     scene, stack, panel = env["scene"], env["stack"], env["panel"]
     rect = _add(
         env, RectObject(id=scene.document.new_id(), x=10, y=10, width=50, height=40, fill="#FF0000")
     )
     _select_only(env, rect)
 
-    container = _field_widget(panel, "rect", "fill")
-    checkbox = _first(container, QCheckBox)
-    button = _first(container, QPushButton)
+    button = _field_widget(panel, "rect", "fill")
+    assert isinstance(button, QPushButton)
+    menu = button.menu()
+    assert menu is not None
+    pick_action, none_action = menu.actions()
 
-    # checkbox: 「透明」チェックで fill が None になる。
-    checkbox.setChecked(True)
-    assert shiboken6.isValid(checkbox) and shiboken6.isValid(button)
+    # 「なし」アクション: fill が None になる。
+    none_action.trigger()
+    assert shiboken6.isValid(button)
     assert rect.fill is None
-    assert not button.isEnabled()
 
-    checkbox.setChecked(False)
-    assert shiboken6.isValid(checkbox) and shiboken6.isValid(button)
-    assert rect.fill == "#FF0000", "直前の色が復元される"
-
-    # button: QColorDialog をモックしてクリック経路（色選択）を検証する。
+    # 「色を選択…」アクション: QColorDialog をモックして色選択経路を検証する。
     monkeypatch.setattr(QColorDialog, "getColor", staticmethod(lambda *a, **k: QColor("#123456")))
-    button.click()
-    assert shiboken6.isValid(checkbox) and shiboken6.isValid(button)
+    pick_action.trigger()
+    assert shiboken6.isValid(button)
     assert rect.fill == "#123456"
 
     # SetPropertyCommand は同一 (obj, key) の連続編集を mergeWith で1エントリに
-    # 統合する（§commands.py）ため、ここまでの3回の "fill" 編集は undo 1回で
+    # 統合する（§commands.py）ため、ここまでの2回の "fill" 編集は undo 1回で
     # まとめて元の値まで戻る。
     stack.undo()
-    assert shiboken6.isValid(checkbox) and shiboken6.isValid(button)
+    assert shiboken6.isValid(button)
     assert rect.fill == "#FF0000"
-    assert not checkbox.isChecked()
-    assert button.isEnabled()
 
     stack.redo()
-    assert shiboken6.isValid(checkbox) and shiboken6.isValid(button)
+    assert shiboken6.isValid(button)
     assert rect.fill == "#123456"
 
 
@@ -222,8 +219,8 @@ def test_rect_fill_button_requests_non_native_color_dialog(
     )
     _select_only(env, rect)
 
-    container = _field_widget(panel, "rect", "fill")
-    button = _first(container, QPushButton)
+    button = _field_widget(panel, "rect", "fill")
+    assert isinstance(button, QPushButton)
 
     captured: dict[str, Any] = {}
 
@@ -232,7 +229,8 @@ def test_rect_fill_button_requests_non_native_color_dialog(
         return QColor()  # invalid → 変更しない
 
     monkeypatch.setattr(QColorDialog, "getColor", staticmethod(_fake_get_color))
-    button.click()
+    pick_action, _none_action = button.menu().actions()
+    pick_action.trigger()
 
     assert captured.get("options") == QColorDialog.ColorDialogOption.DontUseNativeDialog
 
@@ -463,11 +461,7 @@ def test_multi_math_font_size_edit_resizes_both_boxes(env: dict[str, Any]) -> No
         item.setSelected(True)
     heights = (m1.height, m2.height)
 
-    specs = panel._multi_common_specs([m1, m2])
-    row = next(i for i, s in enumerate(specs) if s.key == "font_size")
-    item = panel._form.itemAt(row, QFormLayout.ItemRole.FieldRole)
-    assert item is not None and item.widget() is not None
-    spin = item.widget()
+    spin = panel.field_widget_for("font_size")
     assert isinstance(spin, QDoubleSpinBox)
 
     index_before = stack.index()

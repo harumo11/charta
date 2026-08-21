@@ -245,8 +245,12 @@ def test_color_must_be_seven_char_hex() -> None:
 
 
 def test_nullable_color_accepts_none_but_plain_color_does_not() -> None:
+    # rect の fill/stroke はどちらも color_opt（P2契約・担当C: 項目12「矩形の線を
+    # なくせるようにしてほしい」で stroke も null 可になった）。非 nullable の例は
+    # stroke が "color" のまま据え置きの line で確かめる。
     assert _errors("rect", {"fill": None}) == []
-    (error,) = _errors("rect", {"stroke": None})
+    assert _errors("rect", {"stroke": None}) == []
+    (error,) = _errors("line", {"stroke": None})
     assert error.code == "type_mismatch"
 
 

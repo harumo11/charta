@@ -28,6 +28,7 @@ from app.graphics.routing import (
     nearest_anchor_name,
     resolve_anchor,
 )
+from app.graphics.strokes import stroke_margin
 from app.model.objects import BaseObject
 from app.scene.handles import ConnectorHandleSet
 from app.scene.items.arrow_paint import paint_arrowhead
@@ -623,7 +624,7 @@ class ConnectorItem(BaseItem):
             return QRectF()
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        margin = max(float(self.obj.stroke_width), 0.0) / 2.0 + 1.0
+        margin = stroke_margin(self.obj) + 1.0
         if self._has_arrowhead():
             margin += self._arrow_size()
         rect = QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))

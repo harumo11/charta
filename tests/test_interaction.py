@@ -227,11 +227,11 @@ def test_normal_operation_panels_stay_in_sync(rect_env: dict[str, Any]) -> None:
     app = rect_env["app"]
 
     window.property_panel.on_selection_changed()
-    assert window.property_panel._form.rowCount() == len(PROPERTIES["rect"])
+    assert window.property_panel.keys_in_form() == tuple(s.key for s in PROPERTIES["rect"])
 
     stack.push(SetPropertyCommand(scene.document, rect, "stroke_width", 5.0, rect.stroke_width))
     app.processEvents()
-    assert window.property_panel._form.rowCount() == len(PROPERTIES["rect"])
+    assert window.property_panel.keys_in_form() == tuple(s.key for s in PROPERTIES["rect"])
 
 
 # --------------------------------------------------------------------------
@@ -273,7 +273,7 @@ def test_property_panel_handles_arrow_selection_without_keyerror(
     app.processEvents()
 
     window.property_panel.on_selection_changed()  # KeyError が出ないこと
-    assert window.property_panel._form.rowCount() == len(PROPERTIES["arrow"])
+    assert window.property_panel.keys_in_form() == tuple(s.key for s in PROPERTIES["arrow"])
 
 
 # --------------------------------------------------------------------------

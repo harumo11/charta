@@ -68,6 +68,10 @@ _MouseHandler = Callable[[Any, QPointF], bool]
 
 #: sticky defaults(P3契約 §4.2)で記憶する「スタイル」フィールド名。ジオメトリ・
 #: レイヤー状態(x/y/rotation/locked/visible 等)は対象外。
+#: `fill`/`stroke` が `None`（線・塗りなし、P2契約 項目12）の場合もそのまま記憶
+#: 対象になる——「線なし矩形を1つ作ると次も線なしになる」のは、`fill=None` の
+#: 既存の粘り方（塗りなしを作ると次も塗りなし）と同じ意図的な挙動であり、
+#: バグではない。
 _STYLE_KEYS: frozenset[str] = frozenset(
     {
         "fill",

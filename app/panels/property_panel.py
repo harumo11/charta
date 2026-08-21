@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import shiboken6
@@ -29,10 +30,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -42,9 +46,9 @@ from PySide6.QtWidgets import (
 from app.commands.commands import SetArtboardCommand, SetGeometryCommand, SetPropertyCommand
 from app.model.document import Artboard, Physical
 from app.model.objects import BaseObject
-from app.model.properties import COMMON_PROPS, PROPERTIES, PropSpec
+from app.model.properties import PROPERTIES, PropSpec
 from app.ui.artboard_presets import ARTBOARD_CUSTOM_LABEL, ARTBOARD_PRESETS, preset_px_size
-from app.ui.theme import icons
+from app.ui.theme import current_theme, icons
 from app.ui.widgets.scrub_label import ScrubLabel
 
 if TYPE_CHECKING:
@@ -56,7 +60,6 @@ _GEOMETRY_KEYS = {"x", "y", "width", "height", "rotation"}
 
 _SPIN_RANGE = 1_000_000.0
 _DEFAULT_COLOR = "#000000"
-_COLOR_PROP = "charta_color"
 _MIXED_TEXT = "混在"
 # 要件: 数値スピナーの表示・入力は小数第1位まで（int の QSpinBox は対象外）。
 # ただし step が 0.1 未満の項目（opacity/brightness/contrast/smoothing、
@@ -66,15 +69,43 @@ _MIXED_TEXT = "混在"
 _NUMBER_DECIMALS = 1
 
 # パネル固定幅（選択対象に依らず一定にする要件への対応）。
-# 実測（QT_QPA_PLATFORM=offscreen, decimals=1 適用後）: 9 種別すべての
-# PropertyPanel.sizeHint().width() のうち line/arrow（point ウィジェット
-# ×2 行を含む）が最大で 332px。他の全種別・未選択・複数選択はこれより
-# 小さい。この最大値にフォント差など環境差のマージンを載せて 340px とする
-# （setFixedWidth は最小=最大幅を固定するため、これより狭いとラベル/
-# フィールドが切り詰められる — 実測値を下回らないことが必須）。
-# P2 で整列行/artboard モード/セクション見出しを追加した後も 340px に収まる
-# ことを実測で確認済み（§3.7、tests/test_panel_layout.py が定数 import で検証）。
+#
+# 実測手順（必須）: QT_QPA_PLATFORM=offscreen かつ **apply_theme() 適用下**で各種別を選択し
+# `panel._form_widget.sizeHint().width()`（フォームの自然な＝圧縮前の幅）の最大値を採る。
+# `panel.minimumSizeHint().width()` は使わないこと——フォームを `QScrollArea` で包んで
+# 以降（レビュー所見対応、下記）、`panel` 自身の minimumSizeHint はスクロール領域の小さな
+# 既定値を返すだけになり、フォームの実際の幅要求を反映しない。テーマ未適用で測ると QSS の
+# padding とアプリフォント（Noto Sans 10pt）が乗らず 40px 以上小さい値が出る（conftest.py は
+# apply_theme() を呼ばないため、tests/test_panel_layout.py の既存テストで測っている sizeHint
+# はテーマ未適用の値であり、この docstring とは別の前提で有効なままである）。
+# テーマ適用下の実測（2026-08-21、レビュー所見適用後: line/arrow の point 行スピンに
+# `setMinimumWidth(80)`、artboard の preset コンボに `setMinimumWidth(150)` を追加）:
+# `_form_widget.sizeHint().width()` は rect 205 / connector 228 / artboard 335 /
+# **line・arrow 356**。すなわち line/arrow だけが固定幅 340 を超え、point 行
+# （始点/終点）のスピン 1 個あたり自然幅 110px に対し実配置 88〜93px（ウィンドウにより
+# 微差）へ圧縮される。この圧縮は `setMinimumWidth(80)` で意図的に許容している
+# （自然幅のままだとフォームの `minimumSizeHint` が 340 を超え、フォームを包む
+# `QScrollArea` の `setWidgetResizable(True)` がその最小値まで幅を広げてしまい、
+# 横スクロールバー無しでは右側が見切れて操作不能になる——レビューで見つかった回帰。
+# フロアを下げて再び「圧縮されるが全部見える」旧来のトレードオフに戻した）。
+# 注意: artboard の `_form_widget.minimumSizeHint().width()`（`setMinimumWidth(150)`
+# 適用後の**最小**幅、sizeHint ではない）は 245——`test_point_row_spins_are_squeezed_
+# at_the_current_fixed_width` が line で確認しているのと同種の「最小幅がビューポート
+# 幅を超えない」性質を、artboard 自身は sizeHint（335）が固定幅を超える側なので
+# 個別テストでは確認していない（実機の 24 ケースのマトリクス確認では OK だった。
+# `tests/test_panel_row_metrics.py` の `test_all_field_rows_share_one_height[...-
+# artboard]` 系がこれをカバーする）。
+# 値そのものの表示は破綻しないため 340 を維持している（広げるとキャンバスが狭くなる。
+# ユーザーの要望は「高さが揃っていない」であって幅ではないため、要望されていない見た目の
+# 変更を避ける）。この圧縮の事実は tests/test_panel_row_metrics.py::
+# test_point_row_spins_are_squeezed_at_the_current_fixed_width が明示的に記録する
+# （幅を 380 などに変えたらこのテストが落ちて気づける、という向きの安全網）。
 _PANEL_FIXED_WIDTH = 340
+
+# QFormLayout の行間隔（P2契約 担当A）。Fusion 既定と同値を明示することで、
+# 将来スタイルが変わってもここが唯一の真実源になる（Fusion 既定に暗黙に委ねない）。
+_FORM_V_SPACING = 6
+_FORM_H_SPACING = 12
 
 # 整列/分布ボタン行（P2契約 §3.3）: (アイコン名, ツールチップ, align_selected/
 # distribute_selected へ渡すモード文字列)。
@@ -93,8 +124,35 @@ _DISTRIBUTE_ACTIONS: tuple[tuple[str, str, str], ...] = (
 _ALIGN_BUTTON_SIZE = 24
 _ALIGN_ICON_SIZE = 16
 
-# multi モードで対象にする kind（point/text/color_opt は対象外、P2契約 §3.6）。
-_MULTI_KINDS = frozenset({"number", "int", "color", "enum", "bool"})
+# multi モードで対象にする kind（point/text は対象外、P2契約 §3.6）。
+# color_opt は P2 契約（担当C）で追加: rect/ellipse/curve の stroke が
+# color_opt になったため、これを対象外にすると「rect を複数選択したときに
+# 線色行が出ない」という新たな回帰になる。ただし rect+line のような
+# color/color_opt 混在は `_multi_common_specs` が実効 kind を "color" へ
+# 寄せるため、この集合には両方を含めておく。
+_MULTI_KINDS = frozenset({"number", "int", "color", "color_opt", "enum", "bool"})
+
+#: color と color_opt は「色を選ぶ」という操作としては互換（P2契約: 複数選択で
+#: rect+line の「線色」行を消さないための互換扱い）。
+_COLOR_KINDS = frozenset({"color", "color_opt"})
+
+
+def _pin_control_height(widget: QWidget) -> None:
+    """スピン/チェックボックスの高さを `control_h` に固定する（レビュー所見）。
+
+    Fusion + QSS の `min-height` は、実測では「その時点でウィジェットに
+    割り当てられている幅」によって最終的な計算結果が変わることが確認できた
+    （`QDoubleSpinBox`/`QSpinBox`/`QCheckBox` は同じ QSS・同じテーマでも、
+    line/arrow の point 行のように幅が圧縮されたり、フォームの縦スクロール
+    バーの出現/消失でビューポート幅が数px 増減したりするたびに、外形高さが
+    29/32/35/37px のようにばらついた）。QSS の係数（`control_h - N`）を
+    チューニングするだけでは「幅が変わるたびに再び崩れる」問題を構造的に
+    解決できないため、レイアウト API（`setFixedHeight`）で高さそのものを
+    幅に依存しない値へ固定する。ウィジェット単位の `setStyleSheet` ではない
+    ため「原則禁止」規約には抵触しない。QSS 側の min-height はこれと矛盾
+    しない下限として残してある（フォールバックスタイル適用時の保険）。
+    """
+    widget.setFixedHeight(current_theme().control_h)
 
 
 class _MixedDoubleSpinBox(QDoubleSpinBox):
@@ -130,38 +188,6 @@ class _MixedSpinBox(QSpinBox):
         if self.mixed:
             return _MIXED_TEXT
         return super().textFromValue(value)
-
-
-class _HeaderedLabel(QWidget):
-    """セクション見出し + 実ラベルを縦に積んだ複合ラベル欄（P2契約 §3.4）。
-
-    `QFormLayout` の行数を変えずに「見出し行を挿入した」見た目を得るため、
-    見出しはこの行自身のラベル欄（`LabelRole`）にだけ埋め込み、フィールド欄
-    （`FieldRole`）は一切変更しない。これは `tests/test_panel_layout.py` /
-    `tests/test_panel_edit_m8.py` / `tests/test_interaction.py` が
-    「`PROPERTIES[type]` の並び順 == `QFormLayout` の行番号」という前提で
-    `_form.itemAt(row, FieldRole)` / `_form.rowCount()` を検証しているため
-    （見出しを独立した行として `addRow` すると行番号がずれてこれらが壊れる）。
-    `tests/test_type_anchors.py` は `LabelRole` 側ウィジェットの `.text()` を
-    呼ぶため、実ラベルへ委譲する `text()` を用意して互換性を保つ。
-    """
-
-    def __init__(
-        self, header_text: str, label_widget: QWidget, parent: QWidget | None = None
-    ) -> None:
-        super().__init__(parent)
-        self._label_widget = label_widget
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        header = QLabel(header_text)
-        header.setProperty("role", "section")
-        layout.addWidget(header)
-        layout.addWidget(label_widget)
-
-    def text(self) -> str:
-        get_text = getattr(self._label_widget, "text", None)
-        return get_text() if callable(get_text) else ""
 
 
 class PropertyPanel(QWidget):
@@ -207,17 +233,63 @@ class PropertyPanel(QWidget):
         self._push_depth = 0
         self._resync_pending = False
 
+        # 公開ヘルパ（row_for_key/field_widget_for/...）の裏付けとなる行台帳。
+        # 見出し行を独立スパン行にした（_HeaderedLabel 廃止）ことで、
+        # 「PROPERTIES[type] の並び順 == QFormLayout の行番号」という前提が
+        # 崩れるため、key → 実際の行番号を明示的に記録する。
+        self._row_keys: dict[str, int] = {}
+        # keys_in_form() が返す表示順（requires で隠れた行は含まない）。
+        self._ordered_keys: list[str] = []
+        # (見出し行の行番号, 見出しテキスト) の列。line/arrow で「スタイル」が
+        # p1（始点）行の直前に付くバグ（ユーザー報告）をテストで固定するために使う。
+        self._section_rows: list[tuple[int, str]] = []
+
+        # QSS の `#propertyPanel` スコープ選択子（app/ui/theme/qss.py）がこのパネル
+        # 自体を識別する鍵（将来パネル全体の見た目を扱う規則のため）。
+        self.setObjectName("propertyPanel")
+
         self._align_row = self._build_align_row()
         self._info_label = QLabel("")
         self._form = QFormLayout()
         self._form_widget = QWidget()
+        # 行高・スウォッチ幅の QSS 規則（`#propertyPanelForm ...`）は `self`
+        # ではなくこちらをスコープ鍵にする。`_make_color_widget` が開く
+        # `QColorDialog` は `self`（PropertyPanel）を親に取るため、`#propertyPanel
+        # QPushButton` のような子孫セレクタにすると、ダイアログ内部の OK/Cancel/
+        # 「画面上の色を選択」ボタンまで拾って幅108pxへ強制的に狭められてしまう
+        # （実測で確認済み。ラベル文字が入り切らずクリップされる）。フォーム内容の
+        # コンテナだけを鍵にすることで、その配下にしかいないスウォッチ/入力欄だけに
+        # 規則が効き、ダイアログには届かなくなる。
+        self._form_widget.setObjectName("propertyPanelForm")
         self._form_widget.setLayout(self._form)
+        self._configure_form()
+
+        # フォームをスクロール領域に包む（レビュー所見: ドックがフォームの
+        # sizeHint 未満の高さしか与えないとき——1366×768/1200×900 のような
+        # 常用ウィンドウで text/rect フォームは容易にこれを超える——QVBoxLayout
+        # は `_form_widget` を QSS の min-height 未満まで圧縮してしまい、行高
+        # 統一・ラベル/入力欄の垂直中心一致（担当A の目的そのもの）が崩れる。
+        # `setWidgetResizable(True)` で「ビューポートより小さければビューポート
+        # まで広げ、`_form_widget.minimumSizeHint()` より小さくはしない」という
+        # Qt 標準の挙動に任せることで、縦方向は自然な sizeHint を尊重して
+        # スクロールに逃がす（どんなドック高でも行は常に control_h を保つ）。
+        # 横方向は `_make_point_widget` 側でスピンに `setMinimumWidth` の下限を
+        # 設けてあるため、フォーム全体の最小幅がパネル固定幅(340px)を上回らず、
+        # 横スクロールバー（AlwaysOff）を出さなくても見切れない
+        # （line/arrow の point 行が圧縮されて全部見える、という既存の
+        # トレードオフを維持したまま実現している）。
+        self._form_scroll = QScrollArea()
+        self._form_scroll.setObjectName("propertyPanelFormScroll")
+        self._form_scroll.setWidget(self._form_widget)
+        self._form_scroll.setWidgetResizable(True)
+        self._form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._form_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._align_row)
         layout.addWidget(self._info_label)
-        layout.addWidget(self._form_widget)
-        layout.addStretch(1)
+        layout.addWidget(self._form_scroll, 1)
 
         # 選択オブジェクト種別ごとにフォーム内容の幅が変わっても QDockWidget が
         # 追従リサイズしないよう、パネル自体を固定幅にする（要件1）。
@@ -241,6 +313,47 @@ class PropertyPanel(QWidget):
         """
         hint = super().minimumSizeHint()
         return QSize(hint.width(), 1)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt override)
+        """フォームの自然な幅を反映する（`_form_scroll` の幅上乗せを打ち消す）。
+
+        `QScrollArea.sizeHint()` は縦スクロールバー用の余白を常に見込むため、
+        埋め込みウィジェット（`_form_widget`）自身の sizeHint 幅より広い値を
+        返す（実測: 内容 316px に対し 329px）。これが `panel.sizeHint()`
+        （`panel.adjustSize()` が使う）を押し上げ、line/arrow のような
+        幅広フォームで `_PANEL_FIXED_WIDTH` を余分に超えてしまう
+        （既存テスト `test_panel_form_does_not_exceed_fixed_width_for_widest_type`
+        の回帰、レビュー所見対応）。
+
+        `_FormScrollArea` のようなサブクラスで `sizeHint()` 自体を上書きする
+        案も試したが、`QLayout` が `QWidgetItem` 経由で C++ 側から呼ぶ経路
+        では反映されないことを実測で確認した（Python から直接呼べば上書きは
+        効くが、レイアウトの `totalSizeHint()` 計算はこの経路を通らない）。
+        そのため、最終的な合計を返す**この関数**で埋め込みウィジェットの
+        sizeHint を直接読み、差分だけ補正する（Python から直接呼ぶので
+        上記の制約を受けない）。
+        """
+        hint = super().sizeHint()
+        overshoot = self._form_scroll.sizeHint().width() - self._form_widget.sizeHint().width()
+        if overshoot > 0:
+            return QSize(hint.width() - overshoot, hint.height())
+        return hint
+
+    def _configure_form(self) -> None:
+        """行の整列規約を明示する（Fusion 既定に委ねない、P2契約 担当A）。
+
+        既定では labelAlignment に垂直フラグが無く、行がフィールドより高いとき
+        フィールドが上寄せされる（実測: 見出し埋め込み行でラベル文字とスピンの中心が
+        13〜21px ずれていた）。AlignVCenter を明示し、行の高さは QSS の min-height
+        （Theme.control_h）で一定にすることで、どの kind の行でもラベル文字と入力欄の
+        垂直中心が一致する。
+        """
+        self._form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self._form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        self._form.setVerticalSpacing(_FORM_V_SPACING)
+        self._form.setHorizontalSpacing(_FORM_H_SPACING)
 
     # ------------------------------------------------------------------
     # 整列/分布ボタン行（P2契約 §3.3）
@@ -432,6 +545,9 @@ class PropertyPanel(QWidget):
     def _clear_form(self) -> None:
         while self._form.rowCount() > 0:
             self._form.removeRow(0)
+        self._row_keys = {}
+        self._ordered_keys = []
+        self._section_rows = []
 
     # ------------------------------------------------------------------
     # object モード: フォーム構築（PROPERTIES 駆動）
@@ -442,28 +558,42 @@ class PropertyPanel(QWidget):
         self._updaters = []
         try:
             specs = PROPERTIES.get(obj.type, [])
-            common_keys = {p.key for p in COMMON_PROPS}
-            # 「スタイル」見出しの挿入位置: COMMON_PROPS に無い最初の key
-            # （P2契約 §3.4）。line/arrow/connector のように x を持たない型では
-            # 「変形」見出しは自然と発生しない（spec.key=="x" が存在しないため）。
-            style_header_index = next(
-                (i for i, s in enumerate(specs) if s.key not in common_keys), None
-            )
-            for i, spec in enumerate(specs):
+            for spec in specs:
                 if spec.requires is not None and not getattr(obj, spec.requires, None):
                     continue
+                # 見出しは PropSpec.section（データ）が持つ。「COMMON_PROPS に
+                # 無い最初の key」という位置ベースの推論は、x/y を持たない
+                # line/arrow で「スタイル」が p1（始点）行に付くバグを生んでいた
+                # （ユーザー報告）。section を独立スパン行として先に addRow する
+                # ことで、見出しの有無がフィールド行の高さ（QFormLayout の
+                # 上寄せ）に影響しなくなる（項目3/項目4 の主因対策）。
+                if spec.section is not None:
+                    header_row = self._form.rowCount()
+                    self._form.addRow(self._make_section_label(spec.section))
+                    self._section_rows.append((header_row, spec.section))
                 widget = self._make_widget(obj, spec)
                 label_widget = self._make_label_widget(spec, widget)
-                header_text: str | None = None
-                if spec.key == "x":
-                    header_text = "変形"
-                elif i == style_header_index:
-                    header_text = "スタイル"
-                if header_text is not None:
-                    label_widget = _HeaderedLabel(header_text, label_widget)
+                field_row = self._form.rowCount()
                 self._form.addRow(label_widget, widget)
+                self._row_keys[spec.key] = field_row
+                self._ordered_keys.append(spec.key)
         finally:
             self._rebuilding = False
+
+    @staticmethod
+    def _make_section_label(text: str) -> QLabel:
+        """セクション見出し用の独立スパン行ラベルを作る。
+
+        以前は `_HeaderedLabel` で見出しをラベル欄に埋め込んでいたが、
+        フィールド行がラベル欄の高さ（見出し2行分）に引っ張られて上寄せされ、
+        実ラベル文字と入力欄の中心が最大21pxずれていた（項目3/項目4 の実測）。
+        `QFormLayout.addRow(widget)`（スパン行）として完全に独立させることで、
+        見出しの有無がフィールド行の高さに一切影響しなくなる。artboard モードの
+        見出しもこれを使い、見出し生成を1箇所に統一する。
+        """
+        label = QLabel(text)
+        label.setProperty("role", "section")
+        return label
 
     def _make_label_widget(self, spec: PropSpec, field_widget: QWidget) -> QWidget:
         """number/int/point 行のラベルは ScrubLabel にする（P2契約 §3.4）。
@@ -479,6 +609,58 @@ class PropertyPanel(QWidget):
         return QLabel(spec.label)
 
     # ------------------------------------------------------------------
+    # 公開ヘルパ（契約 API）: セクション見出しの独立行化により
+    # 「PROPERTIES[type] の並び順 == QFormLayout の行番号」という前提が
+    # 崩れたため、key から実際の行/ウィジェットを引く経路をここに一本化する
+    # （テストと外部からはこの経路を使うこと。itemAt の生の index 引きは
+    # 見出し行があると見出しラベル自身を掴んでしまう）。
+    # ------------------------------------------------------------------
+
+    def row_for_key(self, key: str) -> int:
+        """`key` に対応する `QFormLayout` の行番号（FieldRole 側）を返す。
+
+        見出し行はどの key にも属さないため、この番号は常に実データ行を指す。
+        """
+        try:
+            return self._row_keys[key]
+        except KeyError:
+            available = ", ".join(sorted(self._row_keys)) or "(none)"
+            raise KeyError(f"row not found for key {key!r}; available keys: {available}") from None
+
+    def field_widget_for(self, key: str) -> QWidget:
+        """`key` のフィールド側ウィジェットを返す（セクション見出しを返すことはない）。"""
+        row = self.row_for_key(key)
+        item = self._form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+        if item is None:
+            # `python -O` で assert が消えても不変条件違反を無言で通さない
+            # （`row_for_key` の KeyError と同様、公開ヘルパは例外種別を
+            # 安定させる。レビュー所見）。
+            raise RuntimeError(f"field item not found for key {key!r} (row={row})")
+        widget = item.widget()
+        if widget is None:
+            raise RuntimeError(f"field widget not found for key {key!r} (row={row})")
+        return widget
+
+    def label_widget_for(self, key: str) -> QWidget:
+        """`key` のラベル側ウィジェットを返す。"""
+        row = self.row_for_key(key)
+        item = self._form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+        if item is None:
+            raise RuntimeError(f"label item not found for key {key!r} (row={row})")
+        widget = item.widget()
+        if widget is None:
+            raise RuntimeError(f"label widget not found for key {key!r} (row={row})")
+        return widget
+
+    def keys_in_form(self) -> tuple[str, ...]:
+        """現在のフォームの表示順（`requires` で隠れた行は含まない）。"""
+        return tuple(self._ordered_keys)
+
+    def section_rows(self) -> tuple[tuple[int, str], ...]:
+        """(見出し行の行番号, 見出しテキスト) の列を表示順に返す。"""
+        return tuple(self._section_rows)
+
+    # ------------------------------------------------------------------
     # ウィジェット生成（kind ごと、object モード用）
     # ------------------------------------------------------------------
 
@@ -489,10 +671,8 @@ class PropertyPanel(QWidget):
             return self._make_int_widget(obj, spec)
         if spec.kind == "point":
             return self._make_point_widget(obj, spec)
-        if spec.kind == "color":
+        if spec.kind in ("color", "color_opt"):
             return self._make_color_widget(obj, spec)
-        if spec.kind == "color_opt":
-            return self._make_color_opt_widget(obj, spec)
         if spec.kind == "enum":
             return self._make_enum_widget(obj, spec)
         if spec.kind == "bool":
@@ -503,6 +683,7 @@ class PropertyPanel(QWidget):
 
     def _make_number_widget(self, obj: BaseObject, spec: PropSpec) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
+        _pin_control_height(spin)
         spin.setKeyboardTracking(False)
         spin.setDecimals(spec.decimals if spec.decimals is not None else _NUMBER_DECIMALS)
         spin.setMinimum(spec.minimum if spec.minimum is not None else -_SPIN_RANGE)
@@ -538,6 +719,7 @@ class PropertyPanel(QWidget):
 
     def _make_int_widget(self, obj: BaseObject, spec: PropSpec) -> QSpinBox:
         spin = QSpinBox()
+        _pin_control_height(spin)
         spin.setKeyboardTracking(False)
         spin.setMinimum(int(spec.minimum) if spec.minimum is not None else int(-_SPIN_RANGE))
         spin.setMaximum(int(spec.maximum) if spec.maximum is not None else int(_SPIN_RANGE))
@@ -572,17 +754,37 @@ class PropertyPanel(QWidget):
 
     def _make_point_widget(self, obj: BaseObject, spec: PropSpec) -> QWidget:
         container = QWidget()
+        # 行高統一の対象は `field_widget_for("p1")` が返すこのコンテナ自身
+        # （内側のスピン2個は個別に `_pin_control_height` 済み）。
+        _pin_control_height(container)
         hlayout = QHBoxLayout(container)
         hlayout.setContentsMargins(0, 0, 0, 0)
+        # ラベル("x"/"y")とスピンの間隔を明示する（P2契約 担当A。Fusion 既定の
+        # 詰まり方に委ねず、外側フォームの _FORM_H_SPACING より詰めた値にして
+        # 「内側の対」であることを視覚的に示す）。
+        hlayout.setSpacing(6)
 
         point: list[float] = list(getattr(obj, spec.key))
         spin_x = QDoubleSpinBox()
         spin_y = QDoubleSpinBox()
         for spin in (spin_x, spin_y):
+            _pin_control_height(spin)
             spin.setKeyboardTracking(False)
             spin.setDecimals(_NUMBER_DECIMALS)
             spin.setMinimum(-_SPIN_RANGE)
             spin.setMaximum(_SPIN_RANGE)
+            # line/arrow の始点/終点行はスピン2個を横に並べるため、自然な
+            # sizeHint（107px前後/個）のままだとフォーム全体の最小幅が
+            # `_PANEL_FIXED_WIDTH` を超える。フォームを包む QScrollArea が
+            # `setWidgetResizable(True)` で「ビューポートより小さければ
+            # minimumSizeHint まで広げる」ため、この最小幅がパネル幅を
+            # 超えると横スクロールバー無しでは右側が見切れる（レビュー所見の
+            # 回帰）。ここで最小幅の床を下げておくことで、フォームの最小幅が
+            # 常にパネル幅に収まり、QFormLayout の AllNonFixedFieldsGrow が
+            # 従来どおりスピンを圧縮してフィットさせる（点行が圧縮されてでも
+            # 全部見える、という既存のトレードオフを維持）。80px は小数第1位
+            # までの数値（例 "-1234.5"）が入る実用上の下限。
+            spin.setMinimumWidth(80)
         spin_x.blockSignals(True)
         spin_x.setValue(float(point[0]))
         spin_x.blockSignals(False)
@@ -590,9 +792,18 @@ class PropertyPanel(QWidget):
         spin_y.setValue(float(point[1]))
         spin_y.blockSignals(False)
 
-        hlayout.addWidget(QLabel("x"))
+        # 行高統一後は外側ラベル（ScrubLabel）と同じ AlignVCenter を明示することで、
+        # 内側の "x"/"y" ラベルもスピンと中心が一致する（実測で確認済み。
+        # QSpinBox.setPrefix 化はスピンの sizeHint を +11px/個 押し上げて幅制約を
+        # 圧迫するので採らない）。
+        label_x = QLabel("x")
+        label_x.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        label_y = QLabel("y")
+        label_y.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        hlayout.addWidget(label_x)
         hlayout.addWidget(spin_x)
-        hlayout.addWidget(QLabel("y"))
+        hlayout.addWidget(label_y)
         hlayout.addWidget(spin_y)
 
         def on_changed(
@@ -644,10 +855,29 @@ class PropertyPanel(QWidget):
         return container
 
     def _make_color_widget(self, obj: BaseObject, spec: PropSpec) -> QPushButton:
-        button = QPushButton()
-        self._apply_button_color(button, getattr(obj, spec.key) or _DEFAULT_COLOR)
+        """color / color_opt 共通の色ボタンを作る（P2契約: 色ウィジェットの単一化）。
 
-        def on_click(
+        以前は kind="color_opt" 専用に `_make_color_opt_widget`
+        （QCheckBox「透明」+ QPushButton の2部品構成）を持っていたが、これを廃止し
+        1個のボタンへ統合した。理由は3つ:
+        (1) 1プロパティに2部品出すのはユーザーの「UI部品は最小限」方針に反する。
+        (2) QCheckBox は QSS 上の行高が他コントロールと異なり、行高不揃い
+            （項目3）の原因の一つだった。
+        (3) 「透明」解除時に直前の色をボタンの動的プロパティへ退避・復元する
+            隠し状態が、トグルの往復だけで元の色を失う回帰を過去に起こして
+            いた。
+
+        nullable（kind=="color_opt"）のときだけボタンに `QMenu` を付け、
+        「色を選択…」と `spec.null_label` の2アクションから選ぶ（`exec()` を
+        呼ばずに `menu().actions()[i].trigger()` でヘッドレスに駆動できる）。
+        非 nullable（kind=="color"）はメニューを付けず `clicked` → 直接ダイアログ
+        のまま（従来どおり）。
+        """
+        nullable = spec.kind == "color_opt"
+        button = QPushButton()
+        self._apply_button_color(button, getattr(obj, spec.key), spec.null_label)
+
+        def pick_color(
             _checked: bool = False,
             obj: BaseObject = obj,
             spec: PropSpec = spec,
@@ -668,106 +898,40 @@ class PropertyPanel(QWidget):
             new_value = color.name()
             if new_value == old_value:
                 return
-            self._apply_button_color(button, new_value)
+            self._apply_button_color(button, new_value, spec.null_label)
             self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
 
-        button.clicked.connect(on_click)
+        def set_none(
+            _checked: bool = False,
+            obj: BaseObject = obj,
+            spec: PropSpec = spec,
+            button: QPushButton = button,
+        ) -> None:
+            old_value = getattr(obj, spec.key)
+            if old_value is None:
+                return
+            self._apply_button_color(button, None, spec.null_label)
+            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, None, old_value))
+
+        if nullable:
+            menu = QMenu(button)
+            pick_action = menu.addAction("色を選択…")
+            pick_action.triggered.connect(pick_color)
+            none_action = menu.addAction(spec.null_label)
+            none_action.triggered.connect(set_none)
+            button.setMenu(menu)
+        else:
+            button.clicked.connect(pick_color)
 
         def update_widget(
             button: QPushButton = button, obj: BaseObject = obj, spec: PropSpec = spec
         ) -> None:
             if not shiboken6.isValid(button):
                 return
-            self._apply_button_color(button, getattr(obj, spec.key) or _DEFAULT_COLOR)
+            self._apply_button_color(button, getattr(obj, spec.key), spec.null_label)
 
         self._updaters.append(update_widget)
         return button
-
-    def _make_color_opt_widget(self, obj: BaseObject, spec: PropSpec) -> QWidget:
-        container = QWidget()
-        hlayout = QHBoxLayout(container)
-        hlayout.setContentsMargins(0, 0, 0, 0)
-
-        current: str | None = getattr(obj, spec.key)
-        checkbox = QCheckBox("透明")
-        button = QPushButton()
-        checkbox.blockSignals(True)
-        checkbox.setChecked(current is None)
-        checkbox.blockSignals(False)
-        button.setEnabled(current is not None)
-        self._apply_button_color(button, current or _DEFAULT_COLOR)
-
-        hlayout.addWidget(checkbox)
-        hlayout.addWidget(button)
-
-        def on_toggle(
-            checked: bool,
-            obj: BaseObject = obj,
-            spec: PropSpec = spec,
-            button: QPushButton = button,
-        ) -> None:
-            button.setEnabled(not checked)
-            if self._rebuilding:
-                return
-            old_value = getattr(obj, spec.key)
-            stored_color = button.property(_COLOR_PROP) or _DEFAULT_COLOR
-            new_value: str | None = None if checked else stored_color
-            if new_value == old_value:
-                return
-            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
-
-        def on_click(
-            _checked: bool = False,
-            obj: BaseObject = obj,
-            spec: PropSpec = spec,
-            button: QPushButton = button,
-        ) -> None:
-            old_value = getattr(obj, spec.key)
-            initial = QColor(old_value) if old_value else QColor(_DEFAULT_COLOR)
-            # DontUseNativeDialog: ネイティブ色ダイアログの環境では `setCustomColor`
-            # で載せたパレットスウォッチが表示されない（所見 S1）。
-            color = QColorDialog.getColor(
-                initial,
-                self,
-                "色を選択",
-                options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
-            )
-            if not color.isValid():
-                return
-            new_value = color.name()
-            if new_value == old_value:
-                return
-            self._apply_button_color(button, new_value)
-            self._push(SetPropertyCommand(self.scene.document, obj, spec.key, new_value, old_value))
-
-        checkbox.toggled.connect(on_toggle)
-        button.clicked.connect(on_click)
-
-        def update_widget(
-            checkbox: QCheckBox = checkbox,
-            button: QPushButton = button,
-            obj: BaseObject = obj,
-            spec: PropSpec = spec,
-        ) -> None:
-            if not shiboken6.isValid(checkbox) or not shiboken6.isValid(button):
-                return
-            current: str | None = getattr(obj, spec.key)
-            checkbox.blockSignals(True)
-            try:
-                checkbox.setChecked(current is None)
-            finally:
-                checkbox.blockSignals(False)
-            button.setEnabled(current is not None)
-            # current が None（透明）の間はボタンの色/_COLOR_PROP に触れない。
-            # ここで _DEFAULT_COLOR を書き込んでしまうと、on_toggle が
-            # 「直前の色を覚えておいて透明解除時に復元する」ために読む
-            # button.property(_COLOR_PROP) を上書きしてしまい、透明トグルの
-            # on/off を往復するだけで元の色を失う（実際に発生した回帰）。
-            if current is not None:
-                self._apply_button_color(button, current)
-
-        self._updaters.append(update_widget)
-        return container
 
     def _make_enum_widget(self, obj: BaseObject, spec: PropSpec) -> QComboBox:
         combo = QComboBox()
@@ -807,6 +971,7 @@ class PropertyPanel(QWidget):
 
     def _make_bool_widget(self, obj: BaseObject, spec: PropSpec) -> QCheckBox:
         checkbox = QCheckBox()
+        _pin_control_height(checkbox)
         checkbox.blockSignals(True)
         checkbox.setChecked(bool(getattr(obj, spec.key)))
         checkbox.blockSignals(False)
@@ -877,8 +1042,16 @@ class PropertyPanel(QWidget):
         """選択オブジェクト全型に共通する (key, kind[, options]) を求める。
 
         表示順は先頭オブジェクトの型の spec 順（PROPERTIES[type] の交差）。
-        text/point/color_opt は対象外。`requires` 付き spec も対象外にする
+        text/point は対象外。`requires` 付き spec も対象外にする
         （mask_src 等インスタンス依存の可否を型交差だけでは判定できないため）。
+
+        color/color_opt は互換扱いにする（P2契約: 担当C）。rect（fill/stroke が
+        color_opt）と line（stroke が color のまま）を同時選択すると、単純な
+        `other.kind != spec.kind` 判定では「線色」行そのものが消えてしまう
+        （color_opt vs color の不一致として弾かれるため。今できていることの
+        回帰になる）。実効 kind は「全員 color_opt のときだけ color_opt、
+        1つでも color が混ざれば color」に寄せる（狭い方＝null を許容しない方へ
+        寄せることで、実際に None を送れない対象を含む行にメニューを出さない）。
         """
         if not objs:
             return []
@@ -890,13 +1063,27 @@ class PropertyPanel(QWidget):
             if spec.kind not in _MULTI_KINDS or spec.requires is not None:
                 continue
             ok = True
+            kinds = {spec.kind}
             for spec_map in other_spec_maps:
                 other = spec_map.get(spec.key)
-                if other is None or other.kind != spec.kind or other.options != spec.options:
+                if other is None or other.requires is not None:
                     ok = False
                     break
-            if ok:
-                result.append(spec)
+                if other.kind == spec.kind:
+                    if other.options != spec.options:
+                        ok = False
+                        break
+                    continue
+                if {spec.kind, other.kind} <= _COLOR_KINDS:
+                    kinds.add(other.kind)
+                    continue
+                ok = False
+                break
+            if not ok:
+                continue
+            if kinds <= _COLOR_KINDS and len(kinds) > 1:
+                spec = replace(spec, kind="color")
+            result.append(spec)
         return result
 
     def _build_multi_form(self, objs: list[BaseObject]) -> None:
@@ -905,7 +1092,11 @@ class PropertyPanel(QWidget):
         try:
             for spec in self._multi_common_specs(objs):
                 widget = self._make_multi_widget(objs, spec)
+                row = self._form.rowCount()
                 self._form.addRow(QLabel(spec.label), widget)
+                # 公開ヘルパ（row_for_key 等）が multi モードでも引けるようにする。
+                self._row_keys[spec.key] = row
+                self._ordered_keys.append(spec.key)
         finally:
             self._rebuilding = False
 
@@ -914,7 +1105,7 @@ class PropertyPanel(QWidget):
             return self._make_multi_number_widget(objs, spec)
         if spec.kind == "int":
             return self._make_multi_int_widget(objs, spec)
-        if spec.kind == "color":
+        if spec.kind in ("color", "color_opt"):
             return self._make_multi_color_widget(objs, spec)
         if spec.kind == "enum":
             return self._make_multi_enum_widget(objs, spec)
@@ -924,6 +1115,7 @@ class PropertyPanel(QWidget):
 
     def _make_multi_number_widget(self, objs: list[BaseObject], spec: PropSpec) -> QDoubleSpinBox:
         spin = _MixedDoubleSpinBox()
+        _pin_control_height(spin)
         spin.setKeyboardTracking(False)
         spin.setDecimals(spec.decimals if spec.decimals is not None else _NUMBER_DECIMALS)
         spin.setMinimum(spec.minimum if spec.minimum is not None else -_SPIN_RANGE)
@@ -981,6 +1173,7 @@ class PropertyPanel(QWidget):
 
     def _make_multi_int_widget(self, objs: list[BaseObject], spec: PropSpec) -> QSpinBox:
         spin = _MixedSpinBox()
+        _pin_control_height(spin)
         spin.setKeyboardTracking(False)
         spin.setMinimum(int(spec.minimum) if spec.minimum is not None else int(-_SPIN_RANGE))
         spin.setMaximum(int(spec.maximum) if spec.maximum is not None else int(_SPIN_RANGE))
@@ -1032,6 +1225,16 @@ class PropertyPanel(QWidget):
         return spin
 
     def _make_multi_color_widget(self, objs: list[BaseObject], spec: PropSpec) -> QPushButton:
+        """color / color_opt 共通の複数選択用色ボタン（単一選択の `_make_color_widget`
+        と同じ理由で統一。P2契約 §3.6）。
+
+        `effective kind`（`_multi_common_specs` が既に決めている）が "color_opt"
+        のとき（＝選択全員が color_opt）だけメニューを付ける。rect+line のような
+        混在は effective kind が "color" に寄せられているため、ここではメニュー
+        無し・直接ダイアログのまま（多数派が None を許容しない対象を含むので、
+        一括で None を送る操作を UI 上提示しない）。
+        """
+        nullable = spec.kind == "color_opt"
         button = QPushButton()
 
         def sync_widget(button: QPushButton = button) -> None:
@@ -1039,17 +1242,32 @@ class PropertyPanel(QWidget):
                 return
             values = {getattr(o, spec.key) for o in objs}
             if len(values) == 1:
-                self._apply_button_color(button, next(iter(values)) or _DEFAULT_COLOR)
+                self._apply_button_color(button, next(iter(values)), spec.null_label)
             else:
                 button.setText(_MIXED_TEXT)
                 button.setStyleSheet("")
-                button.setProperty(_COLOR_PROP, None)
+                button.setToolTip(_MIXED_TEXT)
 
         sync_widget()
 
-        def on_click(_checked: bool = False, button: QPushButton = button) -> None:
+        def apply_color(new_value: str | None, button: QPushButton = button) -> None:
+            cmds: list[Any] = []
+            for o in objs:
+                old_value = getattr(o, spec.key)
+                if old_value == new_value:
+                    continue
+                cmds.append(
+                    SetPropertyCommand(self.scene.document, o, spec.key, new_value, old_value)
+                )
+            if not cmds:
+                return
+            self._apply_button_color(button, new_value, spec.null_label)
+            self._push_macro(f"{spec.label}を変更", cmds)
+
+        def pick_color(_checked: bool = False, button: QPushButton = button) -> None:
             values = {getattr(o, spec.key) for o in objs}
-            initial = QColor(next(iter(values))) if len(values) == 1 else QColor(_DEFAULT_COLOR)
+            current = next(iter(values)) if len(values) == 1 else None
+            initial = QColor(current) if current else QColor(_DEFAULT_COLOR)
             # DontUseNativeDialog: ネイティブ色ダイアログの環境では `setCustomColor`
             # で載せたパレットスウォッチが表示されない（所見 S1）。
             color = QColorDialog.getColor(
@@ -1060,19 +1278,18 @@ class PropertyPanel(QWidget):
             )
             if not color.isValid():
                 return
-            new_value = color.name()
-            cmds: list[Any] = []
-            for o in objs:
-                old_value = getattr(o, spec.key)
-                if old_value == new_value:
-                    continue
-                cmds.append(
-                    SetPropertyCommand(self.scene.document, o, spec.key, new_value, old_value)
-                )
-            self._apply_button_color(button, new_value)
-            self._push_macro(f"{spec.label}を変更", cmds)
+            apply_color(color.name())
 
-        button.clicked.connect(on_click)
+        if nullable:
+            menu = QMenu(button)
+            pick_action = menu.addAction("色を選択…")
+            pick_action.triggered.connect(pick_color)
+            none_action = menu.addAction(spec.null_label)
+            none_action.triggered.connect(lambda: apply_color(None))
+            button.setMenu(menu)
+        else:
+            button.clicked.connect(pick_color)
+
         self._updaters.append(sync_widget)
         return button
 
@@ -1116,6 +1333,7 @@ class PropertyPanel(QWidget):
 
     def _make_multi_bool_widget(self, objs: list[BaseObject], spec: PropSpec) -> QCheckBox:
         checkbox = QCheckBox()
+        _pin_control_height(checkbox)
 
         def sync_widget(checkbox: QCheckBox = checkbox) -> None:
             if not shiboken6.isValid(checkbox):
@@ -1164,29 +1382,41 @@ class PropertyPanel(QWidget):
         self._rebuilding = True
         self._updaters = []
         try:
-            header = QLabel("アートボード")
-            header.setProperty("role", "section")
-            self._form.addRow(header)
+            header_row = self._form.rowCount()
+            self._form.addRow(self._make_section_label("アートボード"))
+            self._section_rows.append((header_row, "アートボード"))
 
             preset_combo = QComboBox()
             for label, *_rest in ARTBOARD_PRESETS:
                 preset_combo.addItem(label)
             preset_combo.addItem(ARTBOARD_CUSTOM_LABEL)
+            # 最長のプリセット名（例 "A4 (210×297mm)"）がそのまま
+            # minimumSizeHint になり、ラベル分と合わせてフォームの最小幅が
+            # `_PANEL_FIXED_WIDTH` を超えてしまう（line/arrow の point 行と
+            # 同じ構造の問題、レビュー所見）。フォームを包む QScrollArea が
+            # `setWidgetResizable(True)` でこの最小幅まで広げるため、床を
+            # 下げてパネル幅に収める（閉じた状態では省略記号で切れるが、
+            # 開けば全文が見える）。
+            preset_combo.setMinimumWidth(150)
 
             width_mm_spin = QDoubleSpinBox()
+            _pin_control_height(width_mm_spin)
             width_mm_spin.setKeyboardTracking(False)
             width_mm_spin.setRange(1.0, 2000.0)
             width_mm_spin.setDecimals(1)
 
             dpi_spin = QSpinBox()
+            _pin_control_height(dpi_spin)
             dpi_spin.setKeyboardTracking(False)
             dpi_spin.setRange(1, 2400)
 
             width_px_spin = QSpinBox()
+            _pin_control_height(width_px_spin)
             width_px_spin.setKeyboardTracking(False)
             width_px_spin.setRange(1, 20000)
 
             height_px_spin = QSpinBox()
+            _pin_control_height(height_px_spin)
             height_px_spin.setKeyboardTracking(False)
             height_px_spin.setRange(1, 20000)
 
@@ -1315,12 +1545,19 @@ class PropertyPanel(QWidget):
             height_px_spin.valueChanged.connect(on_field_changed)
             bg_button.clicked.connect(on_bg_click)
 
-            self._form.addRow("プリセット", preset_combo)
-            self._form.addRow("幅 (mm)", width_mm_spin)
-            self._form.addRow("解像度 (dpi)", dpi_spin)
-            self._form.addRow("幅 (px)", width_px_spin)
-            self._form.addRow("高さ (px)", height_px_spin)
-            self._form.addRow("背景色", bg_button)
+            # 公開ヘルパ（row_for_key 等）が artboard モードでも引けるようにする。
+            for label, widget, key in (
+                ("プリセット", preset_combo, "preset"),
+                ("幅 (mm)", width_mm_spin, "width_mm"),
+                ("解像度 (dpi)", dpi_spin, "dpi"),
+                ("幅 (px)", width_px_spin, "width_px"),
+                ("高さ (px)", height_px_spin, "height_px"),
+                ("背景色", bg_button, "background"),
+            ):
+                row = self._form.rowCount()
+                self._form.addRow(label, widget)
+                self._row_keys[key] = row
+                self._ordered_keys.append(key)
 
             self._updaters.append(sync_widget)
         finally:
@@ -1419,7 +1656,25 @@ class PropertyPanel(QWidget):
             self._push_depth -= 1
 
     @staticmethod
-    def _apply_button_color(button: QPushButton, color_str: str) -> None:
-        button.setText(color_str)
-        button.setStyleSheet(f"background-color: {color_str};")
-        button.setProperty(_COLOR_PROP, color_str)
+    def _apply_button_color(
+        button: QPushButton, color: str | None, null_label: str = "なし"
+    ) -> None:
+        """ボタンの見た目をモデル値（色 or None）に同期する。
+
+        以前は `setText(color_str)` で hex を文字として出していたが、これは
+        `sizeHint` を値依存にしてしまい、色を変えるたびに行高/行幅が揺れる
+        （項目3「高さが揃っていない」と衝突する）。色ありは空文字テキスト +
+        `background-color` + tooltip に hex、null（線・塗りなし）は
+        `null_label` をテキストに出し `background-color` を外す（色面ではなく
+        通常ボタンの見た目に戻す）。`null_label` の既定 "なし" は artboard の
+        背景色ボタン等（常に非 null）からの既存の2引数呼び出しをそのまま通す
+        ためのもの。
+        """
+        if color is None:
+            button.setText(null_label)
+            button.setStyleSheet("")
+            button.setToolTip(null_label)
+            return
+        button.setText("")
+        button.setStyleSheet(f"background-color: {color};")
+        button.setToolTip(color)

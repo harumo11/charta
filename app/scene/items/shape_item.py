@@ -10,6 +10,7 @@ from PySide6.QtGui import QBrush, QColor, QPainterPath, QPainterPathStroker, QPe
 from PySide6.QtWidgets import QGraphicsItem
 
 from app.graphics.arrows import shorten_amount
+from app.graphics.strokes import is_stroked, stroke_margin
 from app.model.objects import BaseObject
 from app.scene.handles import EndpointHandleSet
 from app.scene.items.arrow_paint import paint_arrowhead
@@ -32,7 +33,14 @@ def pen_for(obj: BaseObject) -> QPen:
 
     `dash` を持たないオブジェクト種別（例: freehand）でも安全に使えるよう
     既定値 "solid" にフォールバックする。
+
+    線を描かない（`stroke=None` または `stroke_width<=0`。判定は
+    `app.graphics.strokes.is_stroked` に一本化）なら `Qt.PenStyle.NoPen` を返す。
+    以前は `stroke_width=0` でも `QPen.setWidthF(0)` の cosmetic 1px ヘアラインが
+    画面には残り、SVG（`_stroke_attrs`）は不可視になる食い違いがあった。
     """
+    if not is_stroked(obj):
+        return QPen(Qt.PenStyle.NoPen)
     color = QColor(obj.stroke) if obj.stroke else QColor(0, 0, 0)
     pen = QPen(color)
     pen.setWidthF(max(float(obj.stroke_width), 0.0))
@@ -56,7 +64,7 @@ class RectEllipseItem(BoxItem):
     """rect / ellipse を描画するアイテム。box handles（8方向リサイズ+回転）を持つ。"""
 
     def boundingRect(self) -> QRectF:
-        margin = max(float(self.obj.stroke_width), 0.0) / 2.0
+        margin = stroke_margin(self.obj)
         return QRectF(0.0, 0.0, self._w, self._h).adjusted(-margin, -margin, margin, margin)
 
     def paint(self, painter: Any, option: Any, widget: Any = None) -> None:
@@ -106,7 +114,7 @@ class LineItem(BaseItem):
         return self.obj.arrow_start != "none" or self.obj.arrow_end != "none"
 
     def boundingRect(self) -> QRectF:
-        margin = max(float(self.obj.stroke_width), 0.0) / 2.0 + 1.0
+        margin = stroke_margin(self.obj) + 1.0
         if self._has_arrowheads():
             margin += max(float(self.obj.arrow_size), 0.0)
         x1, y1 = self._p1

@@ -18,6 +18,7 @@ from PySide6.QtGui import QBrush, QColor, QPainterPath, QPainterPathStroker
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
 from app.graphics import curves
+from app.graphics.strokes import stroke_margin
 from app.model.objects import CurveObject
 from app.scene.items.box_item import BoxItem
 from app.scene.items.curve_node_overlay import CurveNodeOverlay
@@ -94,7 +95,7 @@ class CurveItem(BoxItem):
         path = self._build_local_path()
         if path is None:
             return QRectF(0.0, 0.0, self._w, self._h)
-        margin = max(float(self.obj.stroke_width), 0.0) / 2.0
+        margin = stroke_margin(self.obj)
         return path.boundingRect().adjusted(-margin, -margin, margin, margin)
 
     def paint(self, painter: Any, option: Any, widget: Any = None) -> None:
