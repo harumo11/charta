@@ -594,6 +594,48 @@ def test_an_oversized_object_is_shrunk_not_endlessly_nudged(api: AgentAPI, windo
     assert api.critique(checks=["clipped"])["findings"] == []
 
 
+def test_bound_line_clipped_offers_no_move_since_it_would_not_converge(
+    api: AgentAPI, window: Any
+) -> None:
+    """接着 line/connector の `clipped` は `move_objects` の corrected_call を付けない。
+
+    P4/P5契約 (B) 項目8 レビュー major所見: 接続端(`pN_id`/`source_id`/
+    `target_id`)は `move_objects`/`translate_geom` が baked 座標を書き換えても
+    実効座標(アンカー解決後)は変わらない(§9.3・既知の制限2)。にもかかわらず
+    修正案を返すと、送り返しても同じ警告・同じ dx/dy が出続けて往復が
+    終わらない。「修正案は送り返せば直ることが要件」なので、収束を保証
+    できないこの組み合わせでは corrected_call を付けない。
+    """
+    artboard = window.scene.document.artboard
+    rect_id = api.create_objects(
+        [
+            {
+                "type": "rect",
+                "x": artboard.width_px - 40.0,
+                "y": 100.0,
+                "width": 80.0,
+                "height": 60.0,
+            }
+        ]
+    )["created"][0]["id"]
+    line_id = api.create_objects(
+        [{"type": "line", "p1": [100.0, 130.0], "p2": [artboard.width_px - 20.0, 130.0]}]
+    )["created"][0]["id"]
+    # p2 を rect の right アンカー（アートボード外）へ接着する。
+    api.update_objects(items=[{"id": line_id, "p2_id": rect_id, "p2_anchor": "right"}])
+
+    result = api.critique(checks=["clipped"], ids=[line_id])
+    findings = result["findings"]
+    assert findings, "接着端がアートボード右外に出ているので clipped が出るはず"
+    assert "corrected_call" not in findings[0], "収束しない move_objects 案は付けない"
+
+    # 何度呼んでも「同じ提案を送り返し続ける」形にならないこと(=そもそも
+    # 提案が無いこと)を固定する。
+    for _ in range(3):
+        again = api.critique(checks=["clipped"], ids=[line_id])["findings"]
+        assert all("corrected_call" not in f for f in again)
+
+
 def test_every_suggested_fix_actually_changes_something(api: AgentAPI, window: Any) -> None:
     """**no-op な修正案を作らない。**
 

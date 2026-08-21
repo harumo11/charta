@@ -471,3 +471,128 @@ def test_align_selected_still_uses_selection_bbox(window: Any) -> None:
 
     assert r0.x == pytest.approx(0.0)
     assert r1.x == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------
+# P4/P5契約 (B) 項目8 レビュー major所見: 接着 line の陳腐化キャッシュが
+# align/複製を汚染しない
+# --------------------------------------------------------------------------
+
+
+def test_align_excludes_a_bound_line_so_other_objects_are_not_corrupted(window: Any) -> None:
+    """接着 line を選択に含めて整列しても、他のオブジェクトが line の陳腐化した
+    生 bbox に汚染されて無関係な位置へ動いてはいけない。
+
+    line の p1/p2 は接着中「最後に画面に出ていた座標」のキャッシュに過ぎず、
+    `bounding_box(line)` はこの生キャッシュを使う。対象全体の外接矩形（align の
+    基準）にこの陳腐化した bbox が混じると、**line 自身ではなく他の**選択
+    オブジェクトまで見た目とは無関係な位置へ動く（`_arrangeable` が connector と
+    同じ理由で除外することを固定する）。
+    """
+    from app.model.objects import LineObject
+
+    scene = window.scene
+    stack = window.undo_stack
+    document = scene.document
+
+    rect_a = _add_rect(window, 0.0, 0.0)
+    rect_b = _add_rect(window, 200.0, 200.0)
+    target = _add_rect(window, 900.0, 900.0)
+    line = LineObject(
+        id=document.new_id(),
+        p1=[5000.0, 5000.0],  # 陳腐化した生キャッシュ（本来の位置とは無関係に遠い）。
+        p2=[900.0, 900.0],
+        p2_id=target.id,
+        p2_anchor="center",
+    )
+    stack.push(AddObjectCommand(document, line))
+
+    moved = window._edit.align_objects([rect_a, rect_b, line], "left")
+
+    assert line not in moved, "接着 line は整列対象から除外される"
+    assert rect_b.x == pytest.approx(0.0), (
+        "line の陳腐化した bbox が基準(外接矩形)を汚染して rect_b を"
+        "無関係な位置へ動かしてはいけない"
+    )
+
+
+def test_align_with_a_bound_line_as_reference_uses_its_effective_bounding_box(
+    window: Any,
+) -> None:
+    """接着 line を align の基準（`reference`）にすると、実効座標
+    （`resolved_bounding_box`）で揃うこと（エージェントの `arrange_objects
+    (relative_to=...)` 経由で到達可能）。
+    """
+    from app.model.objects import LineObject
+
+    stack = window.undo_stack
+    document = window.scene.document
+
+    target = _add_rect(window, 300.0, 300.0)  # 10x10, left アンカー = (300, 305)
+    mover = _add_rect(window, 0.0, 0.0)
+    line = LineObject(
+        id=document.new_id(),
+        p1=[400.0, 400.0],
+        p2=[999.0, 999.0],  # 陳腐化した生キャッシュ。
+        p2_id=target.id,
+        p2_anchor="left",
+    )
+    stack.push(AddObjectCommand(document, line))
+
+    moved = window._edit.align_objects([mover], "left", reference=line)
+
+    assert mover in moved
+    assert mover.x == pytest.approx(300.0), (
+        "生の p2 キャッシュ(999,999)ではなく実効座標(target の left アンカー)" "を基準に揃うべき"
+    )
+
+
+def test_duplicate_a_bound_line_after_moving_its_target_bakes_the_effective_point(
+    window: Any,
+) -> None:
+    """接着先を動かした後に接着 line を単体複製すると、複製が実効座標＋offset
+    に現れること（陳腐化した生キャッシュ＋offset ではない）。
+
+    `arrange.clone_object_dicts` は document を持たない Qt/document 非依存の
+    純関数のままにし（既存の `test_clone_object_dicts_*` 群を破壊しない）、
+    呼び出し側（`EditController.duplicate_objects`/`copy_selection`）が
+    `_resolved_to_dict` で実効座標へ焼いてから渡すことで直す。
+    """
+    from app.commands.commands import SetGeometryCommand
+    from app.graphics.routing import line_endpoints_from_model
+    from app.model.objects import LineObject
+
+    scene = window.scene
+    stack = window.undo_stack
+    document = scene.document
+
+    rect = _add_rect(window, 0.0, 0.0)
+    stack.push(
+        SetGeometryCommand(
+            document, rect, {"width": 100.0, "height": 80.0}, {"width": 10.0, "height": 10.0}
+        )
+    )
+    line = LineObject(
+        id=document.new_id(),
+        p1=[999.0, 999.0],
+        p2=[400.0, 300.0],
+        p1_id=rect.id,
+        p1_anchor="right",
+    )
+    stack.push(AddObjectCommand(document, line))
+
+    # 接着先を動かす: 実効座標は追従するが、line.p1（生キャッシュ）は
+    # まだ古い値 [999, 999] のまま。
+    stack.push(SetGeometryCommand(document, rect, {"x": 1000.0, "y": 800.0}, {"x": 0.0, "y": 0.0}))
+    effective_p1, _ = line_endpoints_from_model(document, line)
+    assert line.p1 == pytest.approx([999.0, 999.0]), "生キャッシュは陳腐化したまま（前提の確認）"
+
+    scene.clearSelection()
+    scene.item_for(line).setSelected(True)
+    window.duplicate_selection()
+
+    new_line = document.objects[-1]
+    assert new_line.p1_id is None, "接着先を複製していないので id は切り離される"
+    assert new_line.p1 == pytest.approx(
+        [effective_p1[0] + 20.0, effective_p1[1] + 20.0]
+    ), "複製は実効座標＋offsetに現れるべき（陳腐化した生キャッシュ＋offsetではない）"

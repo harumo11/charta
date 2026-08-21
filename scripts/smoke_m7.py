@@ -42,9 +42,14 @@ class _FakeEvent:
 def _add_rect(
     window: MainWindow, x: float, y: float, w: float = 50.0, h: float = 50.0
 ) -> RectObject:
+    # fill を明示する（2026-08-21 項目11）: 塗りなし矩形は内部が素通しになり
+    # （`RectEllipseItem.shape` が輪郭沿いの帯だけを当たり判定にする）、select
+    # ツールで矩形の**内部**を press しても掴めない。このスモークが検証したいのは
+    # まとめ移動・スナップ・整列であって当たり判定ではないので、塗りありにして
+    # 「内部を掴める」前提のまま保つ（tests/ 側の同種の fixture と同じ扱い）。
     scene = window.scene
     stack = window.undo_stack
-    rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h)
+    rect = RectObject(id=scene.document.new_id(), x=x, y=y, width=w, height=h, fill="#DDDDDD")
     stack.push(AddObjectCommand(scene.document, rect))
     return rect
 

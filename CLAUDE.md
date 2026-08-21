@@ -158,7 +158,9 @@ myproject/
 **line / arrow**
 | フィールド | 型 | 説明 |
 |---|---|---|
-| `p1`, `p2` | [x,y] | 始点・終点（回転はこの2点で表現、rotation は使わない） |
+| `p1`, `p2` | [x,y] | 始点・終点（回転はこの2点で表現、rotation は使わない）。**接着中（`pN_id` が非 null）は「最後に画面に出ていた座標」のキャッシュに過ぎない**。実効座標は `routing.line_endpoints_from_model` が毎回解き直す（下記・§9.3 参照） |
+| `p1_id`, `p2_id` | int or null | 接着先オブジェクト ID。null なら固定端点（コネクタの `source_id`/`target_id` と同型。項目8・2026-08-21 追加） |
+| `p1_anchor`, `p2_anchor` | str | 接着先のアンカー名。"start"/"center"/"end"（直線/矢印）または箱型9点 + "nearest"（コネクタの `source_anchor`/`target_anchor` と同型） |
 | `stroke`, `stroke_width`, `dash` | — | 線プロパティ |
 | `arrow_start`, `arrow_end` | str | 矢じり形状 "none"/"triangle"/"open"/"circle" |
 | `arrow_size` | float | 矢じりサイズ |
@@ -333,6 +335,20 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
   - 接続先以外の図形が動いたときの経路更新は `CanvasScene._schedule_connector_reroute`
     が担う（`QTimer.singleShot(0)` で同一ターン内の変更を 1 回にまとめる）。
     人間のドラッグ中はモデルが更新されないため（§9.6）、**更新はドロップ時**。
+- **line/arrow も同じ規約で接着できる**（項目8・2026-08-21 追加）。`pN_id`/
+  `pN_anchor`/`pN` は connector の `source_id`/`source_anchor`/`source_point` と
+  完全同型（`pN` は接着中は上記のキャッシュ、実効座標は `routing.
+  line_endpoints_from_model` が毎回解き直す）。line は connector と違い**自分
+  自身も接着先になり得る**（弦: 両端を同じ図形に接着／line 同士の接着）ため、
+  接着成立は**表示されたアンカーへの磁石吸着時のみ**（`EndpointHandleSet` の
+  ドラッグ、または作図中の吸着ヒント）で、connector にある「図形の胴体上へ
+  ドロップしたら nearest で自動接続」は line には持ち込まない——線は図形の上を
+  通過するのが普通で、通過を接続と解釈されると事故になる。削除時の端点固定化は
+  `binding_slots(type_name)` を索引に connector/line を型を問わず同一実装で扱う
+  （`EditController._fix_bound_endpoints`）。生の `pN`/`source_point`/
+  `target_point` を読む消費者（整列/複製/診断の修正案提示）は実効座標
+  （`resolved_bounding_box`・`line_endpoints_from_model`・
+  `connector_endpoints_from_model`）側へ寄せること。
 
 ### 9.4 数式
 - `math/mathtext_render.py`: LaTeX 文字列 → matplotlib SVG バックエンドで SVG 文字列を生成 → `math_item.py`（`QGraphicsSvgItem`）に読み込み表示。

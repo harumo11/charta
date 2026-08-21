@@ -25,7 +25,11 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 
 from app.agent import paths
-from app.graphics.routing import connector_endpoints_from_model, resolved_bounding_box
+from app.graphics.routing import (
+    connector_endpoints_from_model,
+    line_endpoints_from_model,
+    resolved_bounding_box,
+)
 from app.model.document import Document
 from app.model.objects import BaseObject
 from app.scene.canvas_scene import CanvasScene
@@ -215,9 +219,12 @@ def render_window(view_widget: Any, max_edge: int = DEFAULT_MAX_EDGE) -> tuple[Q
 
 
 def _endpoints_of(document: Document, obj: BaseObject) -> tuple[tuple[float, float], ...]:
-    """端点系オブジェクトの端点（アートボード座標）。box 型は空タプル。"""
+    """端点系オブジェクトの端点（アートボード座標）。box 型は空タプル。
+
+    line/arrow は接着端（項目8）を `line_endpoints_from_model` で実効座標に解決する。
+    """
     if obj.GEOMETRY == "endpoints":
-        return ((float(obj.p1[0]), float(obj.p1[1])), (float(obj.p2[0]), float(obj.p2[1])))
+        return line_endpoints_from_model(document, obj)
     if obj.GEOMETRY == "connector":
         return connector_endpoints_from_model(document, obj)
     return ()

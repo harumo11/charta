@@ -46,7 +46,16 @@ def test_describe_schema_reports_geometry_kind_and_truth_keys() -> None:
     types = schema.describe_schema(Document())["object_types"]
     assert types["rect"]["geometry"] == "box"
     assert types["arrow"]["geometry"] == "endpoints"
-    assert types["arrow"]["geometry_keys"] == ["p1", "p2"]
+    # 項目8: line/arrow は自身の端点を他オブジェクトへ接着できる（connector の
+    # source_id/source_anchor/source_point と同型の3つ組が p1/p2 それぞれにある）。
+    assert types["arrow"]["geometry_keys"] == [
+        "p1_id",
+        "p1_anchor",
+        "p1",
+        "p2_id",
+        "p2_anchor",
+        "p2",
+    ]
     assert types["connector"]["geometry"] == "connector"
 
 
@@ -285,7 +294,14 @@ def test_tool_only_key_names_the_responsible_tool() -> None:
 def test_box_key_on_endpoint_type_returns_a_corrected_call() -> None:
     (error,) = _errors("arrow", {"x": 40}, obj_id=23)
     assert error.code == "wrong_geometry_key"
-    assert error.extra["truth_keys"] == ["p1", "p2"]
+    assert error.extra["truth_keys"] == [
+        "p1_id",
+        "p1_anchor",
+        "p1",
+        "p2_id",
+        "p2_anchor",
+        "p2",
+    ]
     assert error.extra["corrected_call"]["tool"] == "move_objects"
     assert error.extra["corrected_call"]["arguments"]["items"][0]["id"] == 23
 

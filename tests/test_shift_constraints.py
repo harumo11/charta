@@ -4,8 +4,9 @@
   （射影であること、成分クランプではないこと）。
 - line/arrow 作図ツールの `_draw_move`/`_draw_release` 両方が同じ制約を通すこと
   （`_cancel_preview` の順序バグ検出器を含む）。
-- `EndpointHandleSet` の端点ドラッグが反対側の端点を軸の起点にし、ドラッグ開始時の
-  モデル値を基準にすること。
+- `EndpointHandleSet` の端点ドラッグが反対側の端点を軸の起点にし、begin_drag 時点の
+  画面上の実効座標（`live_geometry()` のスナップショット）を基準にすること
+  （反対側が接着済みでモデルの生キャッシュが陳腐化していても流れないこと）。
 - `event.modifiers()` を持たない疑似イベント（既存テストの `_FakeEvent` 流儀）で
   クラッシュしないこと（getattr ガード）。
 """
@@ -19,7 +20,7 @@ import pytest
 import shiboken6
 from PySide6.QtCore import QPointF, Qt
 
-from app.commands.commands import AddObjectCommand
+from app.commands.commands import AddObjectCommand, SetGeometryCommand
 from app.graphics.constraints import CONSTRAIN_STEP_DEG, Point, constrain_to_axis_or_diagonal
 from app.model.objects import EllipseObject, LineObject, RectObject
 from app.scene.handles import EndpointHandleSet
@@ -270,13 +271,15 @@ def test_endpoint_handle_drag_with_shift_constrains_against_the_other_endpoint(
 
 
 def test_endpoint_handle_shift_uses_drag_start_geometry_as_anchor(window: Any, qapp: Any) -> None:
-    """Shiftの基準はドラッグ開始時のモデル値(`_old_geom`)であり、ライブ値ではないこと。"""
+    """Shiftの基準は begin_drag 時点の画面上の実効座標(`live_geometry()`)であり、
+    ドラッグ**中**にライブ移動しても流れないこと。
+    """
     obj, item = _add_line(window, [0.0, 0.0], [100.0, 0.0], "line")
     handles = EndpointHandleSet(item)
     try:
         handles.begin_drag("p1", QPointF(0.0, 0.0))
         # p2 がドラッグ中に(ハンドル経由ではない何らかの理由で)ライブ移動しても、
-        # Shift の基準はドラッグ開始時点のモデル値(元のp2=(100,0))のままであること。
+        # Shift の基準は begin_drag 時点のスナップショット(元のp2=(100,0))のままであること。
         item.set_live_points(p2=[200.0, 300.0])
 
         handles.drag_to("p1", QPointF(-10.0, 90.0), Qt.KeyboardModifier.ShiftModifier)
@@ -286,3 +289,55 @@ def test_endpoint_handle_shift_uses_drag_start_geometry_as_anchor(window: Any, q
         assert item.live_geometry()["p1"] == pytest.approx(list(expected))
     finally:
         handles.destroy()
+
+
+def test_endpoint_handle_shift_uses_live_geometry_for_a_bound_opposite_endpoint(
+    window: Any, qapp: Any
+) -> None:
+    """反対側が接着済みのとき、Shift の基準は begin_drag 時点の**画面上の実効座標**
+    （`live_geometry()`）であり、モデルの生キャッシュ（`model_geometry()`）ではない
+    こと（P4/P5契約 (B) レビュー major所見）。
+
+    `obj.p2`（接着中は「最後に画面に出ていた座標」のキャッシュ、§9.3）は接続先が
+    動いても書き戻されない。ここを軸にすると、画面に実際に見えている角度とは
+    無関係な45°倍数に制約されてしまう。
+    """
+    scene = window.scene
+    stack = window.undo_stack
+
+    rect = RectObject(id=scene.document.new_id(), x=400.0, y=400.0, width=100.0, height=80.0)
+    stack.push(AddObjectCommand(scene.document, rect))
+    line = LineObject(
+        id=scene.document.new_id(),
+        type="line",
+        p1=[600.0, 440.0],
+        p2=[600.0, 440.0],
+        p2_id=rect.id,
+        p2_anchor="center",
+    )
+    stack.push(AddObjectCommand(scene.document, line))
+    item = scene.item_for(line)
+    assert isinstance(item, LineItem)
+    item.setSelected(True)  # `_handles`(EndpointHandleSet)は選択時にのみ生成される。
+
+    # 接続先を動かす: 画面(live_geometry) は追従するが、モデルの生キャッシュ
+    # (obj.p2, ≒ model_geometry()) は更新されず陳腐化したままになる。
+    stack.push(
+        SetGeometryCommand(scene.document, rect, {"x": 700.0, "y": 700.0}, {"x": 400.0, "y": 400.0})
+    )
+    live_p2_before_drag = tuple(item.live_geometry()["p2"])
+    assert live_p2_before_drag == pytest.approx((750.0, 740.0)), "画面は追従している"
+    assert tuple(line.p2) != pytest.approx(
+        live_p2_before_drag
+    ), "モデルの生キャッシュは陳腐化している"
+
+    handles = item._handles
+    assert handles is not None
+    handles.begin_drag("p1", QPointF(*item.live_geometry()["p1"]))
+    handles.drag_to("p1", QPointF(600.0, 440.0), Qt.KeyboardModifier.ShiftModifier)
+
+    expected = constrain_to_axis_or_diagonal(live_p2_before_drag, (600.0, 440.0))
+    assert item.live_geometry()["p1"] == pytest.approx(
+        list(expected)
+    ), "画面に見えている角度(実効p2)を軸に制約すること（陳腐化したモデル値ではない）"
+    handles.end_drag("p1")

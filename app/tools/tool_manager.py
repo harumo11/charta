@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from app.commands.commands import AddObjectCommand, SetGeometryCommand, SetPropertyCommand
 from app.graphics import curves
 from app.graphics.constraints import constrain_to_axis_or_diagonal
+from app.graphics.routing import Point
 from app.model.objects import (
     BaseObject,
     ConnectorObject,
@@ -36,6 +37,15 @@ from app.model.objects import (
     geometry_kind,
 )
 from app.prefs import Preferences
+from app.scene.anchor_snap import (
+    ANCHOR_REVEAL_SCREEN_PX,
+    SNAP_SCREEN_PX,
+    AnchorHintOverlay,
+    anchor_sets_near,
+    find_anchor_snap,
+    logical_box_for_item,
+    scene_threshold,
+)
 
 if TYPE_CHECKING:
     from app.scene.canvas_scene import CanvasScene
@@ -153,6 +163,13 @@ class ToolManager(QObject):
         # rect/ellipse/line/arrow ツール: 描画中のプレビュー
         self._draw_start: QPointF | None = None
         self._preview_item: QGraphicsItem | None = None
+        # line/arrow 作図中のアンカー磁石吸着(P4/P5契約 (B) B-4)。press で始点が
+        # アンカーへ吸着したときの (obj_id, anchor_name)。p1_id/p1_anchor として
+        # LineObject に渡す。p2 側は release 時に都度解決するため持ち越さない。
+        self._draw_p1_bind: tuple[int, str] | None = None
+        # 作図中のアンカー候補ヒント表示(緑ドット群+吸着ハイライト)。
+        # `_cancel_preview` で必ず破棄する。
+        self._draw_anchor_hint: AnchorHintOverlay | None = None
         # freehand ツール: 蓄積中の生 scene 点列とプレビューパス
         self._freehand_points: list[QPointF] | None = None
         self._freehand_path: QPainterPath | None = None
@@ -573,7 +590,18 @@ class ToolManager(QObject):
                 continue
             p1 = geom["p1"]
             p2 = geom["p2"]
-            set_live_points(p1=[p1[0] + dx, p1[1] + dy], p2=[p2[0] + dx, p2[1] + dy])
+            # 接着端（p1_id/p2_id が非 None、項目8）は本体ドラッグで動かさない
+            # （`ConnectorItem.set_live_body_offset` の固定端点のみ動かす規則と同じ、
+            # §9.3）。両端とも接着済みなら動かせる自由端が無いため呼び出し自体を
+            # 省略する（`set_live_points()` は引数無しでも無条件に geometryChanged を
+            # emit するため、何も変わらないのに接続先へ空更新を撒くのを避ける）。
+            live_kwargs: dict[str, list[float]] = {}
+            if obj.p1_id is None:
+                live_kwargs["p1"] = [p1[0] + dx, p1[1] + dy]
+            if obj.p2_id is None:
+                live_kwargs["p2"] = [p2[0] + dx, p2[1] + dy]
+            if live_kwargs:
+                set_live_points(**live_kwargs)
         return False
 
     def _select_release(self, event: Any, scene_pos: QPointF) -> bool:
@@ -623,11 +651,37 @@ class ToolManager(QObject):
             if "p1" in old_geom:
                 # LineItem は ItemIsMovable=False で pos を持たないため、
                 # 実マウス移動量から delta を導出する他ない（§6.2）。
-                if dx is None or math.hypot(dx, dy) < _MOVE_EPS:
-                    continue
-                p1 = old_geom["p1"]
-                p2 = old_geom["p2"]
-                new_geom = {"p1": [p1[0] + dx, p1[1] + dy], "p2": [p2[0] + dx, p2[1] + dy]}
+                item = self.scene.item_for(obj)
+                if dx is not None and math.hypot(dx, dy) >= _MOVE_EPS:
+                    p1 = old_geom["p1"]
+                    p2 = old_geom["p2"]
+                    # 接着端（p1_id/p2_id が非 None、項目8）は本体ドラッグで動かさない
+                    # （コネクタの固定端点のみ書き戻す規則と同じ、§9.3）。redo/undo は
+                    # 同じキー集合を触る必要があるため、new/old は接着していない側の
+                    # キーだけを含む部分辞書にする。両端とも接着済みなら動かせる自由端が
+                    # 無いため no-op（コマンドを積まない）。
+                    new_partial: dict[str, list[float]] = {}
+                    old_partial: dict[str, list[float]] = {}
+                    if obj.p1_id is None:
+                        new_partial["p1"] = [p1[0] + dx, p1[1] + dy]
+                        old_partial["p1"] = p1
+                    if obj.p2_id is None:
+                        new_partial["p2"] = [p2[0] + dx, p2[1] + dy]
+                        old_partial["p2"] = p2
+                    if new_partial:
+                        commands.append(SetGeometryCommand(document, obj, new_partial, old_partial))
+                if item is not None:
+                    # ドラッグが確定した(=コマンドを積む)場合は`SetGeometryCommand`の
+                    # redo が `sync_from_model()` 経由で自然にクリアするが、閾値未満で
+                    # 何も push しない場合はそれが起きない。`_select_move` が設定した
+                    # `_live_p1`/`_live_p2` を明示的に解除しないと、次に接着先が
+                    # `geometryChanged` を出すたびに自由端がこの古いライブ値へ固定
+                    # されたままになる（`ConnectorItem` の `clear_live()` と同じ
+                    # 位置づけ、レビュー major所見の追加対応）。
+                    clear_live_points = getattr(item, "clear_live_points", None)
+                    if callable(clear_live_points):
+                        clear_live_points()
+                continue
             else:
                 # rect/ellipse は ItemIsMovable=True で Qt がドラッグ中に item.pos()
                 # を実際に動かすため、生マウス delta ではなく実移動量を使う。
@@ -665,6 +719,15 @@ class ToolManager(QObject):
             # 右クリック等では何もしない(仮プレビュー未生成のまま消費しない)。
             return False
         self._cancel_preview()
+        if self._tool in ("line", "arrow") and not _shift_pressed(event):
+            # 始点がアンカー候補の近くなら吸着する(P4/P5契約 (B) B-4)。Shift 押下中は
+            # 吸着しない(B-3 と同じ規則: 45°制約と磁石を同時に効かせると
+            # どちらの規則にも従わない点になる)。
+            snap = self._find_draw_anchor_snap(scene_pos)
+            if snap is not None:
+                anchor_point, obj_id, anchor_name = snap
+                scene_pos = QPointF(anchor_point[0], anchor_point[1])
+                self._draw_p1_bind = (obj_id, anchor_name)
         self._draw_start = scene_pos
         pen = QPen(QColor("#3399ff"))
         pen.setStyle(Qt.PenStyle.DashLine)
@@ -698,25 +761,85 @@ class ToolManager(QObject):
         return QPointF(constrained[0], constrained[1])
 
     def _draw_move(self, event: Any, scene_pos: QPointF) -> bool:
+        if self._tool in ("line", "arrow") and self._draw_start is None:
+            # press 前のホバー中でもヒントを更新する（レビュー major所見）。
+            # 始点の接着可否は press の瞬間に判定される（`_draw_press`）ため、
+            # ホバー中にヒントが一度も出ないまま接着が確定してしまうと、
+            # 図形の角の近くから線を引き始めただけで無自覚に接着される事故に
+            # なる。`_preview_item` はまだ無いので早期 return より前に処理する。
+            self._update_draw_anchor_hint(event, scene_pos)
+            return True
         if self._draw_start is None or self._preview_item is None:
             return True
         scene_pos = self._draw_end_point(event, scene_pos)
         if self._tool in ("line", "arrow"):
             line_item: QGraphicsLineItem = self._preview_item  # type: ignore[assignment]
+            snap = self._update_draw_anchor_hint(event, scene_pos)
+            # プレビューの終点も吸着先に合わせる（レビュー所見: ヒントは吸着先を
+            # ハイライトするのにプレビュー線自体はマウス位置のままだと、確定
+            # (`_draw_release`)の瞬間に線が跳んで見える）。`_update_draw_anchor_hint`
+            # が既に同じ探索をしているので、その戻り値を使い回し走査を増やさない。
+            end_point = QPointF(snap[0][0], snap[0][1]) if snap is not None else scene_pos
             line_item.setLine(
-                self._draw_start.x(), self._draw_start.y(), scene_pos.x(), scene_pos.y()
+                self._draw_start.x(), self._draw_start.y(), end_point.x(), end_point.y()
             )
         else:
             rect_item: QGraphicsRectItem = self._preview_item  # type: ignore[assignment]
             rect_item.setRect(QRectF(self._draw_start, scene_pos).normalized())
         return True
 
+    def _find_draw_anchor_snap(self, point: QPointF) -> tuple[Point, int, str] | None:
+        """作図中の終点(または始点)近くの磁石スナップ先を探す（B-4。`EndpointHandleSet`/
+        `LineItem._find_snap` と同じ距離換算だが、まだ line 自体が存在しないため
+        `exclude` は渡さない。
+        """
+        threshold = scene_threshold(self.scene, SNAP_SCREEN_PX)
+        return find_anchor_snap(self.scene, (point.x(), point.y()), threshold=threshold)
+
+    def _update_draw_anchor_hint(
+        self, event: Any, scene_pos: QPointF
+    ) -> tuple[Point, int, str] | None:
+        """line/arrow 作図（またはその前のホバー）中、終点付近のアンカー候補ヒントを
+        表示する（B-4）。**吸着先（`_find_draw_anchor_snap` の結果）を返す**——
+        呼び出し側（`_draw_move`）がプレビュー線の終点をこれで合わせられるように
+        するため（同じ探索を2回走らせない）。
+
+        Shift 押下中は磁石吸着を行わない（B-3 と同じ規則）ため、ヒントも消す
+        （吸着しないのに候補ドットだけ出るとユーザーを誤誘導する）。
+        """
+        if _shift_pressed(event):
+            if self._draw_anchor_hint is not None:
+                self._draw_anchor_hint.destroy()
+                self._draw_anchor_hint = None
+            return None
+        point = (scene_pos.x(), scene_pos.y())
+        reveal = scene_threshold(self.scene, ANCHOR_REVEAL_SCREEN_PX)
+        candidates = anchor_sets_near(self.scene, point, reveal)
+        snap = self._find_draw_anchor_snap(scene_pos)
+        if not candidates and snap is None:
+            if self._draw_anchor_hint is not None:
+                self._draw_anchor_hint.destroy()
+                self._draw_anchor_hint = None
+            return None
+        if self._draw_anchor_hint is None:
+            self._draw_anchor_hint = AnchorHintOverlay(self.scene)
+        self._draw_anchor_hint.update_hints(candidates, snap)
+        return snap
+
     def _draw_release(self, event: Any, scene_pos: QPointF) -> bool:
-        # `_cancel_preview()` は `_draw_start` を None にするため、制約の適用は
-        # 必ずそれより前に行う（P4/P5契約 (A)。順序を誤るとプレビューは45°
-        # なのに確定した線は斜め、というずれが生まれる）。
+        # `_cancel_preview()` は `_draw_start`/`_draw_p1_bind` を None にするため、
+        # 制約・吸着の適用は必ずそれより前に行う（P4/P5契約 (A)。順序を誤ると
+        # プレビューは45°/吸着済みなのに確定した線だけずれる）。
         scene_pos = self._draw_end_point(event, scene_pos)
         start = self._draw_start
+        p1_bind = self._draw_p1_bind
+        p2_bind: tuple[int, str] | None = None
+        if self._tool in ("line", "arrow") and not _shift_pressed(event):
+            p2_snap = self._find_draw_anchor_snap(scene_pos)
+            if p2_snap is not None:
+                anchor_point, obj_id, anchor_name = p2_snap
+                scene_pos = QPointF(anchor_point[0], anchor_point[1])
+                p2_bind = (obj_id, anchor_name)
         self._cancel_preview()
         if start is None:
             return True
@@ -737,6 +860,10 @@ class ToolManager(QObject):
                 p2=[scene_pos.x(), scene_pos.y()],
                 arrow_start="none",
                 arrow_end="triangle" if self._tool == "arrow" else "none",
+                p1_id=p1_bind[0] if p1_bind is not None else None,
+                p1_anchor=p1_bind[1] if p1_bind is not None else "center",
+                p2_id=p2_bind[0] if p2_bind is not None else None,
+                p2_anchor=p2_bind[1] if p2_bind is not None else "center",
             )
         else:
             rect = QRectF(start, scene_pos).normalized()
@@ -761,6 +888,10 @@ class ToolManager(QObject):
                 item_scene.removeItem(self._preview_item)
             self._preview_item = None
         self._draw_start = None
+        self._draw_p1_bind = None
+        if self._draw_anchor_hint is not None:
+            self._draw_anchor_hint.destroy()
+            self._draw_anchor_hint = None
 
     def _push_creation(self, obj: Any) -> bool:
         """AddObjectCommand を push し新規オブジェクトを選択する（ツール切替はしない）。
@@ -995,7 +1126,7 @@ class ToolManager(QObject):
         `tests/test_routing_avoid.py` が実際にそれをやっている）。ここだけ役割を
         分け、箱型図形（`live_geometry()` が x/y/width/height を返す
         rect/ellipse/image/text/math/freehand/curve）はモデルの論理 box
-        （`connector_item.logical_box_for_item`）への点包含判定
+        （`anchor_snap.logical_box_for_item`）への点包含判定
         （`app.graphics.boxes.point_in_obb`）を主とする。**選択は辺のみ・
         接続は箱全体**。line/arrow は対象外のまま従来どおり `shape()` を使う
         （p1/p2 の軸並行 bbox は斜め線で広大になり水平線で高さ0になるため、
@@ -1010,7 +1141,6 @@ class ToolManager(QObject):
         （box ⊇ 旧仕様、shape() ⊆ 選択領域、なので接続 = box ∪ shape ⊇ 選択）。
         """
         from app.graphics.boxes import point_in_obb
-        from app.scene.items.connector_item import logical_box_for_item
 
         views = self.scene.views()
         transform = views[0].transform() if views else QTransform()

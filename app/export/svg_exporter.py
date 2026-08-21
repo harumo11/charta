@@ -39,6 +39,7 @@ from app.graphics.routing import (
     build_routing,
     connector_endpoints_from_model,
     endpoint_direction,
+    line_endpoints_from_model,
 )
 from app.graphics.strokes import is_stroked
 from app.math.mathtext_render import MathRenderError, get_math_svg
@@ -308,9 +309,11 @@ def _render_arrowhead(
     return ""  # pragma: no cover - 未知形状は描かない（"none" 相当）
 
 
-def _render_line(obj: BaseObject) -> str:
-    x1, y1 = float(obj.p1[0]), float(obj.p1[1])
-    x2, y2 = float(obj.p2[0]), float(obj.p2[1])
+def _render_line(document: Document, obj: BaseObject) -> str:
+    """line/arrow をモデルから描画する。接着端は `line_endpoints_from_model`
+    （Qt 非依存の共有経路、項目8）で実効座標に解決してから描く。
+    """
+    (x1, y1), (x2, y2) = line_endpoints_from_model(document, obj)
     direction = unit_vector((x1, y1), (x2, y2))
     arrow_size = max(float(obj.arrow_size), 0.0)
     lx1, ly1, lx2, ly2 = x1, y1, x2, y2
@@ -561,7 +564,7 @@ def _render_ellipse_entry(document: Document, obj: BaseObject, outline_text: boo
 
 @register_svg_renderer("line", "arrow")
 def _render_line_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
-    return _wrap_opacity(_render_line(obj), obj.opacity)
+    return _wrap_opacity(_render_line(document, obj), obj.opacity)
 
 
 @register_svg_renderer("freehand")

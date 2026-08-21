@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING, Any
 
 import shiboken6
@@ -21,7 +20,6 @@ from app.graphics.avoid import collect_obstacles
 from app.graphics.routing import (
     Box,
     Point,
-    anchors_for,
     build_routing,
     compute_endpoints,
     endpoint_direction,
@@ -30,6 +28,16 @@ from app.graphics.routing import (
 )
 from app.graphics.strokes import stroke_margin
 from app.model.objects import BaseObject
+from app.scene.anchor_snap import (
+    SNAP_SCREEN_PX,
+    connectable_items,
+    find_anchor_snap,
+    logical_box_for_item,
+    scene_threshold,
+)
+from app.scene.anchor_snap import (
+    anchor_set_for_item as _anchor_set_for_item,
+)
 from app.scene.handles import ConnectorHandleSet
 from app.scene.items.arrow_paint import paint_arrowhead
 from app.scene.items.base_item import BaseItem
@@ -39,67 +47,11 @@ from app.scene.items.shape_item import pen_for
 if TYPE_CHECKING:
     from app.model.document import Document
 
-_SNAP_SCREEN_PX = 12.0  # アンカー磁石スナップの判定距離(画面px。回転ハンドル等と同様に換算)。
-
-
-def logical_box_for_item(item: BaseItem) -> Box | None:
-    """`item` の「論理 box」（モデル座標系・回転無視の軸並行 bbox）を返す。
-
-    `sceneBoundingRect()` は RectEllipse/Image/Text/Math/Freehand 等で
-    stroke_width/2 ぶん外側に拡張されており、SVG エクスポート側（モデルの
-    x/y/width/height、あるいは line/arrow の p1/p2 bbox）と最大 stroke幅/2
-    食い違う（M6レビュー minor2）。そこで box 系アイテム（`live_geometry()` が
-    x/y/width/height を返す）はその値を、LineItem（`live_geometry()` が p1/p2
-    を返す）は p1/p2 の軸並行 bbox を使う。`live_geometry()` はライブドラッグ中は
-    ライブ値、確定後はモデル値と一致するため、追従（ライブ/コマンド）は引き続き
-    機能する。判定できない場合（`live_geometry` を持たない等）は None を返し、
-    呼び出し側は `sceneBoundingRect()` にフォールバックする。
-
-    モジュール関数として公開しているのは、`ConnectorItem`（ライブ追従）と
-    `main_window._object_box`（削除直前の端点固定化）の双方が同じ box 定義を
-    使う必要があるため（別々に実装すると食い違い、削除直前にアンカーが
-    ジャンプしてしまう）。
-    """
-    live_geometry = getattr(item, "live_geometry", None)
-    if not callable(live_geometry):
-        return None
-    geom = live_geometry()
-    if "width" in geom and "height" in geom:
-        return (float(geom["x"]), float(geom["y"]), float(geom["width"]), float(geom["height"]))
-    if "p1" in geom and "p2" in geom:
-        x1, y1 = geom["p1"]
-        x2, y2 = geom["p2"]
-        x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
-        return (min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-    return None
-
-
-def _anchor_set_for_item(item: BaseItem) -> dict[str, Point]:
-    """`item` の種類別アンカー集合（種類別アンカー契約 §2）。
-
-    `item.obj.type` と `item.live_geometry()` のライブ幾何から
-    `anchors_for()` に委譲する。箱型（`live_geometry()` に width/height）は
-    9点、line/arrow（`live_geometry()` に p1/p2）は start/center/end の3点。
-    どちらの形も持たない場合は `sceneBoundingRect()` を箱として扱う
-    （フォールバック。現状の全接続可能種別は live_geometry を実装するため
-    通常は到達しない）。
-    """
-    obj_type = item.obj.type
-    live_geometry = getattr(item, "live_geometry", None)
-    geom = live_geometry() if callable(live_geometry) else {}
-    if "width" in geom and "height" in geom:
-        box: Box = (float(geom["x"]), float(geom["y"]), float(geom["width"]), float(geom["height"]))
-        rotation = float(geom.get("rotation", 0.0))
-        return anchors_for(obj_type, box, None, None, rotation)
-    if "p1" in geom and "p2" in geom:
-        x1, y1 = geom["p1"]
-        x2, y2 = geom["p2"]
-        p1: Point = (float(x1), float(y1))
-        p2: Point = (float(x2), float(y2))
-        return anchors_for(obj_type, None, p1, p2)
-    rect = item.sceneBoundingRect()
-    box = (float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height()))
-    return anchors_for(obj_type, box, None, None)
+# `logical_box_for_item`/`_anchor_set_for_item` は `app.scene.anchor_snap` へ移設した
+# （項目8 B-2。`handles.py` から `connector_item`/`shape_item` を import すると循環する
+# ため）。ここではモジュールトップの別名として re-export するだけの1行委譲にする
+# （`tool_manager.py` の `from app.scene.items.connector_item import logical_box_for_item`、
+# `protocols.py` のコメント参照を壊さないため）。実装・docstring は `anchor_snap.py` 側。
 
 
 @register_item("connector")
@@ -396,65 +348,36 @@ class ConnectorItem(BaseItem):
     def _snap_scene_threshold(self) -> float:
         """スナップ判定距離を画面上で一定になるよう view の現在スケールで換算する。
 
-        回転ハンドル(`handles.py` の `_rotate_offset`)と同じ換算方式。view が無い
-        （テスト等）場合は `_SNAP_SCREEN_PX` をそのまま scene 距離として使う。
+        `anchor_snap.scene_threshold` への1行委譲（項目8 B-2で `handles.py` とも
+        共有できるよう自由関数化した。回転ハンドル(`handles.py` の `_rotate_offset`)
+        と同じ換算方式）。
         """
-        scene = self.scene()
-        if scene is not None:
-            views = scene.views()
-            if views:
-                scale = views[0].transform().m11()
-                if scale:
-                    return _SNAP_SCREEN_PX / scale
-        return _SNAP_SCREEN_PX
+        return scene_threshold(self.scene(), SNAP_SCREEN_PX)
 
     def _connectable_items(self) -> list[BaseItem]:
         """scene 内の「接続可能」な item 全部（自分自身・connector・非表示を除く）。
 
-        `visible=False` のオブジェクトはスナップ候補から除外する（レビュー
-        minor所見: 非表示オブジェクトがスナップ候補になっていた）。非スナップ時の
-        ドロップ確定 `_hit_connectable_at` は位置指定 `scene.items(pos, ...)` で
-        非表示アイテムを拾わないため、ここでも揃えないと「スナップ時だけ非表示
-        オブジェクトに接続できる」という不整合が生じる。`locked` は接続対象として
-        引き続き有効なので除外しない。
+        `anchor_snap.connectable_items` への1行委譲。`visible=False` のオブジェクトは
+        スナップ候補から除外する（レビュー minor所見: 非表示オブジェクトがスナップ
+        候補になっていた）。非スナップ時のドロップ確定 `_hit_connectable_at` は
+        位置指定 `scene.items(pos, ...)` で非表示アイテムを拾わないため、ここでも
+        揃えないと「スナップ時だけ非表示オブジェクトに接続できる」という不整合が
+        生じる。`locked` は接続対象として引き続き有効なので除外しない。
         """
-        scene = self.scene()
-        if scene is None:
-            return []
-        result: list[BaseItem] = []
-        for item in scene.items():
-            if item is self:
-                continue
-            obj = getattr(item, "obj", None)
-            if obj is None or obj.type == "connector":
-                continue
-            if not obj.visible:
-                continue
-            result.append(item)
-        return result
+        return connectable_items(self.scene(), exclude=self)
 
     def _find_snap(self, which: str, point: Point) -> tuple[Point, int, str] | None:
         """`point`（scene座標）に最も近い接続可能アンカーを探す（コネクタ端点スナップ契約 §3）。
 
-        全 `_connectable_items()` を通じた最小距離のアンカーが
-        `_snap_scene_threshold()` 以内なら `(anchor_point, obj_id, anchor_name)` を
-        返す。無ければ `None`。`which` は現状の距離計算では使わないが、将来
-        端点固有のスナップ規則を入れる余地のためシグネチャに残す。
+        `anchor_snap.find_anchor_snap` への1行委譲。全 `_connectable_items()` を
+        通じた最小距離のアンカーが `_snap_scene_threshold()` 以内なら
+        `(anchor_point, obj_id, anchor_name)` を返す。無ければ `None`。`which` は
+        現状の距離計算では使わないが、将来端点固有のスナップ規則を入れる余地の
+        ためシグネチャに残す。
         """
-        threshold = self._snap_scene_threshold()
-        px, py = point
-        best: tuple[Point, int, str] | None = None
-        best_dist_sq = math.inf
-        for item in self._connectable_items():
-            anchor_set = _anchor_set_for_item(item)
-            for name, (ax, ay) in anchor_set.items():
-                dist_sq = (ax - px) ** 2 + (ay - py) ** 2
-                if dist_sq < best_dist_sq:
-                    best_dist_sq = dist_sq
-                    best = ((ax, ay), item.obj.id, name)
-        if best is None or best_dist_sq > threshold * threshold:
-            return None
-        return best
+        return find_anchor_snap(
+            self.scene(), point, threshold=self._snap_scene_threshold(), exclude=self
+        )
 
     def drag_endpoint(self, which: str, point: Point) -> None:
         """端点ドラッグ中の窓口（`ConnectorHandleSet.drag_to` から呼ぶ。コネクタ端点
@@ -610,21 +533,26 @@ class ConnectorItem(BaseItem):
         `shiboken6.isValid()` で事前に生存確認し、無効なら disconnect 自体を
         呼ばない（例外を握りつぶすのではなく事前回避する。既存の
         layer_panel.py/property_panel.py と同じ防御パターン）。
+
+        `_source_connection`/`_target_connection` が同じ item を指す場合
+        （ハンドルドラッグで target を source と同じ図形へ付け替えた場合等）、
+        Qt の `disconnect(signal, slot)` は一致する接続を全部切るため、素朴に
+        2回呼ぶと2回目が「接続していない相手を切断しようとする」ことになり
+        libpyside の警告が出る（`LineItem._unbind_endpoints` と同じレビュー
+        minor所見。片方だけ直すと同じ穴が別経路に残るため、こちらにも適用する）。
+        `dict.fromkeys` で identity 重複を除いてから1回だけ切る。
         """
-        if self._source_connection is not None:
-            if shiboken6.isValid(self._source_connection):
+        connections = dict.fromkeys(
+            c for c in (self._source_connection, self._target_connection) if c is not None
+        )
+        for connection in connections:
+            if shiboken6.isValid(connection):
                 try:
-                    self._source_connection.geometryChanged.disconnect(self._on_endpoint_changed)
+                    connection.geometryChanged.disconnect(self._on_endpoint_changed)
                 except (RuntimeError, TypeError):
                     pass
-            self._source_connection = None
-        if self._target_connection is not None:
-            if shiboken6.isValid(self._target_connection):
-                try:
-                    self._target_connection.geometryChanged.disconnect(self._on_endpoint_changed)
-                except (RuntimeError, TypeError):
-                    pass
-            self._target_connection = None
+        self._source_connection = None
+        self._target_connection = None
 
     def _on_endpoint_changed(self) -> None:
         self.prepareGeometryChange()

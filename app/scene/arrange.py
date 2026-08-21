@@ -205,7 +205,8 @@ def clone_object_dicts(
       対応が無い group_id は None にする（複製先を意図せぬグループへ混入させない）。
     - x/y を持つオブジェクト（rect/ellipse/image/text/math 等）は x/y に offset を加算。
       freehand は points 全点にも offset を加算する。
-    - line/arrow は p1/p2 に offset を加算。
+    - line/arrow は p1/p2 に offset を加算。接着端（p1_id/p2_id、項目8）は
+      connector の source_id/target_id と同じ規則で id を張り替える（下記）。
     - connector は source_point/target_point に offset を加算し、source_id/target_id は
       同一複製バッチ内に対応する複製先があれば新 id に追従、無ければ None にする
       （複製先で他バッチ外オブジェクトへの不整合な参照を残さないため）。
@@ -243,6 +244,15 @@ def clone_object_dicts(
                 d["p1"] = [d["p1"][0] + dx, d["p1"][1] + dy]
             if d.get("p2") is not None:
                 d["p2"] = [d["p2"][0] + dx, d["p2"][1] + dy]
+            # 接着端（項目8）は connector の source_id/target_id と同じ扱い:
+            # 同一複製バッチ内に対応する複製先があれば新 id に追従、無ければ
+            # None にする（複製先で他バッチ外オブジェクトへの不整合な参照を
+            # 残さないため）。これを怠ると「line + rect をまとめて複製したら
+            # 複製 line が元の rect を追いかける」バグになる。
+            if d.get("p1_id") is not None:
+                d["p1_id"] = id_remap.get(d["p1_id"])
+            if d.get("p2_id") is not None:
+                d["p2_id"] = id_remap.get(d["p2_id"])
         elif kind == "connector":
             if d.get("source_point") is not None:
                 d["source_point"] = [d["source_point"][0] + dx, d["source_point"][1] + dy]

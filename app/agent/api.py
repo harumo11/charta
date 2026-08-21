@@ -54,12 +54,14 @@ from app.graphics import diagnostics
 from app.graphics.routing import (
     anchor_set_for_object,
     compute_endpoints,
+    connector_endpoints_from_model,
+    line_endpoints_from_model,
     resolved_bounding_box,
 )
 from app.model import styles
 from app.model.document import Artboard, Document, Physical
 from app.model.geometry import bounding_box, translate_geom
-from app.model.objects import OBJECT_REGISTRY, BaseObject, new_object
+from app.model.objects import OBJECT_REGISTRY, BaseObject, binding_slots, new_object
 from app.model.serialize import PROJECT_JSON_NAME, load_document, save_document
 from app.scene import arrange
 
@@ -96,6 +98,38 @@ _TOOL_CREATED_TYPES: dict[str, str] = {"image": "place_image", "connector": "con
 _RELATIVE_SIDES = ("above", "below", "left_of", "right_of", "inside")
 _RELATIVE_ALIGNS = ("start", "center", "end")
 _RELATIVE_DEFAULT_GAP = 24.0
+
+
+def _drop_unconvergent_move_suggestions(
+    document: Document, findings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """`clipped`/`offscreen` の `corrected_call` のうち、対象が接続端を持つ場合は外す。
+
+    `move_objects`/`translate_geom` は接続端（line/arrow の `pN_id`、connector の
+    `source_id`/`target_id`）が非 None の側の baked 座標を動かせない（§9.3・
+    「## 9.5 の既知の制限2」）ため、その端が原因で `clipped`/`offscreen` になって
+    いる場合、提示した dx/dy を送り返しても実効座標（アンカー解決後）は変わらず、
+    次の `critique` が全く同じ `corrected_call` を返し続けて往復が終わらない
+    （レビュー major所見。実測: 右端外の rect に接着した line へ move_objects の
+    提案を送っても bbox の右端が動かない）。
+
+    「修正案は送り返せば直ることが要件」（CLAUDE.md「## 図の破綻を機械可読に
+    点検する」節）なので、収束を保証できない場合は corrected_call を付けない
+    （`diagnose.suggest_fix` が既に「案なし」に None を使っている場所と同じ
+    語彙）。`clipped(fits=False)`（縮小案・`update_objects`）や `overlap`/
+    `occluded`/`text_overflow`/`low_contrast`/`small_text` の修正案は対象の型を
+    問わず収束することが元から保証されているため、ここでは `clipped`/
+    `offscreen` の `move_objects` 提案だけを対象にする。
+    """
+    result: list[dict[str, Any]] = []
+    for finding in findings:
+        if finding.get("code") in ("clipped", "offscreen") and "corrected_call" in finding:
+            obj = document.object_by_id(finding.get("id"))
+            slots = binding_slots(obj.type) if obj is not None else ()
+            if obj is not None and slots and any(getattr(obj, k) is not None for k, _, _ in slots):
+                finding = {k: v for k, v in finding.items() if k != "corrected_call"}
+        result.append(finding)
+    return result
 
 
 def _suggest(value: Any, candidates: tuple[str, ...]) -> str | None:
@@ -404,14 +438,36 @@ class AgentAPI:
             points = full.get("points")
             if isinstance(points, list) and len(points) > 32:
                 full["points"] = f"<{len(points)} 点を省略>"
+            # 接着中/接続中の p1/p2・source_point/target_point は「最後に画面に
+            # 出ていた座標」の陳腐化しうるキャッシュ（§9.3）。`to_dict()` の生値を
+            # そのまま返すと、同じレスポンス内の "bbox"（`resolved_bounding_box`）
+            # や detail="summary" の p1/p2 と食い違う（レビュー minor所見:
+            # エージェントが detail を切り替えると同じ line の座標が別の値に見え、
+            # detail="full" の値を基準に計算すると画面にも SVG にも存在しない
+            # 座標を使うことになる）。実効座標で上書きする。
+            if obj.GEOMETRY == "endpoints" and (obj.p1_id is not None or obj.p2_id is not None):
+                p1, p2 = line_endpoints_from_model(document, obj)
+                full["p1"] = list(p1)
+                full["p2"] = list(p2)
+            elif obj.GEOMETRY == "connector" and (
+                obj.source_id is not None or obj.target_id is not None
+            ):
+                sp, tp = connector_endpoints_from_model(document, obj)
+                full["source_point"] = list(sp)
+                full["target_point"] = list(tp)
             entry["properties"] = full
         else:
             for key in ("text", "latex", "src", "fill", "stroke", "stroke_width", "font_size"):
                 if hasattr(obj, key):
                     entry[key] = getattr(obj, key)
             if obj.GEOMETRY == "endpoints":
-                entry["p1"] = list(obj.p1)
-                entry["p2"] = list(obj.p2)
+                p1, p2 = line_endpoints_from_model(document, obj)
+                entry["p1"] = list(p1)
+                entry["p2"] = list(p2)
+                entry["p1_id"] = obj.p1_id
+                entry["p2_id"] = obj.p2_id
+                entry["p1_anchor"] = obj.p1_anchor
+                entry["p2_anchor"] = obj.p2_anchor
             elif obj.GEOMETRY == "connector":
                 entry["source_id"] = obj.source_id
                 entry["target_id"] = obj.target_id
@@ -609,6 +665,7 @@ class AgentAPI:
         findings, snapshot = diagnose.collect_detailed(document, checks_tuple, ids_tuple)
         if include_suggestions:
             findings = diagnose.with_suggestions(findings, snapshot)
+            findings = _drop_unconvergent_move_suggestions(document, findings)
         return self._ok(
             findings=findings,
             summary=diagnostics.summarize(findings),
@@ -1073,11 +1130,15 @@ class AgentAPI:
                     values[f"{side}_id"] = ref_to_id[ref]
             obj = new_object("connector", document.new_id(), **values)
             # 端点座標を先に解いておく（rebind 前でも幾何が正しくなるように）。
+            # document を渡すことで、接続先が接着済みの line/arrow（項目8）の
+            # 場合もその実効端点まで連鎖して解決する。
             src_set = anchor_set_for_object(
-                document.object_by_id(obj.source_id) if obj.source_id is not None else None
+                document.object_by_id(obj.source_id) if obj.source_id is not None else None,
+                document,
             )
             tgt_set = anchor_set_for_object(
-                document.object_by_id(obj.target_id) if obj.target_id is not None else None
+                document.object_by_id(obj.target_id) if obj.target_id is not None else None,
+                document,
             )
             p1, p2 = compute_endpoints(
                 src_set,

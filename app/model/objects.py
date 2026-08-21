@@ -52,6 +52,9 @@ class BaseObject:
 
     TYPE: ClassVar[str] = ""
     GEOMETRY: ClassVar[str] = "box"
+    #: 接続バインディング（(id_key, anchor_key, point_key) のタプル）。空 = 接続機能を
+    #: 持たない型。line/arrow・connector が上書きする（§9.3・項目8）。
+    BINDINGS: ClassVar[tuple[tuple[str, str, str], ...]] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """`_` で始まるフィールドを除外して辞書化する。`type` を必ず含む。"""
@@ -126,9 +129,20 @@ class LineObject(BaseObject):
     arrow_start: str = "none"
     arrow_end: str = "none"
     arrow_size: float = 12.0
+    # --- 接着（項目8）。コネクタの source_id/source_anchor/source_point と同型。
+    # `pN_id` が not None の間、`pN` は「最後に画面に出ていた座標」のキャッシュに過ぎず、
+    # 実効座標は `routing.line_endpoints_from_model` が毎回解き直す（§9.3 の *_point 規約）。
+    p1_id: int | None = None
+    p1_anchor: str = "center"
+    p2_id: int | None = None
+    p2_anchor: str = "center"
 
     TYPE: ClassVar[str] = "line"
     GEOMETRY: ClassVar[str] = "endpoints"
+    BINDINGS: ClassVar[tuple[tuple[str, str, str], ...]] = (
+        ("p1_id", "p1_anchor", "p1"),
+        ("p2_id", "p2_anchor", "p2"),
+    )
 
 
 @dataclass(kw_only=True)
@@ -213,6 +227,10 @@ class ConnectorObject(BaseObject):
 
     TYPE: ClassVar[str] = "connector"
     GEOMETRY: ClassVar[str] = "connector"
+    BINDINGS: ClassVar[tuple[tuple[str, str, str], ...]] = (
+        ("source_id", "source_anchor", "source_point"),
+        ("target_id", "target_anchor", "target_point"),
+    )
 
 
 @dataclass(kw_only=True)
@@ -266,3 +284,15 @@ def geometry_kind(type_name: str) -> str:
     未知の型名は `KeyError` を送出する（`OBJECT_REGISTRY[type_name]` の素の挙動に従う）。
     """
     return OBJECT_REGISTRY[type_name].GEOMETRY
+
+
+def binding_slots(type_name: str) -> tuple[tuple[str, str, str], ...]:
+    """`type_name` の接続バインディング（`(id_key, anchor_key, point_key)` のタプル）。
+
+    line/arrow は `p1_id`/`p1_anchor`/`p1` と `p2_id`/`p2_anchor`/`p2`、connector は
+    `source_id`/`source_anchor`/`source_point` と `target_id`/`target_anchor`/
+    `target_point` を返す。接続機能を持たない型は空タプル。削除時の端点固定化
+    （§9.3）を型を問わず同一実装で扱うための索引で、`OBJECT_REGISTRY[type_name].
+    BINDINGS` の薄い委譲（未知の型名は `KeyError`、`geometry_kind` と同じ挙動）。
+    """
+    return OBJECT_REGISTRY[type_name].BINDINGS

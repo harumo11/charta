@@ -3,10 +3,15 @@
 MainWindow の `copy_selection`/`paste_clipboard`/`duplicate_selection`/
 `_clone_and_add`/`bring_to_front`/`send_to_back`/`bring_forward`/`send_backward`/
 `_reorder_selected`/`_apply_box_moves`/`align_selected`/`distribute_selected`/
-`group_selected`/`ungroup_selected`/`delete_selected`/`_fix_connector_endpoints`/
-モジュール関数 `_object_anchor_set`/`_toggle_grid`/`_toggle_snap` を移設したもの
+`group_selected`/`ungroup_selected`/`delete_selected`/`_fix_bound_endpoints`
+（旧 `_fix_connector_endpoints`）/モジュール関数 `_object_anchor_set`/
+`_toggle_grid`/`_toggle_snap` を移設したもの
 （Phase 4契約 Stage 3）。ロジックは `app/ui/main_window.py`（移設前）と同一で、
 `self.xxx` の参照付け替えのみ行った。
+
+`_fix_connector_endpoints` は P4/P5 契約 (B) 項目8 B-5 で `_fix_bound_endpoints` に
+一般化された（`binding_slots(type_name)` を索引に connector/line を同一実装で扱う。
+§9.3・§14「加法的登録」により将来型が増えても本ファイルは無改修で対応する）。
 """
 
 from __future__ import annotations
@@ -25,10 +30,19 @@ from app.commands.commands import (
     SetPropertyCommand,
     UngroupCommand,
 )
-from app.graphics.routing import Box, Point, anchors_for, compute_endpoints
+from app.graphics.routing import (
+    Box,
+    Point,
+    anchor_set_for_object,
+    anchors_for,
+    compute_endpoints,
+    connector_endpoints_from_model,
+    line_endpoints_from_model,
+    resolved_bounding_box,
+)
 from app.model.document import Document
 from app.model.geometry import bounding_box, translate_geom
-from app.model.objects import BaseObject
+from app.model.objects import BaseObject, binding_slots, geometry_kind
 from app.scene import arrange
 
 if TYPE_CHECKING:
@@ -66,12 +80,36 @@ def _object_anchor_set(
         box: Box = (float(geom["x"]), float(geom["y"]), float(geom["width"]), float(geom["height"]))
         rotation = float(geom.get("rotation", 0.0))
         return anchors_for(obj.type, box, None, None, rotation)
-    if obj.GEOMETRY == "endpoints":
-        p1 = (float(obj.p1[0]), float(obj.p1[1]))
-        p2 = (float(obj.p2[0]), float(obj.p2[1]))
-        return anchors_for(obj.type, None, p1, p2)
-    box = (float(obj.x), float(obj.y), float(obj.width), float(obj.height))
-    return anchors_for(obj.type, box, None, None, float(obj.rotation))
+    # item の live_geometry が無い（item 未生成/box 型で live 値が別形）場合は
+    # モデルの生の値にフォールバックする。line/arrow が自身の端点を他オブジェクトへ
+    # 接着している場合（項目8）は `anchor_set_for_object` が `document` 経由で
+    # 実効座標まで連鎖して解決する。
+    return anchor_set_for_object(obj, document)
+
+
+def _resolved_to_dict(document: Document, obj: BaseObject) -> dict[str, Any]:
+    """`obj.to_dict()` だが、接着端点（line/arrow・connector）は実効座標で焼く。
+
+    複製元の生 `p1`/`p2`（`source_point`/`target_point`）は接着中「最後に画面へ
+    表示されていた座標」のキャッシュに過ぎない。複製バッチが接着先を含まない
+    場合、`arrange.clone_object_dicts` は `id_key` を `None` に切り離すが座標は
+    渡された値（＝この生キャッシュ + offset）のまま焼くため、接着先を動かした
+    後に複製すると、複製が「接着した瞬間の座標＋offset」という無関係な位置に
+    現れる（レビュー major所見）。バッチ内に複製先が含まれる場合は id が新 id へ
+    追従して実効座標を解決し直すため実害は無いが、区別せず常に実効座標で
+    焼いても安全なので常にこちらを使う。
+    """
+    d = obj.to_dict()
+    kind = geometry_kind(obj.type)
+    if kind == "endpoints" and (obj.p1_id is not None or obj.p2_id is not None):
+        p1, p2 = line_endpoints_from_model(document, obj)
+        d["p1"] = [p1[0], p1[1]]
+        d["p2"] = [p2[0], p2[1]]
+    elif kind == "connector" and (obj.source_id is not None or obj.target_id is not None):
+        p1, p2 = connector_endpoints_from_model(document, obj)
+        d["source_point"] = [p1[0], p1[1]]
+        d["target_point"] = [p2[0], p2[1]]
+    return d
 
 
 #: z順操作の識別子 -> (新インデックス計算, 処理順を降順にするか)。
@@ -111,11 +149,16 @@ class EditController:
     # ------------------------------------------------------------------
 
     def copy_selection(self) -> None:
-        """選択中オブジェクトを内部クリップボードへ `to_dict()` でコピーする。"""
+        """選択中オブジェクトを内部クリップボードへ `to_dict()` でコピーする。
+
+        接着端点は `_resolved_to_dict` で実効座標へ焼く（レビュー major所見。
+        「複製」節の docstring 参照）。
+        """
         objs = self._scene.selected_objects()
         if not objs:
             return
-        self._clipboard = [obj.to_dict() for obj in objs]
+        document = self._scene.document
+        self._clipboard = [_resolved_to_dict(document, obj) for obj in objs]
 
     def paste_clipboard(self) -> None:
         """内部クリップボードの内容を複製して貼り付ける。"""
@@ -133,10 +176,13 @@ class EditController:
         """`objs` をその場で複製する。生成した新オブジェクトを返す。
 
         `select=False` にすると人間の選択状態を奪わない（エージェント経路の既定）。
+        接着端点は `_resolved_to_dict` で実効座標へ焼く（レビュー major所見）。
         """
         if not objs:
             return []
-        return self._clone_and_add([obj.to_dict() for obj in objs], text=text, select=select)
+        document = self._scene.document
+        dicts = [_resolved_to_dict(document, obj) for obj in objs]
+        return self._clone_and_add(dicts, text=text, select=select)
 
     def _clone_and_add(
         self, dicts: list[dict[str, Any]], text: str, select: bool = True
@@ -266,8 +312,28 @@ class EditController:
         return [obj for obj, _, _ in changes]
 
     def _arrangeable(self, objs: list[BaseObject], force: bool) -> list[BaseObject]:
-        """整列/分布の対象を絞る。コネクタは独立した位置を持たないので常に除外する。"""
-        return [o for o in objs if (force or not o.locked) and o.type != "connector"]
+        """整列/分布の対象を絞る。
+
+        コネクタは独立した位置を持たないので常に除外する。接着端を持つ
+        line/arrow（`binding_slots` の id_key のいずれかが非 None）も同じ理由で
+        除外する（レビュー major所見）: `bounding_box(o)` は生の `p1`/`p2`
+        （接着中は「最後に画面に出ていた座標」の陳腐化しうるキャッシュ）を使うため、
+        対象全体の外接矩形（基準）にこの陳腐化した bbox が混じると、align/
+        distribute で**他の**選択オブジェクトまで見た目とは無関係な位置へ動く
+        （既知の制限2「接続端の baked 座標を動かすこと自体は視覚的に no-op」とは
+        別の実害: 基準を汚染して無関係なオブジェクトを動かす）。
+        """
+        result: list[BaseObject] = []
+        for o in objs:
+            if not (force or not o.locked):
+                continue
+            if o.type == "connector":
+                continue
+            slots = binding_slots(o.type)
+            if slots and any(getattr(o, id_key) is not None for id_key, _, _ in slots):
+                continue
+            result.append(o)
+        return result
 
     def align_selected(self, mode: str) -> None:
         """選択中オブジェクトを `mode` に整列する（コネクタは対象外）。"""
@@ -289,14 +355,18 @@ class EditController:
         （コネクタとロック済みを除いた後で判定する）。`reference` を与えると
         その 1 個を基準にして残りを揃える。基準は対象から除外されるので絶対に
         動かず、戻り値にも現れない（`objs` に含まれていても同じ）。この場合は
-        対象 1 個でも成立する。
+        対象 1 個でも成立する。`reference` 自身は `_arrangeable` の除外対象では
+        ないため（基準は動かないので接着端の陳腐化キャッシュでも実害は無いはず
+        だが）、接着済み line/arrow・コネクタを明示的に基準にした場合でも実際に
+        見えている位置に揃うよう、`bounding_box` ではなく `resolved_bounding_box`
+        を使う（レビュー major所見。エージェントの `relative_to` 経由で到達可能）。
         """
         targets = self._arrangeable(objs, force)
         if reference is not None:
             targets = [o for o in targets if o.id != reference.id]
             if not targets:
                 return []
-            ref_box: Box | None = bounding_box(reference)
+            ref_box: Box | None = resolved_bounding_box(self._scene.document, reference)
         else:
             if len(targets) < 2:
                 return []
@@ -399,10 +469,11 @@ class EditController:
     def delete_objects(self, objs: list[BaseObject], text: str = "削除") -> list[int]:
         """`objs` を削除する。削除した id のリストを返す。
 
-        削除対象を接続先に持つ非対象コネクタは、削除前（接続先がまだ存在する
-        時点）に現在のアンカー座標を計算して端点を固定化してから
-        `RemoveObjectCommand` を積む。すべて 1 つの undo マクロにまとめるため、
-        1 回の undo で全て復元される（§9.3: 孤立させない）。
+        削除対象を接続先に持つ非対象の connector/line は、削除前（接続先がまだ
+        存在する時点）に現在のアンカー座標を計算して接続端を固定化してから
+        `RemoveObjectCommand` を積む（`binding_slots` で型を問わず判定。B-5）。
+        すべて 1 つの undo マクロにまとめるため、1 回の undo で全て復元される
+        （§9.3: 孤立させない）。
 
         ロック済みでも削除する（従来の Delete キーの挙動と同じ）。ロックを尊重したい
         呼び出し側は事前に絞り込むこと。
@@ -415,48 +486,63 @@ class EditController:
 
         self._undo_stack.beginMacro(text)
         try:
-            for conn in list(document.objects):
-                if conn.type != "connector" or conn.id in ids:
+            for holder in list(document.objects):
+                if holder.id in ids:
                     continue
-                if conn.source_id not in ids and conn.target_id not in ids:
+                slots = binding_slots(holder.type)
+                if not slots:
                     continue
-                self._fix_connector_endpoints(scene, conn, ids)
+                bound_ids = {getattr(holder, id_key) for id_key, _, _ in slots}
+                bound_ids.discard(None)
+                if not bound_ids & ids:
+                    continue
+                self._fix_bound_endpoints(scene, holder, ids)
             for obj in objs:
                 self._undo_stack.push(RemoveObjectCommand(document, obj))
         finally:
             self._undo_stack.endMacro()
         return sorted(ids)
 
-    def _fix_connector_endpoints(
-        self, scene: CanvasScene, conn: BaseObject, deleted_ids: set[int]
+    def _fix_bound_endpoints(
+        self, scene: CanvasScene, holder: BaseObject, deleted_ids: set[int]
     ) -> None:
-        """`conn` の端点のうち `deleted_ids` に接続されている側を現在座標に固定化する。"""
-        document = scene.document
-        src_set = _object_anchor_set(scene, document, conn.source_id)
-        tgt_set = _object_anchor_set(scene, document, conn.target_id)
-        src_point: Point = (float(conn.source_point[0]), float(conn.source_point[1]))
-        tgt_point: Point = (float(conn.target_point[0]), float(conn.target_point[1]))
-        src_pt, tgt_pt = compute_endpoints(
-            src_set, src_point, conn.source_anchor, tgt_set, tgt_point, conn.target_anchor
+        """`holder` の接続端点のうち `deleted_ids` を指す側を現在座標に固定化する。
+
+        `_fix_connector_endpoints`（旧名）を一般化したもの。`binding_slots
+        (holder.type)` から `(id_key, anchor_key, point_key)` を型を問わず引くため、
+        connector と line（項目8）が同一実装を共有する（**再実装しない**、
+        B-5 契約）。`BINDINGS` は現行の全型（connector/line）でちょうど 2 スロット
+        なので、`compute_endpoints` の相互参照（相手の `center` を toward にする）
+        をそのまま使う。push 順は **point → id**（id を先に消すと、その時点で
+        `_object_anchor_set` が None を返し point が解けなくなるため）。
+        """
+        if len(binding_slots(holder.type)) != 2:
+            return
+        (id_key1, anchor_key1, point_key1), (id_key2, anchor_key2, point_key2) = binding_slots(
+            holder.type
         )
-        if conn.source_id in deleted_ids:
+        document = scene.document
+        id1 = getattr(holder, id_key1)
+        id2 = getattr(holder, id_key2)
+        set1 = _object_anchor_set(scene, document, id1)
+        set2 = _object_anchor_set(scene, document, id2)
+        raw_point1 = getattr(holder, point_key1)
+        raw_point2 = getattr(holder, point_key2)
+        point1: Point = (float(raw_point1[0]), float(raw_point1[1]))
+        point2: Point = (float(raw_point2[0]), float(raw_point2[1]))
+        anchor1 = getattr(holder, anchor_key1)
+        anchor2 = getattr(holder, anchor_key2)
+        pt1, pt2 = compute_endpoints(set1, point1, anchor1, set2, point2, anchor2)
+        if id1 in deleted_ids:
             self._undo_stack.push(
-                SetPropertyCommand(
-                    document, conn, "source_point", [src_pt[0], src_pt[1]], list(conn.source_point)
-                )
+                SetPropertyCommand(document, holder, point_key1, [pt1[0], pt1[1]], list(raw_point1))
             )
+            self._undo_stack.push(SetPropertyCommand(document, holder, id_key1, None, id1))
+        if id2 in deleted_ids:
             self._undo_stack.push(
-                SetPropertyCommand(document, conn, "source_id", None, conn.source_id)
+                SetPropertyCommand(document, holder, point_key2, [pt2[0], pt2[1]], list(raw_point2))
             )
-        if conn.target_id in deleted_ids:
-            self._undo_stack.push(
-                SetPropertyCommand(
-                    document, conn, "target_point", [tgt_pt[0], tgt_pt[1]], list(conn.target_point)
-                )
-            )
-            self._undo_stack.push(
-                SetPropertyCommand(document, conn, "target_id", None, conn.target_id)
-            )
+            self._undo_stack.push(SetPropertyCommand(document, holder, id_key2, None, id2))
 
     # ------------------------------------------------------------------
     # 表示: グリッド/スナップ（§9・M7契約 §5）

@@ -56,7 +56,9 @@ RESERVED_KEYS: dict[str, frozenset[str]] = {
 #: 幾何種別 -> 幾何の真実源となるキー。
 GEOMETRY_TRUTH_KEYS: dict[str, tuple[str, ...]] = {
     "box": ("x", "y", "width", "height", "rotation"),
-    "endpoints": ("p1", "p2"),
+    # p1/p2 は「未接続端の固定座標」または「接続端の最後の実効座標キャッシュ」の
+    # 二役（項目8。connector の source_id/source_anchor/source_point と同型）。
+    "endpoints": ("p1_id", "p1_anchor", "p1", "p2_id", "p2_anchor", "p2"),
     "connector": (
         "source_id",
         "source_anchor",
@@ -90,7 +92,9 @@ _ANNOTATION_KINDS: dict[str, str] = {
 }
 
 #: 別オブジェクトの id を指すキー（kind を object_ref に上書きする）。
-_OBJECT_REF_KEYS: frozenset[str] = frozenset({"group_id", "source_id", "target_id"})
+_OBJECT_REF_KEYS: frozenset[str] = frozenset(
+    {"group_id", "source_id", "target_id", "p1_id", "p2_id"}
+)
 
 _ANCHOR_NOTE = (
     "box 型: tl|top|tr|left|center|right|bl|bottom|br /"
@@ -108,6 +112,16 @@ _KEY_NOTES: dict[str, str] = {
     "z": "配列順から導出される派生キャッシュ。書いてはいけない（order_objects を使う）",
     "source_anchor": _ANCHOR_NOTE,
     "target_anchor": _ANCHOR_NOTE,
+    "p1_anchor": _ANCHOR_NOTE,
+    "p2_anchor": _ANCHOR_NOTE,
+    # pN_id/source_id・target_id が非 None の間、pN/source_point・target_point は
+    # 「最後に画面に出ていた座標」の陳腐化しうるキャッシュ（レビュー minor所見）。
+    # get_scene の既定 detail="summary"（および detail="full" もこの反映対象）が
+    # 実効座標（アンカー解決後）を返す。
+    "p1": "p1_id が非 None の間はキャッシュ。実効座標は get_scene が返す",
+    "p2": "p2_id が非 None の間はキャッシュ。実効座標は get_scene が返す",
+    "source_point": "source_id が非 None の間はキャッシュ。実効座標は get_scene が返す",
+    "target_point": "target_id が非 None の間はキャッシュ。実効座標は get_scene が返す",
     "latex": "matplotlib mathtext（LaTeX のサブセット）。\\usepackage 不可・日本語不可",
     "routing": "straight = 直線（何も避けない）/ orthogonal = 直角折れ線で"
     "間にある図形を避ける（近似。避けきれない配置では交差の少ない経路になる）",
