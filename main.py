@@ -8,13 +8,76 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import sys
+from collections.abc import MutableMapping
+from pathlib import Path
 
+from PySide6.QtCore import QLibraryInfo
 from PySide6.QtWidgets import QApplication
 
 from app.model.serialize import load_document
 from app.ui.main_window import MainWindow
 from app.ui.theme import apply_theme
+
+
+def _configure_input_method(
+    environ: MutableMapping[str, str] = os.environ, plugin_dir: Path | None = None
+) -> None:
+    """IME に一度も接続できない環境（fcitx 指定 + 同梱プラグイン無し）を ibus に逃がす。
+
+    背景（実測は `reports/altkey.md` §1）: PySide6 wheel が同梱する
+    `platforminputcontexts` プラグインに fcitx 用のものが無い。ユーザー環境の多くは
+    im-config 由来で `QT_IM_MODULE=fcitx`（または `fcitx5`）になっており、この組み合わせだと
+    Qt はプラグインを見つけられず compose にフォールバックする。compose は IME ではないため、
+    日本語入力が一度も機能しない。fcitx5 は IBus フロントエンドを常に持つので、同梱の
+    ibus プラグイン経由なら接続できる（Qt バージョンに依存しない方式）……ただし非 portal
+    モードの同梱 ibus プラグインは `ibus-daemon` 実行ファイル（ibus パッケージ）が PATH に
+    無いと接続を確立しない（レビューで発覚。実測は `reports/altkey.md` 追補・
+    scratchpad/review/verify_A_1.py）。fcitx5 単体環境（ibus パッケージ未導入）ではその場合
+    `IBUS_USE_PORTAL=1` を追加し、fcitx5 が公開する `org.freedesktop.portal.IBus` 経由で
+    接続させる（portal モードは ibus-daemon を要らない）。fcitx5 自体が見当たらないときは
+    portal も指定しない（何もいない portal 名前へ繋ぎに行き、Qt の compose フォールバックを
+    失うだけになるため）。
+
+    `QApplication` 生成の直前に呼ぶこと（`QT_IM_MODULE` は Qt 初期化時にしか読まれない）。
+    利用者が `QT_IM_MODULES`（複数候補の明示列挙）を既に設定している場合は何もしない。
+    ただし Qt 自身（`QPlatformInputContextFactory::requested()`）は `;` 区切りで空要素を
+    捨てた結果が空なら未設定として `QT_IM_MODULE` にフォールバックするため、この関数も
+    同じ基準で「明示」を判定する（空文字列や `";"` だけの値は明示とみなさない）。
+    ディレクトリが読めない等の例外はここで飲み込み、「プラグイン無し」として扱う
+    （IME 設定のためだけに起動が失敗してはならない）。
+    """
+    if any(part for part in environ.get("QT_IM_MODULES", "").split(";")):
+        return
+    requested = environ.get("QT_IM_MODULE", "")
+    if requested.lower() not in ("fcitx", "fcitx5"):
+        return
+    try:
+        if plugin_dir is None:
+            plugin_dir = (
+                Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
+                / "platforminputcontexts"
+            )
+        has_fcitx_plugin = any(plugin_dir.glob("*fcitx*"))
+    except Exception:
+        # ディレクトリが無い／読めない等はすべて「プラグイン無し」とみなす。IME 設定の
+        # ためだけに起動そのものを失敗させてはならない。
+        has_fcitx_plugin = False
+    if has_fcitx_plugin:
+        return
+    environ["QT_IM_MODULE"] = "ibus"
+    path = environ.get("PATH")
+    if (
+        "IBUS_USE_PORTAL" not in environ
+        and shutil.which("ibus-daemon", path=path) is None
+        and shutil.which("fcitx5", path=path) is not None
+    ):
+        # ibus パッケージ（ibus-daemon）が無い fcitx5 単体環境。非 portal の同梱 ibus
+        # プラグインは ibus-daemon を見つけられないと接続しないため、fcitx5 が公開する
+        # portal 経由に切り替える。fcitx5 自体が無ければ portal 先も無いので触らない。
+        environ["IBUS_USE_PORTAL"] = "1"
 
 
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -41,6 +104,7 @@ def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     args, qt_args = _parse_args(sys.argv)
+    _configure_input_method()
     app = QApplication([sys.argv[0], *qt_args])
     apply_theme(app)
     # デスクトップ統合: charta.desktop / アイコンとウィンドウを紐づける

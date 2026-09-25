@@ -106,13 +106,19 @@ charta は研究図用の単ページ・ベクター作図アプリ（ローカ�
   line のアンカーは start center end、共通で nearest。
 - **z 順は `get_scene` の配列順**（後ろほど前面）。`z` フィールドは派生キャッシュなので
   書いてはいけない。`order_objects` を使う。
-- 色は厳密に `#rrggbb`（7 文字）。`fill` と `mask_color` は null 可
-  （null の `mask_color` は対象外領域を切り抜く）。
+- 色は厳密に `#rrggbb`（7 文字）。`rect`/`ellipse`/`curve` の `fill`・`stroke`、`text` の
+  `background`、`image` の `mask_color` は null 可（null の `mask_color` は対象外領域を
+  切り抜く。`fill`/`stroke` の null は塗り/線なし、`background` の null は背景なし）。
+  `line`/`arrow`/`freehand`/`connector` の `stroke` は null 不可（消すには `stroke_width` を
+  0 にする）。
 - `opacity` は 0.0–1.0（パーセントではない）。
 - `math` は matplotlib mathtext（LaTeX のサブセット）。`\\usepackage` 不可・**日本語不可**。
   不正な式は適用前に弾かれ、matplotlib のエラーメッセージがそのまま返る。
 - `text` の既定フォントは Noto Sans CJK JP。`width` / `height` を省くと内容に合わせて採寸される。
-- `rect` / `ellipse` は width > 0 かつ height > 0 でないと不可視になる（エラーにはならない）。
+- `rect` / `ellipse` の既定は塗りあり（薄いグレー）・線なし。`fill` を明示的に null にし、
+  かつ線も無い（`stroke` が null または `stroke_width<=0`）状態にすると完全に不可視になる
+  （エラーにはならないが `critique` の `invisible` が検出する）。width > 0 かつ
+  height > 0 でないと不可視になるのも同様（エラーにはならない）。
 - `id` / `type` / `z` / `src` / `mask_src` は書けない。
 
 ## 作法
@@ -388,7 +394,8 @@ def render_canvas(
     `warnings` は全診断コードを返す: offscreen（完全に画面外）/ clipped（一部が
     はみ出して書き出すと切れる）/ degenerate（退化寸法）/ overlap（重なり）/
     occluded（遮蔽）/ text_overflow（文字あふれ）/ low_contrast（低コントラスト）/
-    small_text（出力実寸で小さすぎる文字）。
+    small_text（出力実寸で小さすぎる文字）/ invisible（塗りも線も無く不可視な
+    rect/ellipse/curve）。
     **診断だけが目的なら `critique` のほうが安い**（PNG を書き出さず、各所見に
     `corrected_call` が付く）。ここの `warnings` は PNG を見るついでに拾う位置づけ。"""
     return _call(
@@ -422,14 +429,17 @@ def critique(
     """図の破綻を**機械可読に**点検する（読み取り専用・PNG を書き出さない）。
 
     完全に画面外・**一部がはみ出して書き出すと切れる**・退化寸法・重なり・遮蔽・
-    文字あふれ・低コントラスト・出力実寸で小さすぎる文字を 1 往復でまとめて返す。
-    各所見には `corrected_call`（`move_objects` / `update_objects` /
-    `order_objects` のいずれか、そのまま送れる形）が付く。
+    文字あふれ・低コントラスト・出力実寸で小さすぎる文字・**塗りも線も無く
+    不可視な図形**を 1 往復でまとめて返す。各所見には `corrected_call`
+    （`move_objects` / `update_objects` / `order_objects` のいずれか、
+    そのまま送れる形）が付く。
     **描いた直後にこれを 1 回呼ぶ方が `render_canvas` で目視するより安く、
     判定もぶれない。**
 
-    `checks` を絞ると該当検査だけ（既定は全件）。`ids` を渡すと、その id を
-    参照する所見だけに絞れる。
+    `checks` に渡せる名前: offscreen / clipped / degenerate / overlap /
+    occluded / text_overflow / low_contrast / small_text / invisible。
+    絞ると該当検査だけ（既定は全件）。`ids` を渡すと、その id を参照する
+    所見だけに絞れる。
 
     `run_async=True`（RPC 側の引数名は `async_`）にするとワーカースレッドで
     解析して即座に `job_id` を返す（オブジェクトが数百ある図で画面を固めない

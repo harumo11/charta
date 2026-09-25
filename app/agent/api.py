@@ -64,6 +64,7 @@ from app.model.geometry import bounding_box, translate_geom
 from app.model.objects import OBJECT_REGISTRY, BaseObject, binding_slots, new_object
 from app.model.serialize import PROJECT_JSON_NAME, load_document, save_document
 from app.scene import arrange
+from app.scene.items.box_follow import box_follow_geometry
 
 if TYPE_CHECKING:
     from app.ui.main_window import MainWindow
@@ -642,10 +643,13 @@ class AgentAPI:
     ) -> dict[str, Any]:
         """図の破綻を**機械可読に**点検する（読み取り専用・PNG を書き出さない）。
 
-        画面外・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・出力実寸で
-        小さすぎる文字を 1 往復でまとめて返す。各所見には `corrected_call`
+        画面外・一部がはみ出して書き出すと切れる・退化寸法・重なり・遮蔽・
+        文字あふれ・低コントラスト・出力実寸で小さすぎる文字・塗りも線も無く
+        不可視な図形を 1 往復でまとめて返す。各所見には `corrected_call`
         （`move_objects` / `update_objects` / `order_objects` のいずれか、
-        そのまま送れる形）が付く。
+        そのまま送れる形）が付く。`checks` に渡せる名前は offscreen / clipped /
+        degenerate / overlap / occluded / text_overflow / low_contrast /
+        small_text / invisible（`app.graphics.diagnostics.CHECK_NAMES` と同じ）。
 
         描いた直後に 1 回呼ぶのが想定用途。`render` で PNG を目視するより安く、
         判定もぶれない。
@@ -1311,9 +1315,14 @@ class AgentAPI:
             for obj, values in planned:
                 geom = {k: v for k, v in values.items() if k in geometry_keys}
                 scalars = {k: v for k, v in values.items() if k not in geometry_keys}
-                follow = _math_follow_geometry(obj, scalars)
-                if follow is not None and not ({"width", "height"} & geom.keys()):
-                    # width/height を明示指定されたときはそちらを尊重する。
+                # width/height/x/y を明示指定されたときはそちらを尊重する規則
+                # （width/height 明示なら追従自体を止め、x/y 明示ならその軸だけ
+                # 追従結果から落とす）は `box_follow_geometry` の `explicit_keys`
+                # に一本化されている（`app/scene/items/box_follow.py` docstring
+                # 参照。center/right 寄せの箱幅追従で `x` も返るようになったのに
+                # `y` しか落としていなかった review finding の再発防止）。
+                follow = box_follow_geometry(obj, scalars, explicit_keys=frozenset(geom.keys()))
+                if follow is not None:
                     geom.update(follow)
                 if geom:
                     old = {k: _copy_value(getattr(obj, k)) for k in geom}
@@ -1499,6 +1508,18 @@ class AgentAPI:
         created = self._edit.duplicate_objects(
             objs, text=UNDO_PREFIX + self._label(undo_label, "複製"), select=select
         )
+        # 複製は z 順に積む（元の重なり順を保つため。EditController.duplicate_objects）
+        # ので、戻り値もその順で返ってくる。`created[i]` が `ids[i]` の複製である
+        # という従来の対応（create_objects の `created` と同じ規約）を保つため、
+        # 入力順へ並べ直す（レビュー4巡目 minor）。
+        if len(created) == len(objs):
+            from app.ui.controllers.edit_controller import _in_z_order
+
+            clone_of = {
+                src.id: clone
+                for src, clone in zip(_in_z_order(self._document, objs), created, strict=True)
+            }
+            created = [clone_of[o.id] for o in objs]
         return self._ok(
             created=[
                 {
@@ -1778,8 +1799,8 @@ class AgentAPI:
                     )
                 )
             for obj, values, _skipped in planned:
-                # font_size が寸法に効く math は、push 前（旧値のうち）に追従寸法を計算する。
-                follow = _math_follow_geometry(obj, values)
+                # font_size が寸法に効く math/text は、push 前（旧値のうち）に追従寸法を計算する。
+                follow = box_follow_geometry(obj, values)
                 for key, value in values.items():
                     macro.push(
                         SetPropertyCommand(
@@ -1795,7 +1816,7 @@ class AgentAPI:
                     old_geom = {k: _copy_value(getattr(obj, k)) for k in follow}
                     macro.push(
                         SetGeometryCommand(
-                            document, obj, follow, old_geom, text=UNDO_PREFIX + "数式サイズ追従"
+                            document, obj, follow, old_geom, text=UNDO_PREFIX + "サイズ追従"
                         )
                     )
         return self._ok(
@@ -2160,13 +2181,15 @@ class AgentAPI:
     # ------------------------------------------------------------------
 
     def set_selection(self, ids: list[int]) -> dict[str, Any]:
-        """人間の選択状態を明示的に変更する（生成系は既定でこれを呼ばない）。"""
+        """人間の選択状態を明示的に変更する（生成系は既定でこれを呼ばない）。
+
+        `ids` がちょうど 1 つのグループの一部だけなら、そのグループへ「入って」
+        から選択する（`CanvasScene.select_exactly`。グループ内個別編集契約
+        §F-6）。人間が画面上で 2 回クリックしてメンバーへ絞り込んだのと同じ
+        状態になり、グループ全体へ再展開されない。
+        """
         objs = self._resolve_many(ids)
-        self._scene.clearSelection()
-        for obj in objs:
-            item = self._scene.item_for(obj)
-            if item is not None:
-                item.setSelected(True)
+        self._scene.select_exactly(objs)
         return self._ok(selection=[o.id for o in self._scene.selected_objects()])
 
     def highlight_objects(
@@ -2240,30 +2263,6 @@ def _check_math_renderable(
             id=obj_id,
         )
     return None
-
-
-def _math_follow_geometry(obj: BaseObject, new_values: dict[str, Any]) -> dict[str, float] | None:
-    """math の `latex`/`font_size` 変更に伴う box 追従寸法を返す（無関係なら None）。
-
-    math の box は「自然サイズ × 表示倍率」の派生値（`follow_math_box` の docstring
-    参照）。`update_objects` と `apply_style` の両方がこの関数を通ることで、どの
-    経路で `font_size` を書いても表示サイズが追従する。
-    """
-    if getattr(obj, "type", None) != "math":
-        return None
-    if not ({"latex", "font_size"} & new_values.keys()):
-        return None
-    from app.scene.items.math_item import follow_math_box
-
-    return follow_math_box(
-        obj.latex,
-        float(obj.font_size),
-        str(new_values.get("latex", obj.latex)),
-        float(new_values.get("font_size", obj.font_size)),
-        str(new_values.get("color", obj.color)),
-        float(obj.width),
-        float(obj.height),
-    )
 
 
 def _copy_value(value: Any) -> Any:

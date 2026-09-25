@@ -190,13 +190,24 @@ class LayerPanel(QWidget):
             old_value = obj.visible
             if checked == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene.document, obj, "visible", checked, old_value))
+            # 離散操作なので統合しない（プロパティパネルのチェックボックスと同じ。
+            # 統合すると表示 OFF→ON の 2 回が no-op として消え、次の Ctrl+Z が
+            # 無関係な直前の操作を取り消す。レビュー4巡目 minor）。
+            self._push(
+                SetPropertyCommand(
+                    self.scene.document, obj, "visible", checked, old_value, mergeable=False
+                )
+            )
 
         def on_locked_toggled(checked: bool, obj: BaseObject = obj) -> None:
             old_value = obj.locked
             if checked == old_value:
                 return
-            self._push(SetPropertyCommand(self.scene.document, obj, "locked", checked, old_value))
+            self._push(
+                SetPropertyCommand(
+                    self.scene.document, obj, "locked", checked, old_value, mergeable=False
+                )
+            )
 
         visible_cb.toggled.connect(on_visible_toggled)
         locked_cb.toggled.connect(on_locked_toggled)
@@ -254,14 +265,11 @@ class LayerPanel(QWidget):
         self._updating = True
         try:
             selected_ids = {item.data(_ID_ROLE) for item in self._list.selectedItems()}
-            # scene.clearSelection()/setSelected() は組込 selectionChanged を自然に
-            # 発火させる。_updating の再入ガードにより _sync_selection_from_scene 側の
-            # 折り返しは無視されるので、他パネル（PropertyPanel 等）への伝播は
-            # 手動 emit なしで機能する。
-            self.scene.clearSelection()
-            for obj in self.scene.document.objects:
-                item = self.scene.item_for(obj)
-                if item is not None:
-                    item.setSelected(obj.id in selected_ids)
+            # 行クリックはその集合ちょうどを選択する（グループの一員 1 個だけを
+            # 選んだ場合もその 1 個だけになる。グループ全体は展開しない。
+            # `select_exactly` が「入っている」状態の判定も兼ねる。
+            # グループ内個別編集契約 §F-4）。
+            objs = [obj for obj in self.scene.document.objects if obj.id in selected_ids]
+            self.scene.select_exactly(objs)
         finally:
             self._updating = False

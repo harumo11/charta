@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import re
 
-from app.model.palettes import PALETTES, Palette, palette_by_id, palette_style_bundles
+from app.model.palettes import (
+    BASIC_COLORS,
+    PALETTES,
+    Palette,
+    dropdown_colors,
+    palette_by_id,
+    palette_style_bundles,
+)
 
 _HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
@@ -171,3 +178,87 @@ def test_palette_dataclass_shape() -> None:
     assert palette.name == "X"
     assert palette.note == "note"
     assert palette.colors == ("#000000",) * 8
+
+
+# --------------------------------------------------------------------------
+# 色ドロップダウン（要望8/11、P2契約 D1-2）: BASIC_COLORS / dropdown_colors
+# --------------------------------------------------------------------------
+
+
+def test_basic_colors_are_eight_uppercase_hex_values() -> None:
+    assert len(BASIC_COLORS) == 8
+    for color in BASIC_COLORS:
+        assert _HEX_RE.match(color), color
+        assert color == color.upper()
+
+
+def test_basic_colors_match_contract_values_verbatim() -> None:
+    assert BASIC_COLORS == (
+        "#000000",
+        "#808080",
+        "#D9D9D9",
+        "#FFFFFF",
+        "#FF0000",
+        "#FFFF00",
+        "#00B050",
+        "#0070C0",
+    )
+
+
+def test_dropdown_colors_with_no_palette_falls_back_to_basic_colors_plus_bw() -> None:
+    # BASIC_COLORS はすでに黒・白を含むので、追加で重複することはない。
+    assert dropdown_colors(None) == BASIC_COLORS
+
+
+def test_dropdown_colors_appends_missing_black_and_white() -> None:
+    palette = palette_by_id("tableau10")
+    assert palette is not None
+    result = dropdown_colors(palette)
+    assert result[:8] == palette.colors
+    assert result[8:] == ("#000000", "#FFFFFF")
+    assert len(result) == 10
+
+
+def test_dropdown_colors_does_not_duplicate_black_already_in_palette() -> None:
+    # okabe_ito の8色目はすでに #000000。黒は重複追加せず、白だけ足す。
+    palette = palette_by_id("okabe_ito")
+    assert palette is not None
+    result = dropdown_colors(palette)
+    assert result.count("#000000") == 1
+    assert result[-1] == "#FFFFFF"
+    assert len(result) == 9
+
+
+def test_dropdown_colors_matching_is_case_insensitive() -> None:
+    lower_case_bw = Palette(
+        id="lowercase",
+        name="lowercase",
+        note="",
+        colors=(
+            "#111111",
+            "#222222",
+            "#333333",
+            "#444444",
+            "#555555",
+            "#666666",
+            "#000000",
+            "#ffffff",
+        ),
+    )
+    result = dropdown_colors(lower_case_bw)
+    # 既出（大文字小文字を無視）なので黒・白は追加されない。かつ全部大文字。
+    assert result == (
+        "#111111",
+        "#222222",
+        "#333333",
+        "#444444",
+        "#555555",
+        "#666666",
+        "#000000",
+        "#FFFFFF",
+    )
+
+
+def test_dropdown_colors_all_returned_as_uppercase() -> None:
+    for color in dropdown_colors(palette_by_id("apple")):
+        assert color == color.upper()

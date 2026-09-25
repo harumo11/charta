@@ -19,6 +19,8 @@ from PySide6.QtWidgets import QGraphicsItem, QGraphicsSceneMouseEvent
 
 from app.graphics.constraints import constrain_to_axis_or_diagonal
 from app.graphics.routing import Point
+from app.scene.anchor_snap import scene_threshold
+from app.scene.snapping import ALIGN_SNAP_SCREEN_PX, snap_edge
 
 if TYPE_CHECKING:
     from app.scene.items.connector_item import ConnectorItem
@@ -27,7 +29,11 @@ if TYPE_CHECKING:
 _HANDLE_SIZE = 8.0
 _ROTATE_OFFSET = 24.0
 _MIN_SIZE = 1.0
-_GRID_SNAP_THRESHOLD = 6.0
+#: finding #2: ロール文字列中の l/r・t/b だけを入れ替える変換表（'m' 等は素通り）。
+#: ハンドルが反対側の辺を追い越したとき、以後「動いている辺」の解釈を
+#: 実効ロール側で反転させるために使う。
+_H_FLIP = str.maketrans("lr", "rl")
+_V_FLIP = str.maketrans("tb", "bt")
 _HANDLE_DEFAULT_PEN = "#2979FF"
 _HANDLE_DEFAULT_BRUSH = "#FFFFFF"
 _HANDLE_SNAP_COLOR = "#00C853"  # コネクタ端点のスナップ吸着色(自動アンカードットと同系統)。
@@ -57,19 +63,38 @@ def _grid_size_for_snap(scene: Any) -> float | None:
     return float(size) if size else None
 
 
-def _snap_to_grid(value: float, grid_size: float) -> float:
-    nearest = round(value / grid_size) * grid_size
-    if abs(nearest - value) <= _GRID_SNAP_THRESHOLD:
-        return nearest
-    return value
-
-
 def _has_horizontal_component(role: str) -> bool:
     return "l" in role or "r" in role
 
 
 def _has_vertical_component(role: str) -> bool:
     return "t" in role or "b" in role
+
+
+def _aspect_free_dims(role: str, w0: float, h0: float, local_pos: QPointF) -> tuple[float, float]:
+    """マウス位置から得られる「自由な」幅・高さ（アスペクト適用前）を返す。
+
+    `_aspect_resize_edges` と `BoxHandleSet._snap_aspect_resize`（finding #4）が
+    共有する。角ハンドルでどちらの軸が駆動軸か（`free_w >= free_h * aspect` か）
+    の判定は、この関数の戻り値がアスペクト適用**前**の生の値であることに依存する
+    ——アスペクト適用後の (w, h) は常に `w == h * aspect` を満たすため、適用後の
+    値では駆動軸を判定できない。
+    """
+    if "l" in role:
+        free_w = abs(w0 - local_pos.x())
+    elif "r" in role:
+        free_w = abs(local_pos.x())
+    else:
+        free_w = w0
+
+    if "t" in role:
+        free_h = abs(h0 - local_pos.y())
+    elif "b" in role:
+        free_h = abs(local_pos.y())
+    else:
+        free_h = h0
+
+    return free_w, free_h
 
 
 def _aspect_resize_edges(
@@ -87,19 +112,7 @@ def _aspect_resize_edges(
     has_h = _has_horizontal_component(role)
     has_v = _has_vertical_component(role)
 
-    if "l" in role:
-        free_w = abs(w0 - local_pos.x())
-    elif "r" in role:
-        free_w = abs(local_pos.x())
-    else:
-        free_w = w0
-
-    if "t" in role:
-        free_h = abs(h0 - local_pos.y())
-    elif "b" in role:
-        free_h = abs(local_pos.y())
-    else:
-        free_h = h0
+    free_w, free_h = _aspect_free_dims(role, w0, h0, local_pos)
 
     if has_h and has_v:
         target_w = max(free_w, free_h * aspect)
@@ -282,6 +295,17 @@ class BoxHandleSet:
         }
         self._rotate_handle = _HandleItem(self, "rotate", parent_item)
         self._old_geom: dict[str, float] | None = None
+        # リサイズ中の吸着対象(吸着契約 §G-5)。`begin_drag` で 1 回だけ集めて
+        # `drag_to` の毎イベントでは使い回す(性能。押下時に索引を1回だけ作る規約)。
+        self._resize_snap_targets: dict[str, list[float]] = {"x": [], "y": []}
+        # ドラッグ中の「実効ロール」（finding #2）。掴んだハンドルが反対側の辺を
+        # 追い越すと、以後そのハンドルは追い越した側の辺を駆動することになる
+        # （例: 'ml' で右端を追い越すと、以後は右端を駆動する）。`role` 自体は
+        # 呼び出し元(`_HandleItem`)が常に元のハンドル名で渡してくるため、
+        # `_drag_resize` が越えた辺を検出するたびにここへ書き戻し、以後の
+        # イベント・吸着判定はこちらを使う。`begin_drag` で `role` にリセットし、
+        # `end_drag` でクリアする。
+        self._eff_role: str | None = None
         self.update_positions()
 
     def destroy(self) -> None:
@@ -325,6 +349,32 @@ class BoxHandleSet:
         # 呼ぶため、ドラッグ中は base_item の move スナップを抑止する
         # (M7レビュー所見: リサイズ中の move スナップ誤発火)。
         self.parent_item._resizing = True
+        self._resize_snap_targets = self._collect_resize_snap_targets()
+        self._eff_role = role
+
+    def _collect_resize_snap_targets(self) -> dict[str, list[float]]:
+        """吸着契約 §G-5: 動いている辺が吸着する他オブジェクトの候補値を集める。
+
+        押下時(`begin_drag`)に 1 回だけ呼び、`drag_to` の毎イベントでは
+        使い回す(性能。索引は押下時に1回だけ作る規約)。回転済みアイテムでは
+        軸並行の辺吸着は意味を持たないため（`_snap_resize_edges` 側で
+        `rotation != 0` を弾く）、ここでは常に候補を集めるだけに留める。
+        """
+        scene = self.parent_item.scene()
+        if scene is None or not getattr(scene, "snap_enabled", False):
+            return {"x": [], "y": []}
+        collect = getattr(scene, "collect_snap_targets", None)
+        if not callable(collect):
+            return {"x": [], "y": []}
+        obj = getattr(self.parent_item, "obj", None)
+        exclude = frozenset({obj.id}) if obj is not None else frozenset()
+        boxes = collect(exclude_ids=exclude)
+        x_targets: list[float] = []
+        y_targets: list[float] = []
+        for bx, by, bw, bh in boxes:
+            x_targets.extend((bx, bx + bw / 2.0, bx + bw))
+            y_targets.extend((by, by + bh / 2.0, by + bh))
+        return {"x": x_targets, "y": y_targets}
 
     def drag_to(
         self,
@@ -341,6 +391,8 @@ class BoxHandleSet:
 
     def end_drag(self, role: str) -> None:
         self.parent_item._resizing = False
+        self._resize_snap_targets = {"x": [], "y": []}
+        self._eff_role = None
         if self._old_geom is None:
             return
         new_geom = self.parent_item.live_geometry()
@@ -380,22 +432,57 @@ class BoxHandleSet:
             if old_w > 0.0 and old_h > 0.0:
                 aspect = old_w / old_h
 
+        # round2 finding #4: アスペクト分岐も自由リサイズ分岐と同じ実効ロール
+        # （`self._eff_role or role`）を通して live box を解釈する。`cur`
+        # （＝ live box）は毎イベント最新のものを取り直すため、free 分岐での
+        # 反対側追い越し（finding #2）の後に Shift を押すと、アスペクト分岐が
+        # 元の `role`（追い越し前のハンドル名）で live box を解釈してしまい、
+        # 「マウス側の辺」を誤って固定辺と取り違えて箱を極小に潰す回帰があった
+        # （round1 #32/#35 の半端な適用。free 分岐だけが `_eff_role` を読み書き
+        # していた）。アスペクト分岐自体は辺を追い越して反転することが無いので
+        # `_eff_role` を書き戻さない（読むだけ）。
+        eff_role = self._eff_role or role
         if aspect is not None and aspect > 0.0:
-            left, top, right, bottom = _aspect_resize_edges(role, w0, h0, local_pos, aspect)
+            left, top, right, bottom = _aspect_resize_edges(eff_role, w0, h0, local_pos, aspect)
         else:
+            # finding #2: 掴んだハンドルが反対側の辺を追い越すと、`role`
+            # （元のハンドル名）をそのまま使い続けると「動いている辺」の解釈が
+            # 次のイベントでズレる（`cur = parent.live_geometry()` は毎回
+            # 最新のライブ box から取り直すため、追い越した後は origin が既に
+            # 反対側へ移っている）。`self._eff_role` に前回までの実効ロールを
+            # 持ち越し、今回さらに追い越したら l/r・t/b だけを個別に入れ替えて
+            # 更新する（水平・垂直は独立: 角ハンドルで片方だけ追い越すことがある。
+            # `eff_role` は上（アスペクト分岐と共通）で計算済み）。
             left, top, right, bottom = 0.0, 0.0, w0, h0
-            if "l" in role:
+            if "l" in eff_role:
                 left = local_pos.x()
-            if "r" in role:
+            if "r" in eff_role:
                 right = local_pos.x()
-            if "t" in role:
+            if "t" in eff_role:
                 top = local_pos.y()
-            if "b" in role:
+            if "b" in eff_role:
                 bottom = local_pos.y()
             if left > right:
                 left, right = right, left
+                eff_role = eff_role.translate(_H_FLIP)
             if top > bottom:
                 top, bottom = bottom, top
+                eff_role = eff_role.translate(_V_FLIP)
+            # finding #2 パート2: _MIN_SIZE は「固定辺」を動かさず「動いている辺」
+            # だけをそこへ寄せて満たす（中心座標の計算より前に行う）。これを
+            # やらないと、マウスが固定辺のすぐ近くにある間、中心再計算のたびに
+            # 固定辺自体がわずかにドリフトする（0.5px 程度の再センタリング）。
+            if right - left < _MIN_SIZE:
+                if "l" in eff_role:
+                    left = right - _MIN_SIZE
+                elif "r" in eff_role:
+                    right = left + _MIN_SIZE
+            if bottom - top < _MIN_SIZE:
+                if "t" in eff_role:
+                    top = bottom - _MIN_SIZE
+                elif "b" in eff_role:
+                    bottom = top + _MIN_SIZE
+            self._eff_role = eff_role
 
         new_w = max(right - left, _MIN_SIZE)
         new_h = max(bottom - top, _MIN_SIZE)
@@ -408,50 +495,200 @@ class BoxHandleSet:
         new_x = new_center_parent.x() - new_w / 2.0
         new_y = new_center_parent.y() - new_h / 2.0
         if aspect is not None and aspect > 0.0:
-            # アスペクトロック時はグリッド吸着でアスペクトを崩したくないためスキップする。
-            _clear_snap_guides(parent.scene())
+            # アスペクトロック時は主な辺を吸着し、もう一方を比から計算する
+            # （finding #4、吸着契約 §G-5）。round2 finding #4: ここも `role`
+            # ではなく `eff_role` を使う（追い越し後の実効ロール）。
+            new_x, new_y, new_w, new_h = self._snap_aspect_resize(
+                eff_role, local_pos, w0, h0, aspect, new_x, new_y, new_w, new_h
+            )
         else:
-            new_x, new_y, new_w, new_h = self._snap_resize_edges(role, new_x, new_y, new_w, new_h)
+            new_x, new_y, new_w, new_h = self._snap_resize_edges(
+                eff_role, new_x, new_y, new_w, new_h
+            )
         parent.set_live_rect(new_x, new_y, new_w, new_h)
 
     def _snap_resize_edges(
         self, role: str, x: float, y: float, w: float, h: float
     ) -> tuple[float, float, float, float]:
-        """リサイズ後のエッジをグリッドへ吸着する(M7契約 §8・最小実装)。
+        """リサイズ後のエッジを他オブジェクトの辺・グリッドへ吸着する(吸着契約 §G-5)。
 
-        回転済みアイテムでは scene 軸平行のエッジ吸着は近似になるが、
-        `_drag_resize` 自体が既に中心を scene 座標へ写像する近似実装のため、
-        整合する範囲での最小限のグリッド吸着に留める(他オブジェクトへの
-        吸着や move 系のガイド計算は base_item/snapping.py の担当)。
+        動いている辺だけを対象にする（role に含まれる l/r/t/b のみ）。他オブジェクトの
+        辺を優先し、見つからないときだけグリッドへ吸着する（`snap_edge` の段組み。
+        `snapping.py` の move 系と同じ規則）。回転済みアイテム・子アイテム（crop
+        オーバーレイ等、scene 座標系と一致しない）は対象外——`_drag_resize` 自体が
+        中心を scene 座標へ写像する近似実装であり、回転ありでの軸並行エッジ吸着は
+        見えている辺と食い違うため。
+
+        **ガイドは実際に吸着した辺だけに出す**（`snap_edge` が返す bool を見る。
+        旧実装は「吸着していないのに一番近いグリッド線へガイドを描く」バグを持って
+        いた。§G-1 原因4）。
+
+        **固定辺を追い越す吸着は却下する**（finding #2 パート3）。`role` は
+        呼び出し元（`_drag_resize`）が追い越しを検出して更新した実効ロールで、
+        動いている辺の反対側（固定辺）は `role` に含まれない文字が指す座標
+        （`x`/`y`/`x+w`/`y+h` のうち動いていない方）である。吸着先が固定辺を
+        追い越す、または `_MIN_SIZE`未満まで近づく候補は採用しない（採用すると
+        「縮めようとしただけなのに動かないはずの固定辺が動く」事故になる）。
         """
         if self.parent_item.parentItem() is not None:
-            # 子アイテム（crop オーバーレイ等）の座標系は scene 座標と一致しない
-            # ため、scene 座標基準のグリッド吸着は適用しない。
+            return x, y, w, h
+        if self.parent_item.obj.rotation % 360.0 != 0.0:
             return x, y, w, h
         scene = self.parent_item.scene()
         grid_size = _grid_size_for_snap(scene)
-        if not grid_size:
+        targets = self._resize_snap_targets
+        if not grid_size and not targets["x"] and not targets["y"]:
             return x, y, w, h
+        threshold = scene_threshold(scene, ALIGN_SNAP_SCREEN_PX)
         left, top, right, bottom = x, y, x + w, y + h
         guides: list[tuple[str, float]] = []
         if "l" in role:
-            left = _snap_to_grid(left, grid_size)
-            guides.append(("v", left))
+            candidate, snapped = snap_edge(left, targets["x"], grid_size, threshold)
+            if snapped and candidate <= right - _MIN_SIZE:
+                left = candidate
+                guides.append(("v", left))
         if "r" in role:
-            right = _snap_to_grid(right, grid_size)
-            guides.append(("v", right))
+            candidate, snapped = snap_edge(right, targets["x"], grid_size, threshold)
+            if snapped and candidate >= left + _MIN_SIZE:
+                right = candidate
+                guides.append(("v", right))
         if "t" in role:
-            top = _snap_to_grid(top, grid_size)
-            guides.append(("h", top))
+            candidate, snapped = snap_edge(top, targets["y"], grid_size, threshold)
+            if snapped and candidate <= bottom - _MIN_SIZE:
+                top = candidate
+                guides.append(("h", top))
         if "b" in role:
-            bottom = _snap_to_grid(bottom, grid_size)
-            guides.append(("h", bottom))
-        new_w = max(right - left, _MIN_SIZE)
-        new_h = max(bottom - top, _MIN_SIZE)
+            candidate, snapped = snap_edge(bottom, targets["y"], grid_size, threshold)
+            if snapped and candidate >= top + _MIN_SIZE:
+                bottom = candidate
+                guides.append(("h", bottom))
+        # _MIN_SIZE は「固定辺」を動かさず「動いている辺」をそこへ寄せて満たす
+        # （`_drag_resize` パート2 と同じ規則。ここでの再アンカーは主に
+        # 角ハンドルで l/r 双方が role に含まれない場合の保険）。
+        if right - left < _MIN_SIZE:
+            if "l" in role:
+                left = right - _MIN_SIZE
+            elif "r" in role:
+                right = left + _MIN_SIZE
+            else:
+                right = left + _MIN_SIZE
+        if bottom - top < _MIN_SIZE:
+            if "t" in role:
+                top = bottom - _MIN_SIZE
+            elif "b" in role:
+                bottom = top + _MIN_SIZE
+            else:
+                bottom = top + _MIN_SIZE
         set_guides = getattr(scene, "set_snap_guides", None)
         if callable(set_guides):
             set_guides(guides)
-        return left, top, new_w, new_h
+        return left, top, right - left, bottom - top
+
+    def _snap_aspect_resize(
+        self,
+        role: str,
+        local_pos: QPointF,
+        w0: float,
+        h0: float,
+        aspect: float,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> tuple[float, float, float, float]:
+        """縦横比固定リサイズ(Shift・math)でも主な辺を吸着する(finding #4、
+        吸着契約 §G-5「縦横比固定のときは主な辺を吸着し、もう一方を比から計算」)。
+
+        `x, y, w, h` は `_aspect_resize_edges` が既に計算した、この回の
+        （未吸着の）アスペクト保持後の box（scene 座標。`_snap_resize_edges` と
+        同じガード――parentItem() が無く回転 0 のときだけ scene 座標と一致する
+        ため呼び出し元で保証済み）。**駆動軸**（ml/mr は x、tm/bm は y、角は
+        `_aspect_free_dims` の自由な幅/高さの大きい方——アスペクト適用「前」の
+        生の値で判定する必要がある。適用後の w/h は常に `w == h*aspect` を
+        満たすため、適用後の値では駆動軸を判定できない）の辺だけを吸着し、
+        固定側の辺（反対側の辺、または非駆動軸は中心）はそのまま、もう一方の
+        寸法を `aspect` から再計算する。非駆動軸は吸着しない(比が崩れるため)。
+        """
+        parent = self.parent_item
+        scene = parent.scene()
+        if parent.parentItem() is not None or parent.obj.rotation % 360.0 != 0.0:
+            _clear_snap_guides(scene)
+            return x, y, w, h
+        grid_size = _grid_size_for_snap(scene)
+        targets = self._resize_snap_targets
+        if not grid_size and not targets["x"] and not targets["y"]:
+            _clear_snap_guides(scene)
+            return x, y, w, h
+
+        has_h = _has_horizontal_component(role)
+        has_v = _has_vertical_component(role)
+        if has_h and has_v:
+            free_w, free_h = _aspect_free_dims(role, w0, h0, local_pos)
+            axis = "x" if free_w >= free_h * aspect else "y"
+        elif has_h:
+            axis = "x"
+        elif has_v:
+            axis = "y"
+        else:
+            _clear_snap_guides(scene)
+            return x, y, w, h
+
+        threshold = scene_threshold(scene, ALIGN_SNAP_SCREEN_PX)
+        if axis == "x":
+            if "l" in role:
+                candidate, snapped = snap_edge(x, targets["x"], grid_size, threshold)
+                fixed_right = x + w
+                if not snapped or candidate > fixed_right - _MIN_SIZE:
+                    _clear_snap_guides(scene)
+                    return x, y, w, h
+                new_w = fixed_right - candidate
+                new_x = candidate
+            else:
+                candidate, snapped = snap_edge(x + w, targets["x"], grid_size, threshold)
+                fixed_left = x
+                if not snapped or candidate < fixed_left + _MIN_SIZE:
+                    _clear_snap_guides(scene)
+                    return x, y, w, h
+                new_w = candidate - fixed_left
+                new_x = fixed_left
+            new_h = new_w / aspect
+            if "t" in role:
+                new_y = (y + h) - new_h
+            elif "b" in role:
+                new_y = y
+            else:
+                new_y = (y + h / 2.0) - new_h / 2.0
+            guide: tuple[str, float] = ("v", candidate)
+        else:
+            if "t" in role:
+                candidate, snapped = snap_edge(y, targets["y"], grid_size, threshold)
+                fixed_bottom = y + h
+                if not snapped or candidate > fixed_bottom - _MIN_SIZE:
+                    _clear_snap_guides(scene)
+                    return x, y, w, h
+                new_h = fixed_bottom - candidate
+                new_y = candidate
+            else:
+                candidate, snapped = snap_edge(y + h, targets["y"], grid_size, threshold)
+                fixed_top = y
+                if not snapped or candidate < fixed_top + _MIN_SIZE:
+                    _clear_snap_guides(scene)
+                    return x, y, w, h
+                new_h = candidate - fixed_top
+                new_y = fixed_top
+            new_w = new_h * aspect
+            if "l" in role:
+                new_x = (x + w) - new_w
+            elif "r" in role:
+                new_x = x
+            else:
+                new_x = (x + w / 2.0) - new_w / 2.0
+            guide = ("h", candidate)
+
+        set_guides = getattr(scene, "set_snap_guides", None)
+        if callable(set_guides):
+            set_guides([guide])
+        return new_x, new_y, new_w, new_h
 
     def _drag_rotate(self, scene_pos: QPointF) -> None:
         parent = self.parent_item

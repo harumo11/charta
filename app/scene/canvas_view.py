@@ -22,7 +22,7 @@ from PySide6.QtGui import (
     QTransform,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QGraphicsView, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsView, QWidget
 
 from app.commands.commands import SetArtboardCommand
 from app.model.document import ARTBOARD_PX_MAX, artboard_with_pixel_size
@@ -98,6 +98,12 @@ class CanvasView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+
+        # グループ枠（グループ内個別編集契約 §F-3）: `drawForeground` は Qt が
+        # 汚れた item 領域だけを再描画するため、入る/出るで枠の位置が変わっても
+        # 変化しなかった辺は古い破線のまま残り得る。状態が変わるたび明示的に
+        # viewport 全体を再描画する（advisor 所見）。
+        self.scene().entered_group_changed.connect(lambda _group_id: self.viewport().update())
 
     # -- 背景描画（紙の装飾） -------------------------------------------------
 
@@ -491,6 +497,8 @@ class CanvasView(QGraphicsView):
         if scene is None:
             return
         theme = current_theme()
+        # グループ枠はシーン座標のまま描く（world matrix を切る前）。
+        self._draw_entered_group_frame(painter, theme)
         painter.save()
         painter.setWorldMatrixEnabled(False)
         if self._grip_drag_origin_px is not None and self._grip_preview_px is not None:
@@ -679,18 +687,25 @@ class CanvasView(QGraphicsView):
             return
         if self._handle_node_edit_key(event):
             return
-        # curve 下書きの Esc/Enter より前に置く（項目10レビュー minor 所見）:
+        # curve 下書き・グループ内個別編集の Esc より前に置く（項目10レビュー minor
+        # 所見、および findings #1/#8: グループ内個別編集の Esc も同じ穴を持つ）:
         # 4 つの編集モード（上記）はグリップと共存できない（`_grip_edit_mode_blocks`
-        # がグリップ側で先に締め出す）が、curve 下書きだけは tool_manager 側の
-        # 状態でありグリップと共存し得る。ここより後ろだと Esc が
-        # `_handle_curve_draft_key` に先に取られ、curve 下書きだけがキャンセルされて
-        # グリップドラッグが生き残り、直後の release でアートボードが確定してしまう
-        # （ユーザーは「キャンセルした」つもりなのにモデルが変わる静かな破綻）。
+        # がグリップ側で先に締め出す）が、curve 下書きと「グループに入っている」
+        # 状態はどちらも tool_manager/scene 側の状態でありグリップと共存し得る
+        # （グリップ押下はシーンの選択に触れず、`set_tool("curve")` も選択・
+        # entered_group を変えない）。ここより後ろだと Esc が
+        # `_handle_curve_draft_key`/`_handle_group_entry_key` に先に取られ、
+        # curve 下書きのキャンセルやグループ全体選択への復帰だけが起きて
+        # グリップドラッグが生き残り、直後の release でアートボードが確定して
+        # しまう（ユーザーは「キャンセルした」つもりなのにモデルが変わる静かな
+        # 破綻）。
         if self._grip_drag_origin_px is not None and event.key() == Qt.Key.Key_Escape:
             self._cancel_grip_drag()
             event.accept()
             return
         if self._handle_curve_draft_key(event):
+            return
+        if self._handle_group_entry_key(event):
             return
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             if not self._space_panning:
@@ -887,6 +902,106 @@ class CanvasView(QGraphicsView):
         node_item.commit_node_edit()
         event.accept()
         return True
+
+    # -- グループ内個別編集: 入っている間の Esc（グループ内個別編集契約 §F-3） --
+
+    def _entered_group_id(self) -> int | None:
+        """「入っている」グループの id を返す（入っていなければ None）。"""
+        scene = self.scene()
+        getter = getattr(scene, "entered_group_id", None)
+        return getter() if callable(getter) else None
+
+    def _handle_group_entry_key(self, event: QKeyEvent) -> bool:
+        """入っている間の Esc = グループ全体の選択に戻る（処理したら True）。
+
+        テキスト編集・crop・マスク・ノード編集の Esc（各 `_handle_*_key`）に加え、
+        グリップドラッグの Esc キャンセルと curve 下書きの Esc（findings #1/#8）も
+        先に処理されるよう、`keyPressEvent` でそれらすべてより後に置く。グリップ
+        ドラッグと curve 下書きは（4 つの編集モードと違い）「グループに入って
+        いる」状態と共存し得るため、先を譲らないと Esc が本ハンドラに食われ、
+        グリップドラッグ/curve 下書きが生き残ったまま（ユーザーは「キャンセル
+        した」つもりなのに）確定してしまう。
+
+        マウスジェスチャー中（メンバーのドラッグ・ハンドルドラッグ）は選択を
+        変えない（round2 finding #2）: `select_exactly` が単一選択から複数選択へ
+        広げると、(a) メンバー移動では Qt が `movingItemsInitialPositions` を
+        兄弟選択より前にスナップショット済みで、次の move で兄弟が (0,0)+delta
+        へ飛び、その値がそのままモデルへコミットされる、(b) box ハンドルは
+        マウスグラバーである `_HandleSet` 自体が選択変化で破棄され `end_drag` が
+        二度と走らず `_resizing`/`_old_geom` が固着する（`base_item.py` の
+        `_maybe_snap_position` は `_resizing` 中スナップを止めるので、以後の
+        スナップも道連れで壊れる）、(c) 線メンバーの端点ハンドルは `_live_p2` が
+        固着する——という 3 つの「画面とモデルが食い違ったまま止まる」事故を
+        起こす。そこで、マウスボタンが押されている間（ドラッグ中）はこのキーを
+        丸ごと無効化し、ボタンを離してからもう一度 Esc を押せばグループ全体へ
+        戻れるようにする。ラバーバンド選択はグラバー item を持たないため
+        `mouseGrabberItem()` だけでは足りず、ハンドルドラッグは
+        `tool_manager.is_interacting()` の対象外（その docstring どおり）なので
+        `QApplication.mouseButtons()` も見る（`app/agent/host.py` のビジーゲートと
+        同じ判定）。
+        """
+        if event.key() != Qt.Key.Key_Escape:
+            return False
+        group_id = self._entered_group_id()
+        if group_id is None:
+            return False
+        scene = self.scene()
+        if (
+            scene.mouseGrabberItem() is not None
+            or QApplication.mouseButtons() != Qt.MouseButton.NoButton
+        ):
+            event.accept()
+            return True
+        select_exactly = getattr(scene, "select_exactly", None)
+        if not callable(select_exactly):
+            return False
+        # not locked だけでなく visible も要る（review finding #7）: 非表示メンバーを
+        # 選択しようとしても Qt は選択できず黙って無視されるため、Document 側の
+        # 共有判定 `selectable_group_members` に揃えておく（F/D2 の他の判定箇所と同じ）。
+        members = scene.document.selectable_group_members(group_id)
+        select_exactly(members)
+        event.accept()
+        return True
+
+    def _draw_entered_group_frame(self, painter: QPainter, theme: Theme) -> None:
+        """入っているグループのメンバー全体の外接矩形を破線で描く（グループ内個別編集契約 §F-3）。
+
+        `drawForeground` からのみ呼ぶ（書き出し `scene.render()` には写らない、
+        紙のリサイズグリップと同じ理由。§9.8）。
+
+        非表示メンバー（要望10 追加決定 Option A）は枠へ寄与しない——不可視な
+        ものを枠線で囲むと、画面に見えている範囲より枠が広がって見え、
+        「見えているものだけが枠の中」という前提が崩れる。ロックされたメンバー
+        は対象のまま（`not obj.locked` は掛けない）: ロックは編集不可の意味で
+        あって非表示ではなく、画面に描かれている以上は枠にも入るべき——
+        `Document.selectable_group_members`（not locked かつ visible）へ
+        揃えてしまうとロック中の可視メンバーまで枠から外れてしまうので、
+        あえてそちらは使わない（ここは「可視かどうか」だけを見る第三の基準）。
+        """
+        group_id = self._entered_group_id()
+        if group_id is None:
+            return
+        scene = self.scene()
+        union_rect: QRectF | None = None
+        for obj in scene.document.objects:
+            if getattr(obj, "group_id", None) != group_id or not obj.visible:
+                continue
+            item = scene.item_for(obj)
+            if item is None:
+                continue
+            item_rect = item.sceneBoundingRect()
+            union_rect = item_rect if union_rect is None else union_rect.united(item_rect)
+        if union_rect is None:
+            return
+        painter.save()
+        pen = QPen(QColor(theme.accent))
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        pen.setWidthF(1.5)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(union_rect)
+        painter.restore()
 
     # -- curve ツールの下書き（Enter=確定 / Esc=キャンセル） ---------------------
 
@@ -1094,6 +1209,19 @@ class CanvasView(QGraphicsView):
         # カーソルが SizeFDiag に化けないようにするため。
         if event.buttons() == Qt.MouseButton.NoButton:
             self._update_grip_cursor(event.position().toPoint())
+
+        # グループ枠（§F-3、round2 finding #3）: ライブドラッグ/リサイズ/回転は
+        # モデルに触れないため、#5 が model-change 経路に足した repaint は
+        # 1 回も走らない。`drawForeground` は Qt が dirty と判断した item 領域
+        # でしか呼ばれないので、枠のうち動いていない側の辺が古いまま残るか、
+        # 動いた側の新しい辺が断片的にしか描かれない。スナップ ON では
+        # `set_snap_guides` → `scene.update()`（`canvas_scene.py`）が副作用で
+        # フル再描画するため隠れているだけで、スナップ OFF や回転ハンドルの
+        # ドラッグ（`set_snap_guides` を呼ばない）では実際に崩れる。`update()` は
+        # 非同期なので、この時点でまだ item がドラッグ先へ動いていなくても
+        # 問題ない（次の描画サイクルまでに反映される）。
+        if self._entered_group_id() is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.viewport().update()
 
         if self.tool_manager is not None:
             scene_pos = self.mapToScene(event.pos())

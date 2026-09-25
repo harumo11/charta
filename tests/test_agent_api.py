@@ -18,7 +18,7 @@ from PIL import Image
 
 from app.agent.api import AgentAPI
 from app.agent.validate import AgentError
-from app.model.objects import RectObject
+from app.model.objects import DEFAULT_SHAPE_FILL, RectObject
 from app.ui.main_window import MainWindow
 
 
@@ -52,6 +52,18 @@ def _make_rects(api: AgentAPI, count: int = 3) -> list[int]:
 # --------------------------------------------------------------------------
 # 観測
 # --------------------------------------------------------------------------
+
+
+def test_critique_docstring_lists_every_diagnostic_code() -> None:
+    """レビュー所見#4: `AgentAPI.critique` の docstring も `clipped`/`invisible`
+    が抜けたままだった。読んだエージェントが検査名の一覧を信じて渡す先なので、
+    診断コードが増えたらここも増えること。
+    """
+    from app.graphics import diagnostics
+
+    doc = AgentAPI.critique.__doc__ or ""
+    for code in diagnostics.CHECK_NAMES:
+        assert code in doc, f"AgentAPI.critique の docstring に {code!r} が無い"
 
 
 def test_describe_state_exposes_everything_the_agent_needs(api: AgentAPI) -> None:
@@ -175,7 +187,8 @@ def test_apply_style_is_one_undo_entry(api: AgentAPI, window: Any) -> None:
     document = window.scene.document
     assert all(document.object_by_id(i).fill == "#112233" for i in ids)
     window.undo_stack.undo()
-    assert all(document.object_by_id(i).fill is None for i in ids)
+    # 新規 rect の既定 fill は None ではなく DEFAULT_SHAPE_FILL（2026-09-25 ユーザー決定）。
+    assert all(document.object_by_id(i).fill == DEFAULT_SHAPE_FILL for i in ids)
 
 
 def test_apply_style_reports_skipped_keys_on_mixed_types(api: AgentAPI, window: Any) -> None:
@@ -321,7 +334,8 @@ def test_an_invalid_value_applies_nothing(api: AgentAPI, window: Any) -> None:
     with pytest.raises(AgentError) as excinfo:
         api.apply_style(ids=ids, style={"fill": "not a colour"})
     assert excinfo.value.code == "validation_failed"
-    assert all(window.scene.document.object_by_id(i).fill is None for i in ids)
+    # 新規 rect の既定 fill は DEFAULT_SHAPE_FILL（2026-09-25 ユーザー決定）。適用ゼロ件を確認する。
+    assert all(window.scene.document.object_by_id(i).fill == DEFAULT_SHAPE_FILL for i in ids)
 
 
 def test_a_style_applicable_to_nothing_is_an_error(api: AgentAPI) -> None:
@@ -344,7 +358,9 @@ def test_locked_objects_need_force_and_nothing_is_partially_applied(
     with pytest.raises(AgentError) as excinfo:
         api.apply_style(ids=ids, style={"fill": "#010203"})
     assert excinfo.value.to_dict()["errors"][0]["code"] == "locked"
-    assert window.scene.document.object_by_id(ids[0]).fill is None
+    # 新規 rect の既定 fill は DEFAULT_SHAPE_FILL（2026-09-25 ユーザー決定）。
+    # 何も適用されていないことを確認する。
+    assert window.scene.document.object_by_id(ids[0]).fill == DEFAULT_SHAPE_FILL
 
     api.apply_style(ids=ids, style={"fill": "#010203"}, force=True)
     assert window.scene.document.object_by_id(ids[1]).fill == "#010203"
@@ -542,12 +558,156 @@ def test_critique_low_contrast_fix_actually_fixes_it(api: AgentAPI) -> None:
     assert api.critique(checks=["low_contrast"])["findings"] == []
 
 
+def test_critique_low_contrast_fix_converges_for_a_translucent_own_background(
+    api: AgentAPI,
+) -> None:
+    """2026-09-25 訂正（レビュー所見#1）: 半透明な自前背景を持つ text は、
+    色を変えるだけでは収束しない（合成後の色がまた背景側へ沈むため）。
+    修正案は不透明度も 1.0 に戻す必要がある。"""
+    created = api.create_objects(
+        [
+            {
+                "type": "text",
+                "x": 50,
+                "y": 50,
+                "text": "hi",
+                "color": "#ffffff",
+                "font_size": 60,
+                "background": "#001f3f",
+                "opacity": 0.5,
+            }
+        ]
+    )
+    oid = created["created"][0]["id"]
+    result = api.critique(checks=["low_contrast"], ids=[oid])
+    assert result["findings"][0]["code"] == "low_contrast"
+    corrected = result["findings"][0]["corrected_call"]
+    assert corrected["arguments"]["items"][0]["opacity"] == 1.0
+    api.update_objects(**corrected["arguments"])
+    assert api.critique(checks=["low_contrast"], ids=[oid])["findings"] == []
+
+
+def test_critique_low_contrast_fix_converges_without_an_own_background(api: AgentAPI) -> None:
+    """自前背景の無い半透明文字でも同じ非収束が起きる（既存のすり抜けだった
+    ケース。黒文字・不透明度 0.3・白いアートボードでは `readable_color` が
+    黒のままなので色を変えるだけでは沈んだまま。opacity を戻すことで直る）。"""
+    created = api.create_objects(
+        [
+            {
+                "type": "text",
+                "x": 50,
+                "y": 50,
+                "text": "hi",
+                "color": "#000000",
+                "font_size": 60,
+                "opacity": 0.3,
+            }
+        ]
+    )
+    oid = created["created"][0]["id"]
+    result = api.critique(checks=["low_contrast"], ids=[oid])
+    assert result["findings"][0]["code"] == "low_contrast"
+    corrected = result["findings"][0]["corrected_call"]
+    api.update_objects(**corrected["arguments"])
+    assert api.critique(checks=["low_contrast"], ids=[oid])["findings"] == []
+
+
 def test_critique_small_text_fix_reaches_the_threshold(api: AgentAPI) -> None:
     api.create_objects([{"type": "text", "x": 50, "y": 50, "text": "小", "font_size": 6}])
     result = api.critique(checks=["small_text"])
     assert result["findings"][0]["code"] == "small_text"
     api.update_objects(**result["findings"][0]["corrected_call"]["arguments"])
     assert api.critique(checks=["small_text"])["findings"] == []
+
+
+def test_critique_invisible_fix_actually_fixes_it(api: AgentAPI, window: Any) -> None:
+    """rect/ellipse を明示的に fill=None・stroke=None にすると `invisible` が出て、
+    修正案を送り返せば消える。
+
+    2026-09-25 訂正（レビュー所見#2/#3・契約 §担当C・項目3からの変更）: 修正案は
+    もう `fill` を `DEFAULT_SHAPE_FILL` に戻さない。塗りで直すと、画像の上に
+    意図して置いた `fill=null` の枠を塗りつぶして下の内容を隠したり、開曲線を
+    塗りの塊にしたりする実害があったため、線（`stroke`/`stroke_width`）を戻す
+    方式に変えた。
+    """
+    created = api.create_objects(
+        [{"type": "rect", "x": 50, "y": 50, "width": 100, "height": 60, "fill": None}]
+    )
+    oid = created["created"][0]["id"]
+    result = api.critique(checks=["invisible"], ids=[oid])
+    assert result["findings"][0]["code"] == "invisible"
+    corrected = result["findings"][0]["corrected_call"]
+    assert corrected["tool"] == "update_objects"
+    assert "fill" not in corrected["arguments"]["items"][0]
+    api.update_objects(**corrected["arguments"])
+    assert api.critique(checks=["invisible"], ids=[oid])["findings"] == []
+    obj = window.scene.document.object_by_id(oid)
+    assert obj.fill is None
+    assert obj.stroke == "#000000"
+
+
+def test_critique_invisible_fix_keeps_the_content_under_a_null_fill_frame(
+    api: AgentAPI, window: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """レビュー所見#3: `fill=null` の矩形は画像の上に置く強調枠の定番の使い方。
+
+    修正案が `fill` を提案すると、この枠が不透明な灰色の板になって下の画像を
+    覆い隠してしまう（塗りは絶対に提案しないことをピクセルで固定する）。
+    """
+    import numpy as np
+
+    from app.export import png_exporter
+
+    monkeypatch.setenv("CHARTA_AGENT_PATHS", str(tmp_path))
+    rng = np.random.default_rng(0)
+    noise = rng.integers(0, 255, size=(300, 600, 3), dtype=np.uint8)
+    image_path = tmp_path / "noise.png"
+    Image.fromarray(noise, mode="RGB").save(image_path)
+    # place_image の x/y は画像の**中心**（CLAUDE.md 参照）。
+    api.place_image(str(image_path), x=400, y=300, width=600)
+    rect_id = api.create_objects(
+        [{"type": "rect", "x": 250, "y": 200, "width": 200, "height": 120, "fill": None}]
+    )["created"][0]["id"]
+
+    def _inside_std() -> float:
+        document = window.scene.document
+        # `render_artboard_image` はアートボード px ではなく書き出し px
+        # （`physical.width_mm`/`target_dpi` 由来）で返る。既定アートボードは
+        # この 2 つが一致しない（CLAUDE.md §9.8）ので、サンプル点は
+        # `artboard_export_scale` で書き出し px に変換してから読む（さもないと
+        # 枠のすぐ内側のつもりが実際には縁の帯を読んでしまう）。
+        scale = png_exporter.artboard_export_scale(document)
+        image = png_exporter.render_artboard_image(document)
+        samples = [
+            image.pixelColor(round((250 + dx) * scale), round((200 + dy) * scale)).getRgb()[:3]
+            for dx in range(20, 180, 20)
+            for dy in range(20, 100, 20)
+        ]
+        return float(np.array(samples, dtype=np.float64).std())
+
+    before = _inside_std()
+    assert before > 5.0, "ノイズ画像なので枠の内側にばらつきがあるはず"
+
+    result = api.critique(checks=["invisible"], ids=[rect_id])
+    corrected = result["findings"][0]["corrected_call"]
+    assert "fill" not in corrected["arguments"]["items"][0]
+    api.update_objects(**corrected["arguments"])
+
+    obj = window.scene.document.object_by_id(rect_id)
+    assert obj.fill is None, "corrected_call は fill を書き換えてはいけない"
+    assert _inside_std() == pytest.approx(before), "画像の中身は隠されていないはず"
+    assert api.critique(checks=["invisible"], ids=[rect_id])["findings"] == []
+
+
+def test_critique_does_not_warn_about_default_new_rects(api: AgentAPI) -> None:
+    """新規 rect/ellipse の既定(`DEFAULT_SHAPE_FILL` 塗り・線なし)は `invisible` にならない。"""
+    api.create_objects(
+        [
+            {"type": "rect", "x": 10, "y": 10, "width": 80, "height": 40},
+            {"type": "ellipse", "x": 200, "y": 10, "width": 80, "height": 40},
+        ]
+    )
+    assert api.critique(checks=["invisible"])["findings"] == []
 
 
 def test_a_clipped_object_is_reported_and_the_fix_moves_it_inside(
@@ -914,7 +1074,8 @@ def test_update_objects_applies_and_is_one_undo_entry(api: AgentAPI, window: Any
         obj = window.scene.document.object_by_id(oid)
         assert obj.fill == "#00ff00" and obj.stroke_width == 4.0
     window.undo_stack.undo()
-    assert window.scene.document.object_by_id(ids[0]).fill is None
+    # 新規 rect の既定 fill は DEFAULT_SHAPE_FILL（2026-09-25 ユーザー決定）。
+    assert window.scene.document.object_by_id(ids[0]).fill == DEFAULT_SHAPE_FILL
 
 
 def test_update_objects_rejects_invalid_values_without_partial_application(
@@ -928,7 +1089,9 @@ def test_update_objects_rejects_invalid_values_without_partial_application(
                 {"id": ids[1], "set": {"dash": "wobbly"}},
             ]
         )
-    assert window.scene.document.object_by_id(ids[0]).fill is None
+    # 新規 rect の既定 fill は DEFAULT_SHAPE_FILL（2026-09-25 ユーザー決定）。
+    # 何も適用されていないことを確認する。
+    assert window.scene.document.object_by_id(ids[0]).fill == DEFAULT_SHAPE_FILL
 
 
 def test_update_objects_respects_lock_unless_forced(api: AgentAPI, window: Any) -> None:

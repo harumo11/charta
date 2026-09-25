@@ -88,12 +88,22 @@ class BaseObject:
 # --------------------------------------------------------------------------
 
 
+#: 矩形・楕円の既定の塗り（2026-09-25 ユーザー決定: 既定は「線なし＋薄いグレー塗り」）。
+#: 線なし（stroke=None）と塗りなし（fill=None）を両立させると新規図形が完全に
+#: 不可視になるため、塗りを既定で持たせる。人間のツールとエージェントの
+#: create_objects が同じ既定を使うよう、dataclass 側に置く（§9.3 の routing と
+#: 同じ理由で tool_manager だけを変えない）。curve は開いた線として描くことが
+#: 多く、線なし＋塗りにすると開曲線が塗りの塊になるため対象外（従来どおり黒線）。
+DEFAULT_SHAPE_FILL = "#D9D9D9"
+
+
 @dataclass(kw_only=True)
 class RectObject(BaseObject):
     type: str = "rect"
-    fill: str | None = None
+    fill: str | None = DEFAULT_SHAPE_FILL
     # None = 線なし（fill=None の「塗りなし」と対称。P2 契約 §担当C・項目12）。
-    stroke: str | None = "#000000"
+    # 既定は線なし（2026-09-25 ユーザー決定）。
+    stroke: str | None = None
     stroke_width: float = 2.0
     dash: str = "solid"
     corner_radius: float = 0.0
@@ -104,9 +114,10 @@ class RectObject(BaseObject):
 @dataclass(kw_only=True)
 class EllipseObject(BaseObject):
     type: str = "ellipse"
-    fill: str | None = None
+    fill: str | None = DEFAULT_SHAPE_FILL
     # None = 線なし（fill=None の「塗りなし」と対称。P2 契約 §担当C・項目12）。
-    stroke: str | None = "#000000"
+    # 既定は線なし（矩形と同じ。2026-09-25 ユーザー決定）。
+    stroke: str | None = None
     stroke_width: float = 2.0
     dash: str = "solid"
 
@@ -186,10 +197,28 @@ class TextObject(BaseObject):
     italic: bool = False
     underline: bool = False
     color: str = "#000000"
+    # 背景色（None = 背景なし）。箱全体（0,0,width,height）を塗る（2026-09-25 追加）。
+    # 名前を `fill` にしないのは、styles.py の「text/math と図形の見た目キーを暗黙に
+    # 読み替えない」方針と、複数選択パネルがキー名で共通行を作る（rect の「塗り」と
+    # 1 行に統合されてしまう）ため。
+    background: str | None = None
     align: str = "left"
-    valign: str = "top"
+    # 既定は "middle"（2026-09-25 ユーザー決定。それまでは "top"）。
+    valign: str = "middle"
 
     TYPE: ClassVar[str] = "text"
+
+    @classmethod
+    def _from_dict_own(cls, d: dict[str, Any]) -> BaseObject:
+        """`valign` キーを持たない旧ファイル（2026-08-07 の valign 導入前）は "top" で読む。
+
+        既定を "middle" に変えたため、キーが無いファイルを dataclass 既定で埋めると
+        保存当時（常に上揃え）と見た目が変わる。`to_dict` は全フィールドを書き出す
+        ので、valign 導入後に保存されたファイル・貼り付け・複製には影響しない。
+        """
+        if "valign" not in d:
+            d = {**d, "valign": "top"}
+        return super()._from_dict_own(d)
 
 
 @dataclass(kw_only=True)

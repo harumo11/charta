@@ -80,6 +80,19 @@ def test_every_rpc_method_has_a_spec() -> None:
     assert available_methods() - {"ping"} == set(agent_methods.METHOD_SPECS)
 
 
+def test_critique_spec_lists_every_diagnostic_code() -> None:
+    """レビュー所見#4: `invisible` 追加後、`describe_schema(method="critique")`
+    が返す説明文（summary + notes）の列挙が古いままだと、エージェントは新しい
+    診断コードの存在も `checks` への渡し方も発見できない。
+    """
+    from app.graphics import diagnostics
+
+    spec = agent_methods.METHOD_SPECS["critique"]
+    text = spec.summary + " ".join(spec.notes)
+    for code in diagnostics.CHECK_NAMES:
+        assert code in text, f"critique の説明文に診断コード {code!r} が無い"
+
+
 def test_declared_params_match_signatures() -> None:
     """`deprecated_aliases` の旧引数名は、実際の `AgentAPI` シグネチャに実在すること。
 
@@ -243,7 +256,9 @@ def test_corrected_calls_bind_to_the_real_signature(api: AgentAPI) -> None:
     # 10) critique が返す修正案（診断コードごとに 1 種類）
     corrected_calls.extend(_critique_corrected_calls())
 
-    assert len(corrected_calls) == 21
+    # 2026-09-25: `invisible` 診断コードの追加で 1 件、レビュー所見#2 で curve 用の
+    # `invisible` サンプルをもう 1 件増やしたので、21 + 2 = 23 件。
+    assert len(corrected_calls) == 23
     for corrected in corrected_calls:
         _assert_corrected_call_is_valid(corrected)
 
@@ -275,7 +290,40 @@ def _critique_corrected_calls() -> list[dict[str, Any]]:
         text="x",
         text_natural_size=(200.0, 80.0),
     )
-    snapshot = diagnostics.DocumentSnapshot(artboard=artboard, objects=(obj,))
+    # 2026-09-25 追加（契約 §担当C・項目3）: `invisible` は rect/ellipse/curve が
+    # 塗りも線も持たない場合の診断。text 用の obj とは別の id を使う。
+    invisible_obj = diagnostics.ObjectSnapshot(
+        id=3,
+        type="rect",
+        name="r",
+        box=(0.0, 0.0, 100.0, 50.0),
+        rotation=0.0,
+        opacity=1.0,
+        visible=True,
+        z_index=1,
+        fill=None,
+        stroke=None,
+        stroke_width=0.0,
+    )
+    # 2026-09-25 追加（レビュー所見#2）: curve は `invisible` の修正案が rect と
+    # 違う分岐（fill を一切提案しない）を通るので、専用のサンプルで
+    # `test_corrected_calls_bind_to_the_real_signature` にも通す。
+    invisible_curve = diagnostics.ObjectSnapshot(
+        id=4,
+        type="curve",
+        name="c",
+        box=(0.0, 0.0, 100.0, 50.0),
+        rotation=0.0,
+        opacity=1.0,
+        visible=True,
+        z_index=2,
+        fill=None,
+        stroke=None,
+        stroke_width=0.0,
+    )
+    snapshot = diagnostics.DocumentSnapshot(
+        artboard=artboard, objects=(obj, invisible_obj, invisible_curve)
+    )
     samples = [
         {"code": "offscreen", "id": 1},
         # clipped は「収まる大きさか」で修正のしかたが変わるので両方見る。
@@ -286,12 +334,18 @@ def _critique_corrected_calls() -> list[dict[str, Any]]:
         {"code": "text_overflow", "id": 1},
         {"code": "low_contrast", "id": 1, "background": "#ffffff"},
         {"code": "small_text", "id": 1},
+        {"code": "invisible", "id": 3},
+        {"code": "invisible", "id": 4},
     ]
     assert {s["code"] for s in samples} == set(
         diagnostics.CHECK_NAMES
     ), "診断コードを増やしたら修正案もここも増やすこと"
     calls = [diagnose.suggest_fix(sample, snapshot) for sample in samples]
     assert all(call is not None for call in calls), "全コードに修正案があること"
+    # curve の invisible 修正案は fill を一切提案しない（開曲線が塗りの塊になるため。
+    # レビュー所見#2）。
+    curve_call = calls[samples.index({"code": "invisible", "id": 4})]
+    assert "fill" not in curve_call["arguments"]["items"][0]
     # アートボードより大きくて動かしても直らない clipped は、縮める案を返す。
     oversized = diagnose.suggest_fix(
         {"code": "clipped", "id": 1, "bbox": [-100.0, -100.0, 4000.0, 2000.0], "fits": False},

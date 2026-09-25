@@ -71,6 +71,25 @@ def test_set_tool_commits_active_text_edit(window: Any) -> None:
         window.tool_manager.set_tool("select")
 
 
+def test_set_tool_flushes_pending_preedit(window: Any) -> None:
+    """ツール切替による確定でも、変換中の文字列を破棄せず確定する(B-4・altkey.md §3)。
+
+    `commit_text_edit` は `_commit_active_text_edit`(担当C)からも呼ばれる同じ関数
+    なので、IME 変換中の文字列の消失防止はここでも効く。
+    """
+    from PySide6.QtGui import QInputMethodEvent
+
+    obj, item = _add_text(window)
+    assert item.begin_text_edit() is True
+    editor = item._editor
+    editor.inputMethodEvent(QInputMethodEvent("にほん", []))
+    try:
+        window.tool_manager.set_tool("rect")
+        assert obj.text == "helloにほん"
+    finally:
+        window.tool_manager.set_tool("select")
+
+
 # --------------------------------------------------------------------------
 # C-2: main_window.delete_selected のガード
 # --------------------------------------------------------------------------
@@ -104,12 +123,17 @@ def test_status_bar_shows_text_edit_hint(window: Any) -> None:
 
 
 def test_text_edit_mode_changed_signal_is_connected_when_available(window: Any) -> None:
-    """`CanvasScene.text_edit_mode_changed`(担当B)が存在すれば、実際にシグナル経由で
-    ステータスバーが更新されることを確認する。未着地の間はこのテストを skip する。
+    """`CanvasScene.text_edit_mode_changed` 経由で実際にシグナルが飛ぶと
+    ステータスバーが更新されることを確認する。
+
+    2026-09-25 レビュー3巡目 finding: この signal は着地済み
+    （`app/scene/canvas_scene.py` に `text_edit_mode_changed = Signal(bool)`
+    が常に存在する）ので、以前の `getattr(..., None)` による「未着地なら skip」
+    ガードは実行されることのない死んだ分岐になっていた（vacuous skip）。
+    signal が実在することを直接アサートし、無条件でシグナル経由の検証を行う。
     """
-    signal = getattr(window.scene, "text_edit_mode_changed", None)
-    if signal is None:
-        pytest.skip("担当B の CanvasScene.text_edit_mode_changed が未着地")
+    signal = window.scene.text_edit_mode_changed
+    assert signal is not None
     signal.emit(True)
     assert "テキスト編集" in window.statusBar().currentMessage()
     signal.emit(False)

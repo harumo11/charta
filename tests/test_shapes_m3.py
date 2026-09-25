@@ -496,7 +496,12 @@ def _ink_row_span(image: Any) -> tuple[int | None, int | None, int]:
 
 
 def _text_doc(height: float) -> Any:
-    """ディセンダ（`_` と `y`）を含むテキスト 1 個だけの Document。"""
+    """ディセンダ（`_` と `y`）を含むテキスト 1 個だけの Document。
+
+    `valign="top"` を明示する（2026-09-25・要望3の既定 middle 化に伴う契約 B-5:
+    本テストの主題は上下揃えではなく「低い箱でも文字が切れない」ことであり、
+    valign は無関係なので既存挙動どおり top に固定する）。
+    """
     from app.model.document import Artboard, Document, Physical
 
     doc = Document(
@@ -513,6 +518,7 @@ def _text_doc(height: float) -> Any:
             width=520,
             height=height,
             font_size=30,
+            valign="top",
         )
     )
     return doc
@@ -531,7 +537,9 @@ def test_text_descender_is_not_clipped_by_a_short_box(qapp: Any) -> None:
 
     font = font_for(TextObject(id=0, text="charta_mcp.py", font_size=30))
     natural_height = default_text_size("charta_mcp.py", font)[1]
-    short = 48.0
+    # 2026-09-25: 上端トリム（要望3）で自然高さが縮んだ（旧 TEXT_MARGIN 込みで
+    # 約59px→約47px）ため、48.0 は前提を満たさなくなった。30.0 に下げる。
+    short = 30.0
     assert short < natural_height, "前提: 箱は自然な行高より低い"
 
     short_img, _ = render_document(_text_doc(short), max_edge=600)
@@ -545,8 +553,10 @@ def test_png_export_matches_screen_for_a_short_text_box(qapp: Any, tmp_path: Pat
     """PNG 書き出しでも同じ（`export_png` は同じ `TextItem.paint` を通る）。"""
     from app.export.png_exporter import render_artboard_image
 
-    short = _ink_row_span(render_artboard_image(_text_doc(48.0)))
-    tall = _ink_row_span(render_artboard_image(_text_doc(86.0)))
+    # 2026-09-25: 上端トリム（要望3）で自然高さが縮んだため、48.0/86.0 の組を
+    # 30.0/70.0 に下げる（前者は自然高さ約47pxより低い箱、後者は十分高い箱）。
+    short = _ink_row_span(render_artboard_image(_text_doc(30.0)))
+    tall = _ink_row_span(render_artboard_image(_text_doc(70.0)))
     assert short == tall
 
 
@@ -575,18 +585,62 @@ def _ink_rows(arr: np.ndarray) -> tuple[int, int]:
     return int(rows.min()), int(rows.max())
 
 
-def test_text_valign_default_top_is_pixel_identical_to_before(qapp: Any) -> None:
-    """valign 未指定（既定 "top"）の描画は、valign="top" を明示した場合と厳密に一致する
-    （`valign_offset` は factor==0.0 のとき必ず 0.0 を返すため、既存挙動を変えない）。
+def test_text_valign_default_is_middle(qapp: Any) -> None:
+    """valign の既定は "middle"（2026-09-25 ユーザー決定・要望7。旧仕様は "top" だった）。
+
+    2026-09-25 に契約 B-5 に従い書き換え: 以前はここで「未指定は明示 top と厳密
+    一致する」ことを固定していたが、既定が middle になったことでこの一致自体が
+    無意味になった（新規オブジェクトは常に middle で作られ、top と一致するのは
+    valign="top" を明示したときだけ）。
     """
     obj_default = TextObject(id=1, text="charta", x=0, y=0, width=120, height=80, font_size=20)
+    assert obj_default.valign == "middle"
+
+    # 明示的に top を指定すれば、既存どおり top 用の描画になる（回帰確認）。
     obj_explicit_top = TextObject(
         id=2, text="charta", x=0, y=0, width=120, height=80, font_size=20, valign="top"
     )
-    assert obj_default.valign == "top"
     arr_default = _render_item(TextItem(obj_default))
     arr_top = _render_item(TextItem(obj_explicit_top))
-    assert np.array_equal(arr_default, arr_top)
+    assert not np.array_equal(arr_default, arr_top), "既定(middle)は明示 top と見た目が異なること"
+
+
+def test_new_text_box_sized_by_default_text_size_looks_same_for_top_and_middle(qapp: Any) -> None:
+    """新規作成直後（`default_text_size` で採寸した箱）は箱＝ブロックなので、
+    valign="middle"（新既定）でも valign="top" と見た目が一致する
+    （`valign_offset` は `rect.height() == block_height` のとき factor に関わらず
+    0 を返すため。§1 ユーザー決定「7」・契約 B-5 の非退行確認）。
+    """
+    font = QFont("Noto Sans CJK JP")
+    font.setPointSizeF(18.0)
+    text = "charta"
+    w, h = default_text_size(text, font)
+
+    obj_middle = TextObject(id=1, text=text, x=0, y=0, width=w, height=h, valign="middle")
+    obj_top = TextObject(id=2, text=text, x=0, y=0, width=w, height=h, valign="top")
+    arr_middle = _render_item(TextItem(obj_middle))
+    arr_top = _render_item(TextItem(obj_top))
+    assert np.array_equal(arr_middle, arr_top), "新規作成直後は箱=ブロックなので top/middle が一致"
+
+
+def test_text_valign_missing_key_in_saved_dict_reads_as_top(qapp: Any) -> None:
+    """`valign` キーを持たない旧ファイル（2026-08-07 の valign 導入前）は "top" で読む。
+
+    既定を middle に変えたため、キー欠落を dataclass 既定で埋めると保存当時
+    （常に上揃え）と見た目が変わってしまう。`TextObject._from_dict_own` が
+    キー欠落を検出して "top" を補う（P0 実装済み・契約 §1「7 縦位置」）。
+    """
+    obj = TextObject(id=1, text="charta", x=0, y=0, width=120, height=80, font_size=20)
+    d = obj.to_dict()
+    assert "valign" in d, "前提: to_dict は全フィールドを書き出す"
+    del d["valign"]  # valign 導入前(2026-08-07 より前)の project.json を模す
+
+    restored = TextObject.from_dict(d)
+    assert restored.valign == "top"
+
+    # 一方、valign 導入後に保存されたファイル(キーがある)はそのまま尊重される。
+    restored_with_key = TextObject.from_dict({**d, "valign": "middle"})
+    assert restored_with_key.valign == "middle"
 
 
 def test_text_valign_middle_shifts_ink_down(qapp: Any) -> None:
@@ -648,17 +702,29 @@ def test_text_bounding_rect_covers_ink_for_middle_valign(qapp: Any) -> None:
 
 
 def test_commit_text_with_middle_valign_keeps_box_center(window: Any, qapp: Any) -> None:
-    """valign="middle" の箱で編集して高さが縮んでも、箱の垂直中心は不変（1 undo で復元）。"""
+    """valign="middle" の箱で編集して高さが縮んでも、箱の垂直中心は不変（1 undo で復元）。
+
+    §0-7: 2026-09-25 review B-1 で `commit_text` の高さ規則が `refit_text_height`
+    （auto-height の箱は伸縮どちらも追従／ユーザーが広げた箱はあふれるときだけ
+    伸びて縮まない）に変わった。ここでの「編集で縮む」という前提を保つには、
+    箱の高さを最初からちょうど内容に合わせて作る（auto-height）必要がある
+    （手で 120px に広げた箱を想定するテストは
+    `tests/test_text_padding_background.py` に別途ある）。
+    """
+    from app.scene.items.text_item import fitted_text_height, font_for
+
     scene = window.scene
     stack = window.undo_stack
 
+    text = "長いテキストです\nさらに長い"
+    font = font_for(TextObject(id=0, text=text, font_size=20))
     obj = TextObject(
         id=scene.document.new_id(),
-        text="長いテキストです\nさらに長い",
+        text=text,
         x=50,
         y=50,
         width=100,
-        height=120,
+        height=fitted_text_height(text, font, 100),
         valign="middle",
         font_size=20,
     )
@@ -685,17 +751,27 @@ def test_commit_text_with_middle_valign_keeps_box_center(window: Any, qapp: Any)
 
 
 def test_commit_text_with_top_valign_keeps_y_unchanged(window: Any, qapp: Any) -> None:
-    """valign="top"（既定）では、高さが変わっても y は不変（既存挙動の非破壊）。"""
+    """valign="top"（2026-09-25 に既定ではなくなった。ここでは明示指定）では、
+    高さが変わっても y は不変（既存挙動の非破壊）。
+
+    §0-7: `test_commit_text_with_middle_valign_keeps_box_center` と同じ理由で、
+    箱を auto-height（ちょうど内容に合う高さ）で作る（review B-1）。
+    """
+    from app.scene.items.text_item import fitted_text_height, font_for
+
     scene = window.scene
     stack = window.undo_stack
 
+    text = "長いテキストです\nさらに長い"
+    font = font_for(TextObject(id=0, text=text, font_size=20))
+    old_height = fitted_text_height(text, font, 100)
     obj = TextObject(
         id=scene.document.new_id(),
-        text="長いテキストです\nさらに長い",
+        text=text,
         x=50,
         y=50,
         width=100,
-        height=120,
+        height=old_height,
         valign="top",
         font_size=20,
     )
@@ -703,5 +779,5 @@ def test_commit_text_with_top_valign_keeps_y_unchanged(window: Any, qapp: Any) -
     item = scene.item_for(obj)
 
     item.commit_text("短")
-    assert obj.height != 120, "前提: 高さが変わったこと"
+    assert obj.height != pytest.approx(old_height), "前提: 高さが変わったこと"
     assert obj.y == pytest.approx(50.0)

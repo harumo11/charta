@@ -401,16 +401,59 @@ def _build_text_font(obj: BaseObject) -> QFont:
     return font
 
 
-def _render_text(obj: BaseObject, outline_text: bool) -> str:
+def _render_text_background(obj: BaseObject, element_opacity: float | None = None) -> str:
+    """text の背景色（要望4）: 箱全体 `(0,0,w,h)` を塗る `<rect>`。無ければ空文字列。
+
+    背景が無いときは `_wrap_box` の `<g>`（回転・不透明度を持つ）の内側先頭に
+    置くだけで、`<g>` の不透明度をそのまま継承させれば正しい（塗る要素がこの
+    1 個しか無いため、グループ合成も要素合成も同じ結果になる）。**背景がある
+    ときは `element_opacity` が非 None で渡され、`<g>` 側は opacity=1.0 になる**
+    （`_render_text_entry` 参照）。要素自身に `opacity` 属性を出すのはその場合
+    だけで、理由は `_render_text` の docstring を参照。outline / `<text>` の
+    両分岐・空テキストでも共通に出す（`TextItem.paint` が編集モードの早期
+    return・アウトライン分岐より前で箱全体を塗るのと対称。B-2）。
+    """
+    background = getattr(obj, "background", None)
+    if not background:
+        return ""
+    attrs = f'x="0" y="0" width="{_fmt(obj.width)}" height="{_fmt(obj.height)}"'
+    attrs += f" fill={quoteattr(background)}"
+    if element_opacity is not None:
+        attrs += f' opacity="{_fmt(element_opacity)}"'
+    return f"<rect {attrs}/>"
+
+
+def _render_text(obj: BaseObject, outline_text: bool, element_opacity: float | None = None) -> str:
+    """text 本体（背景＋グリフ）を SVG 要素にする。
+
+    `element_opacity`（round-1 #8 / X #2）: 背景ありで `opacity < 1` のとき
+    `_render_text_entry` から渡される。Qt は `QGraphicsItem` の opacity を
+    **プリミティブごと**に適用する（`TextItem.paint` は背景 fillRect →
+    グリフの順に別々に描く）ため、画面・PNG・PDF では「不透明な背景の上に
+    半透明のグリフを重ねる」結果になり、グリフ色は背景色と混ざって淡くなる。
+    一方 SVG の `<g opacity=...>` はグループを一度だけ合成するため、そのまま
+    背景 `<rect>` とグリフを 1 つの `<g>` に入れると「グリフ本来の色のまま
+    半透明の板を重ねる」結果になり、グリフがくっきり出すぎて他の出力と
+    色が食い違う（round-1 #8 で報告・round-2 で修正）。これを避けるため、
+    背景があるときは `<g>` 側の opacity を 1.0 にし、背景 `<rect>` と
+    グリフ（`<path>`/`<text>`）のそれぞれに `opacity` 属性を個別に出す
+    （Qt の per-primitive 合成を再現する）。Qt 側を「グループ合成」に
+    寄せる案（`QGraphicsOpacityEffect`）は PDF 出力がラスタライズされて
+    しまうため採らない。
+    """
     font = _build_text_font(obj)
     rect = QRectF(0.0, 0.0, obj.width, obj.height)
+    background = _render_text_background(obj, element_opacity)
 
     if outline_text:
         path = text_to_path(obj.text, font, rect, obj.align, bool(obj.underline), obj.valign)
         d = qpainterpath_to_svg_path_d(path)
         if not d:
-            return _xml_comment("text: empty, skipped")
-        return f'<path d="{d}" fill={quoteattr(obj.color)}/>'
+            return background + _xml_comment("text: empty, skipped")
+        path_attrs = f'd="{d}" fill={quoteattr(obj.color)}'
+        if element_opacity is not None:
+            path_attrs += f' opacity="{_fmt(element_opacity)}"'
+        return background + f"<path {path_attrs}/>"
 
     # 非アウトライン: <text> はフォント依存（環境に同名フォントが無いと再現不可）。
     # outline_text=True と同じ QFont から QFontMetricsF で px 実寸を導出することで、
@@ -436,6 +479,7 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
     weight = ' font-weight="bold"' if obj.bold else ""
     style = ' font-style="italic"' if obj.italic else ""
     decoration = ' text-decoration="underline"' if obj.underline else ""
+    opacity_attr = f' opacity="{_fmt(element_opacity)}"' if element_opacity is not None else ""
     # 行末スペースは rstrip する: naturalTextWidth（= text-anchor の middle/end が
     # 基準にすべき幅）は行末スペースを含まないため、preserve のまま残すと
     # center/right 揃えがスペース分ずれる。行頭・行中の空白は xml:space="preserve"
@@ -449,12 +493,12 @@ def _render_text(obj: BaseObject, outline_text: bool) -> str:
         f'<text xml:space="preserve" font-family={quoteattr(obj.font_family)}'
         f' font-size="{_fmt(font_size_px)}"'
         f" fill={quoteattr(obj.color)}"
-        f' text-anchor="{anchor}"{weight}{style}{decoration}>{tspans}</text>'
+        f' text-anchor="{anchor}"{weight}{style}{decoration}{opacity_attr}>{tspans}</text>'
     )
     warning = _xml_comment(
         "text rendered as <text> (outline_text=False): requires matching font on viewer"
     )
-    return warning + text_el
+    return background + warning + text_el
 
 
 def _render_image(document: Document, obj: BaseObject) -> str:
@@ -574,6 +618,14 @@ def _render_freehand_entry(document: Document, obj: BaseObject, outline_text: bo
 
 @register_svg_renderer("text")
 def _render_text_entry(document: Document, obj: BaseObject, outline_text: bool) -> str:
+    # round-1 #8 / round-2 #1・#6・#9: 背景あり＋opacity<1 のときだけ、グループの
+    # opacity を 1.0 にして背景/グリフそれぞれへ個別に opacity を出す
+    # （per-primitive 合成。理由は `_render_text` の docstring 参照）。背景が
+    # 無ければ塗る要素が 1 個（グリフ）だけなのでグループ opacity と要素 opacity は
+    # 同じ結果になり、既存の SVG バイト列は変わらない。
+    if getattr(obj, "background", None) and obj.opacity != 1.0:
+        inner = _render_text(obj, outline_text, element_opacity=obj.opacity)
+        return _group_open(obj.x, obj.y, obj.width, obj.height, obj.rotation, 1.0) + inner + "</g>"
     return _wrap_box(_render_text(obj, outline_text), obj)
 
 

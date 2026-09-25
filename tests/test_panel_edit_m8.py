@@ -23,14 +23,11 @@ from typing import Any
 import pytest
 import shiboken6
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QLineEdit,
-    QPushButton,
     QWidget,
 )
 
@@ -48,6 +45,7 @@ from app.model.objects import (
     new_object,
 )
 from app.ui.main_window import MainWindow
+from app.ui.widgets import ColorSwatchButton, SimpleColorDialog
 
 # --------------------------------------------------------------------------
 # フィクスチャ・ヘルパ
@@ -165,9 +163,10 @@ def test_rect_geometry_number_edit_width(env: dict[str, Any]) -> None:
 def test_rect_fill_color_menu_sets_color_and_none(
     env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """P2契約(担当C): 「透明」QCheckBox + QPushButton の2部品を廃止し、単一の
-    色ボタン（color_opt なら QMenu 付き）に統合した。ヘッドレスからは
-    `button.menu().actions()[i].trigger()` で駆動する（`exec()` は呼ばない）。
+    """2026-09-25（要望8/11/12）: 色ウィジェットは `ColorSwatchButton` に統一した。
+    メニューはパレット8色＋「なし」＋「色を選択…」を持つ（`_pick_action`/
+    `_none_action` を固定位置で unpack せず、テキストで引く。ヘッドレスからは
+    `button.menu().actions()` から目的のアクションを探して `trigger()` する）。
     """
     scene, stack, panel = env["scene"], env["stack"], env["panel"]
     rect = _add(
@@ -176,42 +175,55 @@ def test_rect_fill_color_menu_sets_color_and_none(
     _select_only(env, rect)
 
     button = _field_widget(panel, "rect", "fill")
-    assert isinstance(button, QPushButton)
+    assert isinstance(button, ColorSwatchButton)
     menu = button.menu()
     assert menu is not None
-    pick_action, none_action = menu.actions()
+    none_action = next(a for a in menu.actions() if a.text() == "なし")
 
     # 「なし」アクション: fill が None になる。
     none_action.trigger()
     assert shiboken6.isValid(button)
     assert rect.fill is None
 
-    # 「色を選択…」アクション: QColorDialog をモックして色選択経路を検証する。
-    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(lambda *a, **k: QColor("#123456")))
+    # `_choose` の都度メニューを作り直す（値・パレット変更時）ため、直前に
+    # 取得したアクション（`none_action`）は既に破棄されている。「色を選択…」
+    # アクションは作り直された後のメニューから引き直す。
+    monkeypatch.setattr(SimpleColorDialog, "get_color", staticmethod(lambda *a, **k: "#123456"))
+    pick_action = next(a for a in button.menu().actions() if a.text() == "色を選択…")
     pick_action.trigger()
     assert shiboken6.isValid(button)
     assert rect.fill == "#123456"
 
-    # SetPropertyCommand は同一 (obj, key) の連続編集を mergeWith で1エントリに
-    # 統合する（§commands.py）ため、ここまでの2回の "fill" 編集は undo 1回で
-    # まとめて元の値まで戻る。
+    # 2026-09-25 レビュー3巡目 finding #9 で期待値を変更: 色スウォッチの
+    # メニュー選択/ダイアログ確定はクリック1回=undo1回の離散コミットであり
+    # `_commit_scalar(..., mergeable=False)` を通すようになった
+    # （`app/commands/commands.py::SetPropertyCommand` に `mergeable` フラグを
+    # 追加）。以前は既定の mergeable=True のまま `SetPropertyCommand` が
+    # 隣接する同一 (obj, key) 編集を無条件に mergeWith していたため、
+    # 「なし」→「#123456」の2回の選択が1エントリへ潰れ、Ctrl+Z が中間の
+    # 「なし」を飛ばして元の #FF0000 に戻っていた（1回の undo で赤を飛ばす
+    # のは「1回の選択操作=1回の undo」という要件に反する）。今は2エントリに
+    # 分かれ、1回目の undo は直前の選択（なし）まで戻る。
     stack.undo()
     assert shiboken6.isValid(button)
-    assert rect.fill == "#FF0000"
+    assert rect.fill is None, "1回目の undo は直前の選択(なし)まで戻るはず(赤を飛ばさない)"
+
+    stack.undo()
+    assert rect.fill == "#FF0000", "2回目の undo で元の色まで戻る"
 
     stack.redo()
-    assert shiboken6.isValid(button)
+    assert rect.fill is None
+    stack.redo()
     assert rect.fill == "#123456"
 
 
-def test_rect_fill_button_requests_non_native_color_dialog(
+def test_rect_fill_pick_action_opens_the_simple_color_dialog(
     env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """所見(S1): ネイティブ色ダイアログの環境では `QColorDialog.setCustomColor` で
-    載せたパレットスウォッチが表示されないため、常に Qt 製ダイアログを強制する。
-    `customColor()` を読み戻すだけの検証ではこの回帰を検知できない
-    （`setCustomColor` 自体は成功するため）ので、実際の呼び出しに
-    `DontUseNativeDialog` が付いていることを直接確認する。
+    """2026-09-25: `QColorDialog` はアプリから消え、色ダイアログの唯一の経路は
+    `SimpleColorDialog.get_color`（要望12）。旧 `DontUseNativeDialog` の保証
+    （パレットがピッカーに見えること）は、この呼び出しに実際に
+    `panel._palette`（環境設定のパレット）が渡ることで確認する。
     """
     scene, panel = env["scene"], env["panel"]
     rect = _add(
@@ -220,19 +232,21 @@ def test_rect_fill_button_requests_non_native_color_dialog(
     _select_only(env, rect)
 
     button = _field_widget(panel, "rect", "fill")
-    assert isinstance(button, QPushButton)
+    assert isinstance(button, ColorSwatchButton)
 
     captured: dict[str, Any] = {}
 
-    def _fake_get_color(*args: Any, **kwargs: Any) -> QColor:
-        captured.update(kwargs)
-        return QColor()  # invalid → 変更しない
+    def _fake_get_color(initial: Any, palette: Any, parent: Any = None, title: str = "") -> None:
+        captured["initial"] = initial
+        captured["palette"] = palette
+        return None  # キャンセル相当 → 変更しない
 
-    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(_fake_get_color))
-    pick_action, _none_action = button.menu().actions()
+    monkeypatch.setattr(SimpleColorDialog, "get_color", staticmethod(_fake_get_color))
+    pick_action = next(a for a in button.menu().actions() if a.text() == "色を選択…")
     pick_action.trigger()
 
-    assert captured.get("options") == QColorDialog.ColorDialogOption.DontUseNativeDialog
+    assert captured["initial"] == "#FF0000"
+    assert captured["palette"] is panel._palette
 
 
 def test_rect_enum_edit_dash(env: dict[str, Any]) -> None:
@@ -252,6 +266,34 @@ def test_rect_enum_edit_dash(env: dict[str, Any]) -> None:
     assert shiboken6.isValid(combo)
     assert rect.dash == "solid"
     assert combo.currentText() == "solid"
+
+
+def test_text_valign_enum_two_picks_give_two_undo_entries(env: dict[str, Any]) -> None:
+    """2026-09-25 レビュー3巡目 finding #9: enum コンボの選択は
+    `SetPropertyCommand(mergeable=False)` の離散コミットになったこと
+    （以前は既定の mergeable=True のまま隣接編集を無条件に mergeWith して
+    いたため、"top"→"bottom" の2回の選択が1エントリへ潰れ、undo が中間の
+    "top" を飛ばして最初の既定値へ戻っていた）。
+    """
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    text = _add(
+        env, TextObject(id=scene.document.new_id(), text="hi", x=0, y=0, width=60, height=30)
+    )
+    _select_only(env, text)
+    assert text.valign == "middle"
+
+    combo = _field_widget(panel, "text", "valign")
+    assert isinstance(combo, QComboBox)
+
+    idx_before = stack.index()
+    combo.setCurrentText("top")
+    combo.setCurrentText("bottom")
+    assert stack.index() == idx_before + 2, "2回の選択は2個の別々の undo エントリのはず"
+
+    stack.undo()
+    assert text.valign == "top", "1回目の undo は直前の選択(top)まで戻るはず(既定値を飛ばさない)"
+    stack.undo()
+    assert text.valign == "middle"
 
 
 def test_rect_text_edit_name(env: dict[str, Any]) -> None:
@@ -595,6 +637,40 @@ def test_curve_object_bool_edit_closed(env: dict[str, Any]) -> None:
     assert shiboken6.isValid(checkbox)
     assert curve.closed is False
     assert checkbox.isChecked() is False
+
+
+def test_curve_object_bool_edit_closed_two_clicks_give_two_undo_entries(
+    env: dict[str, Any],
+) -> None:
+    """2026-09-25 レビュー3巡目 finding #9: チェックボックスのクリックも
+    `SetPropertyCommand(mergeable=False)` の離散コミット。以前は2回クリック
+    （True→False）が old=False/new=False の no-op 1エントリへ潰れ、
+    Ctrl+Z が見た目何も変えなかった。
+    """
+    scene, stack, panel = env["scene"], env["stack"], env["panel"]
+    curve = _add(
+        env,
+        CurveObject(
+            id=scene.document.new_id(),
+            x=0,
+            y=0,
+            width=10,
+            height=10,
+            points=[[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+        ),
+    )
+    _select_only(env, curve)
+    checkbox = _field_widget(panel, "curve", "closed")
+
+    idx_before = stack.index()
+    checkbox.setChecked(True)
+    checkbox.setChecked(False)
+    assert stack.index() == idx_before + 2, "2回のクリックは2個の別々の undo エントリのはず"
+
+    stack.undo()
+    assert curve.closed is True, "1回目の undo は直前の状態(True)まで戻り、可視の変化があるはず"
+    stack.undo()
+    assert curve.closed is False
 
 
 def test_curve_object_number_edit_tension(env: dict[str, Any]) -> None:

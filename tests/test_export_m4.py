@@ -367,6 +367,10 @@ def test_svg_non_outline_text_font_size_matches_metrics_px(
     doc = _build_document(project_dir, tmp_path)
     text_obj = next(obj for obj in doc.objects if obj.type == "text")
     text_obj.text = "Hello 図\nWorld"  # 複数行にして行送り(lineSpacing)も検証する
+    # 本テストの主題は font-size/行送りであり valign は無関係。既定が
+    # "middle"（2026-09-25・要望7）になったことで offset が非 0 になり
+    # y0 の期待値がずれるため、"top"（offset==0）に固定する（契約 B-5）。
+    text_obj.valign = "top"
 
     font = _build_text_font(text_obj)
     metrics = QFontMetricsF(font)
@@ -631,12 +635,14 @@ def _valign_svg_doc(
 
 
 def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
-    """折返し・改行混在で `text_block_height` == 実レイアウトの行数 × 実行送り。
+    """折返し・改行混在で `text_block_height` == 行数 × 実行送り − 上端トリム。
 
     実行送りは `QTextLine.height()`（切り上げ行高。画面の drawText/QTextDocument と
     同じ積み方）であって `lineSpacing()` 固定ではない（2026-08-15 のエンジン統一）。
+    2026-09-25（要望3・B-1）: 先頭行の字面上端に合わせてブロック全体を trim だけ
+    上に詰めるようになったため、`text_top_trim` を引いた分だけ短くなる。
     """
-    from app.export.text_outline import _layout_lines, text_block_height
+    from app.export.text_outline import _layout_lines, text_block_height, text_top_trim
     from app.scene.items.text_item import font_for
 
     obj = TextObject(id=0, font_size=24.0)
@@ -649,15 +655,20 @@ def test_text_block_height_matches_layout_line_count(qapp: Any) -> None:
     assert len(lines) >= 3, "前提: 折返しで複数行になっていること"
     line_h = lines[1][2] - lines[0][2]  # 連続する行スロットの実行送り
     assert line_h >= metrics.lineSpacing() - 1e-6, "実行送りは lineSpacing の切り上げ"
-    expected = len(lines) * line_h
+    trim = text_top_trim(text, font, wrap_width)
+    expected = len(lines) * line_h - trim
 
     assert text_block_height(text, font, wrap_width) == pytest.approx(expected)
-    assert total == pytest.approx(expected), "空行が無ければ総送り == 行数 × 実行送り"
+    assert total == pytest.approx(expected), "空行が無ければ総送り == 行数 × 実行送り − トリム"
 
 
 def test_text_block_height_counts_blank_lines(qapp: Any) -> None:
-    """空行はグリフを持たないが縦位置は占める。行数で数えると valign がずれる。"""
-    from app.export.text_outline import _layout_lines, text_block_height
+    """空行はグリフを持たないが縦位置は占める。行数で数えると valign がずれる。
+
+    2026-09-25（要望3・B-1）: 上端トリムの分だけ `3 * line_h` より短くなる
+    （trim は先頭行の字面だけで決まるので、後続の空行の有無とは独立）。
+    """
+    from app.export.text_outline import _layout_lines, text_block_height, text_top_trim
     from app.scene.items.text_item import font_for
 
     obj = TextObject(id=0, font_size=24.0)
@@ -673,7 +684,8 @@ def test_text_block_height_counts_blank_lines(qapp: Any) -> None:
     # 間に空行スロットが 1 つ挟まるため）。
     line_h = (lines[1][2] - lines[0][2]) / 2.0
     assert line_h >= metrics.lineSpacing() - 1e-6
-    assert text_block_height(text, font, wrap_width) == pytest.approx(3 * line_h)
+    trim = text_top_trim(text, font, wrap_width)
+    assert text_block_height(text, font, wrap_width) == pytest.approx(3 * line_h - trim)
 
 
 def test_valign_bottom_keeps_text_with_blank_lines_inside_the_box(qapp: Any) -> None:
@@ -696,10 +708,15 @@ def test_valign_bottom_keeps_text_with_blank_lines_inside_the_box(qapp: Any) -> 
 
 
 def test_svg_text_element_baseline_matches_valign_offset(qapp: Any) -> None:
-    """非アウトライン `<text>` の最初の `<tspan>` の y が ascent + valign_offset と一致する。"""
+    """非アウトライン `<text>` の最初の `<tspan>` の y が
+    ascent + valign_offset − 上端トリム と一致する。
+
+    2026-09-25（要望3・B-1）: 先頭行は trim だけ上へシフトする（`top` が
+    `0` ではなく `-trim` になる）ため、期待式にも `text_top_trim` を足す。
+    """
     from PySide6.QtCore import QRectF
 
-    from app.export.text_outline import valign_offset
+    from app.export.text_outline import text_top_trim, valign_offset
 
     doc = _valign_svg_doc("Hello valign", "middle", height=250.0)
     text_obj = doc.objects[0]
@@ -709,7 +726,8 @@ def test_svg_text_element_baseline_matches_valign_offset(qapp: Any) -> None:
     rect = QRectF(0.0, 0.0, text_obj.width, text_obj.height)
     offset = valign_offset(text_obj.text, font, rect, text_obj.valign)
     assert offset > 0.0, "前提: middle でオフセットが生じていること"
-    expected_y0 = metrics.ascent() + offset
+    trim = text_top_trim(text_obj.text, font, rect.width())
+    expected_y0 = metrics.ascent() + offset - trim
 
     svg = document_to_svg(doc, outline_text=False)
     root = ET.fromstring(svg)

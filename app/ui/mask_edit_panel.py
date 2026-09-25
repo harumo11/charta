@@ -4,15 +4,16 @@
 プロンプト・覆い色/不透明度・確定/キャンセル/解除の操作 UI。パネル自身は
 モデルにも scene にも触れず、ウィジェット変更をシグナルで通知するだけに留める
 （モデル変更はすべて `MaskEditSession`/`Sam3MaskController` 側の責務）。
+
+覆い色は 2026-09-25（要望8/11/12）に旧「透明」`QCheckBox` + 色ボタンの2部品
+構成を廃止し、`ColorSwatchButton(nullable=True)` 1個に統合した
+（`app/panels/property_panel.py` の色行と同じ部品・同じパレット）。
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QColorDialog,
     QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
@@ -22,9 +23,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.model.palettes import palette_by_id
+from app.prefs import Preferences
+from app.ui.widgets import ColorSwatchButton
+
 _ERROR_STYLE = "color:#B00020;"
 _DEFAULT_MASK_COLOR = "#FFFFFF"
 _TITLE_STYLE = "font-weight: bold;"
+_TRANSPARENT_LABEL = "透明（切り取り）"
 
 
 class MaskEditPanel(QWidget):
@@ -39,8 +45,9 @@ class MaskEditPanel(QWidget):
     cancel_clicked = Signal()
     remove_clicked = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, prefs: Preferences | None = None) -> None:
         super().__init__(parent)
+        self._prefs = prefs
 
         title = QLabel("SAM3 マスク編集")
         title.setStyleSheet(_TITLE_STYLE)
@@ -51,12 +58,10 @@ class MaskEditPanel(QWidget):
 
         self._status_label = QLabel("")
 
-        self._transparent_check = QCheckBox("透明（切り取り）")
-        self._transparent_check.toggled.connect(self._on_transparent_toggled)
-        self._color_button = QPushButton()
-        self._color_button.clicked.connect(self._pick_color)
-        self._selected_color = _DEFAULT_MASK_COLOR
-        self._apply_button_color(self._selected_color)
+        self._color_button = ColorSwatchButton(nullable=True, null_label=_TRANSPARENT_LABEL)
+        initial_palette = palette_by_id(prefs.palette_id) if prefs is not None else None
+        self._color_button.set_palette(initial_palette)
+        self._color_button.set_value(_DEFAULT_MASK_COLOR)
         self._opacity_spin = QDoubleSpinBox()
         self._opacity_spin.setRange(0.0, 1.0)
         self._opacity_spin.setSingleStep(0.05)
@@ -64,7 +69,6 @@ class MaskEditPanel(QWidget):
         self._opacity_spin.setValue(0.5)
 
         overlay_row = QHBoxLayout()
-        overlay_row.addWidget(self._transparent_check)
         overlay_row.addWidget(self._color_button)
         overlay_row.addWidget(QLabel("不透明度"))
         overlay_row.addWidget(self._opacity_spin)
@@ -104,10 +108,7 @@ class MaskEditPanel(QWidget):
     ) -> None:
         """初期値を設定して show() する。確定ボタンは無効から開始。"""
         self._text_edit.setText(prompt)
-        self._selected_color = color if color is not None else _DEFAULT_MASK_COLOR
-        self._transparent_check.setChecked(color is None)
-        self._color_button.setEnabled(color is not None)
-        self._apply_button_color(self._selected_color)
+        self._color_button.set_value(color)
         self._opacity_spin.setValue(float(opacity))
         self._remove_button.setVisible(can_remove)
         self.set_status("")
@@ -136,36 +137,22 @@ class MaskEditPanel(QWidget):
         return self._text_edit.text().strip()
 
     def overlay_color(self) -> str | None:
-        """現在の覆い色（透明チェック時は None）を返す。"""
-        return None if self._transparent_check.isChecked() else self._selected_color
+        """現在の覆い色（「透明（切り取り）」選択時は None）を返す。"""
+        return self._color_button.value()
 
     def overlay_opacity(self) -> float:
         """現在の不透明度（0.0-1.0）を返す。"""
         return float(self._opacity_spin.value())
 
     # ------------------------------------------------------------------
-    # 覆い色
+    # 覆い色（パレット、要望8/11/12）
     # ------------------------------------------------------------------
 
-    def _on_transparent_toggled(self, checked: bool) -> None:
-        self._color_button.setEnabled(not checked)
+    def refresh_palette(self) -> None:
+        """`self._prefs.palette_id` を読み直し、覆い色スウォッチへ配り直す。
 
-    def _pick_color(self) -> None:
-        # DontUseNativeDialog: GTK/portal 等のネイティブ色ダイアログを使う環境
-        # （実測: xcb + GNOME）では `QColorDialog.setCustomColor` で載せたパレット
-        # スウォッチが一切表示されない（Qt 側の配列自体が画面に出ないため）。
-        # これを避けるため常に Qt 製ダイアログを強制する（所見 S1）。
-        color = QColorDialog.getColor(
-            QColor(self._selected_color),
-            self,
-            "マスク覆い色",
-            options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
-        )
-        if not color.isValid():
-            return
-        self._selected_color = color.name()
-        self._apply_button_color(self._selected_color)
-
-    def _apply_button_color(self, color: str) -> None:
-        self._color_button.setText(color)
-        self._color_button.setStyleSheet(f"background-color: {color};")
+        環境設定ダイアログの確定後に `MainWindow` から呼ばれる
+        （`PropertyPanel.refresh_palette` と対称）。
+        """
+        palette = palette_by_id(self._prefs.palette_id) if self._prefs is not None else None
+        self._color_button.set_palette(palette)

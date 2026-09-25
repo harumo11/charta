@@ -12,6 +12,7 @@ import pytest
 from app.model.document import Artboard, Document, Physical
 from app.model.geometry import bounding_box, translate_geom
 from app.model.objects import (
+    DEFAULT_SHAPE_FILL,
     OBJECT_REGISTRY,
     BaseObject,
     ConnectorObject,
@@ -169,7 +170,8 @@ def test_from_dict_ignores_unknown_keys_and_uses_defaults() -> None:
     restored = BaseObject.from_dict(d)
     assert isinstance(restored, RectObject)
     assert restored.id == 1
-    assert restored.fill is None  # 既定値
+    # rect の既定 fill は DEFAULT_SHAPE_FILL（2026-09-25 ユーザー決定。線なし＋薄いグレー塗り）。
+    assert restored.fill == DEFAULT_SHAPE_FILL  # 既定値
 
 
 def test_new_object_helper() -> None:

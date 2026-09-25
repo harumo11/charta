@@ -24,6 +24,7 @@ from app.commands.commands import AddObjectCommand, SetGeometryCommand, SetPrope
 from app.graphics import curves
 from app.graphics.constraints import constrain_to_axis_or_diagonal
 from app.graphics.routing import Point
+from app.graphics.strokes import FILL_TYPES, is_stroked
 from app.model.objects import (
     BaseObject,
     ConnectorObject,
@@ -46,6 +47,8 @@ from app.scene.anchor_snap import (
     logical_box_for_item,
     scene_threshold,
 )
+from app.scene.hit import topmost_item_at
+from app.scene.snapping import ALIGN_SNAP_SCREEN_PX, Box, snap_move, union_box
 
 if TYPE_CHECKING:
     from app.scene.canvas_scene import CanvasScene
@@ -64,8 +67,34 @@ _TOOLS = (
 )
 _DRAW_TOOLS = ("rect", "ellipse", "line", "arrow")
 
-# 移動判定/最小生成サイズのしきい値(px)。浮動小数の厳密等値比較を避けるための距離マージン。
+# 最小生成サイズのしきい値(px)。浮動小数の厳密等値比較を避けるための距離マージン。
+# 描画ツール（rect/ellipse の `_draw_release` クリック判定・line/arrow・freehand・
+# connector の生成）の縮退判定**のみ**に使う「明確に動いた」しきい値である。
+# select ツールのクリック/ドラッグ判定は画面px換算の `_DRAG_START_SCREEN_PX`
+# （`scene_threshold` 経由）を使い、_select_release のコマンド確定ゲートには
+# 使わない（下記 _GEOM_NOOP_EPS 参照。task3 2026-09-25: 以前は「移動判定」
+# 「クリック/ドラッグの最終フォールバック判定」という select ツール寄りの
+# 書き方をしていたが、select 側は現在この定数を一切読まない）。
 _MOVE_EPS = 1.0
+# _select_release: box/line/connector が「確定すべき実変化を持つか」を見る許容誤差
+# （担当X: finding #5 残課題「b'」）。クリック/ドラッグの判定自体は上の
+# `_DRAG_START_SCREEN_PX` 閾値が既に一括で行っている(is_drag)ため、ここでは
+# 「浮動小数の丸め誤差だけの真の no-op」だけを弾けばよい。以前は `_MOVE_EPS`
+# (1.0 scene px)をここでも使っていたため、実ドラッグ後に吸着で正味変位が
+# 1px 未満に収まるケース(例: box が 100.4→100.0 に吸着)で、box だけコマンドが
+# 落とされて item.pos()(=100.0)と model(=100.4)が食い違ったまま残った
+# (line/connector には同じゲートがあるのに box とだけ独立に判定されるため、
+# 剛体移動の一部だけ確定し一部だけ据え置かれる不整合も起きていた)。
+_GEOM_NOOP_EPS = 1e-6
+# select ツール: クリックとドラッグを区別する開始しきい値（画面px、finding #5）。
+# `ALIGN_SNAP_SCREEN_PX` と同じ `scene_threshold()` 換算を共有する。これ未満の
+# 移動はまだ「クリック」として扱い、吸着もモデルへのライブ反映も行わない――以前は
+# 最初の move イベントから即座に union box で吸着していたため、ズーム倍率が高い
+# 状況での 1px 程度の手ぶれで box系メンバーだけが吸着後の delta ぶん先に動き、
+# line/connector の自由端は追従しない（複数選択/グループの相対配置が崩れる）
+# 回帰があった。`QApplication.startDragDistance()`（既定 約10px）は図形の微調整
+# には広すぎるため使わない。
+_DRAG_START_SCREEN_PX = 3.0
 # freehand: 前点からこの距離(px)以上離れたら新しい点として採用する。
 _FREEHAND_MIN_DIST = 2.0
 # math: 新規生成時の既定 latex とレンダリング失敗時のフォールバック最小サイズ(px)。
@@ -79,10 +108,14 @@ _MouseHandler = Callable[[Any, QPointF], bool]
 
 #: sticky defaults(P3契約 §4.2)で記憶する「スタイル」フィールド名。ジオメトリ・
 #: レイヤー状態(x/y/rotation/locked/visible 等)は対象外。
-#: `fill`/`stroke` が `None`（線・塗りなし、P2契約 項目12）の場合もそのまま記憶
-#: 対象になる——「線なし矩形を1つ作ると次も線なしになる」のは、`fill=None` の
-#: 既存の粘り方（塗りなしを作ると次も塗りなし）と同じ意図的な挙動であり、
-#: バグではない。
+#: `fill`/`stroke` のどちらか片方だけが `None`（線・塗りなし、P2契約 項目12）の場合は
+#: そのまま記憶対象になる——「線なし矩形を1つ作ると次も線なしになる」のは、`fill=None`
+#: の既存の粘り方（塗りなしを作ると次も塗りなし）と同じ意図的な挙動であり、バグではない。
+#: ただし `fill` と線（`app.graphics.strokes.is_stroked`）の**両方**が無い、完全に
+#: 不可視な組み合わせは `_remember_style` が記憶をスキップする（レビュー finding #3:
+#: 矩形の既定が線なし塗りありになったため、パネルで塗りを「なし」にする 1 操作だけで
+#: この組み合わせに到達しやすく、記憶されると以後ずっと同種オブジェクトが不可視のまま
+#: 作られ続けてしまうため）。
 _STYLE_KEYS: frozenset[str] = frozenset(
     {
         "fill",
@@ -100,6 +133,7 @@ _STYLE_KEYS: frozenset[str] = frozenset(
         "italic",
         "underline",
         "color",
+        "background",
         "align",
         "valign",
     }
@@ -160,6 +194,48 @@ class ToolManager(QObject):
         # select ツール: press 時に記録する選択群の旧幾何 {obj.id: geom_dict}
         self._select_start: dict[int, dict[str, Any]] = {}
         self._select_press_pos: QPointF | None = None
+        # select ツール: 「もう一度クリックでグループに入る」候補（グループ内個別編集
+        # 契約 §F-2）。press 時、掴んだ obj がまだ入っていないグループの一員で、
+        # かつそのグループの全メンバーが既に選択済み（=グループ全体が選択されている
+        # 状態）のときだけセットする。release で移動量が閾値未満（=ドラッグでなく
+        # クリック）ならそのグループへ実際に入る。
+        self._group_entry_candidate: BaseObject | None = None
+        # select ツール: Ctrl+press で「まだ選択されていない item」を掴んだ場合の
+        # 昇格待ち対象（finding #7）。press 時点では選択せず、最初の move で
+        # `_promote_ctrl_add_pending` が実際に選択して移動対象を作り直す
+        # （Qt 自身の release が「移動していない Ctrl+click」をトグルとして扱う
+        # ため、press 時点で選択すると click-no-move で再び OFF に戻ってしまう）。
+        self._ctrl_add_pending: BaseObject | None = None
+        # select ツール: 移動セッション（吸着契約 §G-4）。press 時に 1 回だけ構築し
+        # （対象 id・box系メンバーの開始 box・union box・吸着対象プール）、
+        # `_select_move` が union box で 1 回だけ吸着判定して delta を確定する。
+        # box系メンバーは `BaseItem._maybe_snap_position`（`scene.session_snapped_position`
+        # 経由）が、line/arrow の自由端・connector の固定端点は `_select_move`/
+        # `_select_release` 自身がこの delta を使う（finding #1/#6: 以前は「line
+        # は両端自由なときだけ・connector は常に raw」だったため剛体性が崩れて
+        # いた）。None は「セッション対象なし（吸着 OFF・対象なし等）」。
+        self._move_session: dict[str, Any] | None = None
+        # select ツール: press からの移動距離が `_DRAG_START_SCREEN_PX` を一度でも
+        # 超えたら True に latch する（finding #5）。超えるまでは「クリック」として
+        # 扱い、吸着・ライブ追従・確定のいずれも行わない。一度 True になったら
+        # release まで戻さない（ドラッグ中にカーソルが press 位置付近へ戻っても
+        # ちらつかせないため）。
+        self._select_dragging: bool = False
+        # select ツール: press で掴んだ item が `ItemIsMovable` を持つか
+        # （round2 finding #1）。line/arrow/connector は `ItemIsMovable=False`
+        # のため、これらを掴んで複数選択/グループをドラッグしても Qt の既定
+        # `mouseMoveEvent` は「掴んだ item が movable」の場合しか選択中の item を
+        # 一括で動かさない——掴んだ item 自身が非 movable だと、box系メンバーが
+        # movable であっても Qt は何も動かさない。`_select_move` はこのフラグを
+        # 見て、非 movable な item を掴んでいるときだけ box系メンバーへ
+        # 明示的に `setPos` する（Qt が代わりに動かしてくれない分を埋める）。
+        # 既定 True（「box を掴んだ」＝ Qt が普段どおり動かす）にしておき、
+        # press で実際の掴み対象に応じて上書きする。
+        self._grab_is_movable: bool = True
+        # rect/ellipse ツール: 作成ドラッグ中の吸着対象プール（吸着契約 §G-6）。
+        # `_draw_press` で 1 回だけ集め、`_draw_move`/`_draw_release` の毎イベントでは
+        # 使い回す（押下時に索引を1回だけ作る性能規約、§G-8）。
+        self._draw_snap_targets: list[Box] = []
         # rect/ellipse/line/arrow ツール: 描画中のプレビュー
         self._draw_start: QPointF | None = None
         self._preview_item: QGraphicsItem | None = None
@@ -258,7 +334,21 @@ class ToolManager(QObject):
         pass
 
     def _remember_style(self, obj: BaseObject) -> None:
-        """obj の dataclass fields ∩ `_STYLE_KEYS` の現在値を type 別に記憶する。"""
+        """obj の dataclass fields ∩ `_STYLE_KEYS` の現在値を type 別に記憶する。
+
+        塗りも線も無い完全に不可視な rect/ellipse/curve（`app.graphics.strokes.
+        FILL_TYPES` と同じ集合。`app.graphics.diagnostics`/`app.agent.diagnose`
+        もこれを唯一の真実源として import しており、二重管理を避けるためここも
+        同じ定数をそのまま import している）は記憶しない（レビュー finding #3）。
+        矩形の既定が「線なし＋薄いグレー塗り」になったことで、パネルの塗り
+        スウォッチで「なし」を選ぶ 1 操作だけで fill=None/stroke=None の完全
+        不可視スタイルが記憶され、以後ずっと同種オブジェクトが見えないまま
+        作られ続ける（File>New でも消えない）回帰があったため。fill=None だけ、
+        stroke=None だけを記憶すること自体は意図的な既存挙動（「塗りなしを
+        作ると次も塗りなし」と同じ）なので、それは今までどおり残す。
+        """
+        if obj.type in FILL_TYPES and getattr(obj, "fill", None) is None and not is_stroked(obj):
+            return
         style: dict[str, Any] = {
             f.name: getattr(obj, f.name) for f in dataclass_fields(obj) if f.name in _STYLE_KEYS
         }
@@ -297,8 +387,10 @@ class ToolManager(QObject):
         - stroke_width: `prefs.default_stroke_width`
         - routing: `prefs.default_connector_routing`
         - `prefs.initial_color` が `None` でなければ、stroke（図形系）と
-          color（text/math）を `initial_color` に（fill は触らない。塗りなしの
-          既定を維持する）。
+          color（text/math）を `initial_color` に（fill は触らない）。ただし
+          **dataclass 既定が None のフィールドは色で上書きしない**（2026-09-25:
+          rect/ellipse の stroke 既定が None＝線なしになったため。さもないと
+          「現在値 None == 既定 None」の判定で線なしの既定が初期色の線に化ける）。
 
         「dataclass 既定値のときのみ」の判定は `dataclasses.fields(obj)` の
         `default`/`default_factory` と比較する（text/math ダイアログ側の
@@ -321,7 +413,11 @@ class ToolManager(QObject):
             field = fields_by_name.get(name)
             if field is None:
                 continue
-            if getattr(obj, name) == _dataclass_field_default(field):
+            default = _dataclass_field_default(field)
+            if default is None:
+                # 「なし」が既定のフィールド（rect/ellipse の stroke）は初期色で埋めない。
+                continue
+            if getattr(obj, name) == default:
                 setattr(obj, name, value)
 
     def set_tool(self, name: str) -> None:
@@ -331,6 +427,14 @@ class ToolManager(QObject):
         self._cancel_freehand()
         self._select_start = {}
         self._select_press_pos = None
+        self._group_entry_candidate = None
+        self._ctrl_add_pending = None
+        self._move_session = None
+        self._select_dragging = False
+        self._grab_is_movable = True
+        end_session = getattr(self.scene, "end_move_session", None)
+        if callable(end_session):
+            end_session()
         self._text_start = None
         self._math_start = None
         self._connector_source_obj = None
@@ -495,66 +599,262 @@ class ToolManager(QObject):
     # push する（複数選択は beginMacro/endMacro）。ハンドルや空白部（ラバーバンド
     # 選択）を掴んだ場合はアームしない。
     # ------------------------------------------------------------------
-    def _topmost_item_at(self, scene_pos: QPointF) -> QGraphicsItem | None:
-        views = self.scene.views()
-        transform = views[0].transform() if views else QTransform()
-        items = self.scene.items(
-            scene_pos,
-            Qt.ItemSelectionMode.IntersectsItemShape,
-            Qt.SortOrder.DescendingOrder,
-            transform,
-        )
-        return items[0] if items else None
+    def _topmost_item_at(self, scene_pos: QPointF, event: Any = None) -> QGraphicsItem | None:
+        """`scene_pos` にある最上位の item を Qt の press ピックと同じ規則で返す。
+
+        実体は `app.scene.hit.topmost_item_at`（task2, 2026-09-25）: 右クリック
+        メニュー（`MainWindow._topmost_object_at`）と 1 実装を共有する——以前は
+        ここだけがデバイスpx矩形クエリ（round2 finding #3）へ移行しており、
+        右クリックメニューは厳密な 1 点クエリのままだったため、図形の縁ぎりぎり
+        では「左クリックは掴めるのに右クリックメニューは別のオブジェクトに効く」
+        （またはその逆）という食い違いが起きていた。
+
+        `button` は `event.button()` が使えるならそれを、無ければ
+        `Qt.MouseButton.LeftButton` を渡す（レビュー3巡目 finding #1）:
+        呼び出し元 `_select_press` は既にこの手前で右クリック等を弾いている
+        （`event.button() != LeftButton` なら早期 return）ため、ここに来る
+        時点の press は常に左クリックだとみなせる。テストの疑似イベントで
+        `button()` を持たない呼び方も従来どおり動くよう、無ければ Left を
+        既定にする。
+        """
+        button_getter = getattr(event, "button", None)
+        button = button_getter() if callable(button_getter) else Qt.MouseButton.LeftButton
+        return topmost_item_at(self.scene, scene_pos, event, button=button)
 
     def _select_press(self, event: Any, scene_pos: QPointF) -> bool:
         self._select_press_pos = None
         self._select_start = {}
+        self._group_entry_candidate = None
+        self._ctrl_add_pending = None
+        self._select_dragging = False
         if (
             getattr(event, "button", None) is not None
             and event.button() != Qt.MouseButton.LeftButton
         ):
             return False
-        hit = self._topmost_item_at(scene_pos)
+        hit = self._topmost_item_at(scene_pos, event)
         obj = getattr(hit, "obj", None)
         if obj is None or getattr(obj, "locked", False):
             # 空白部（ラバーバンド選択の開始）またはハンドル操作: 移動をアームしない。
             return False
+        # round2 finding #1: 掴んだ item 自身が movable かどうかを記録する。
+        # line/arrow/connector は `ItemIsMovable=False` のため、これを掴んで
+        # 複数選択/グループをドラッグしても Qt は他の box系メンバーを動かして
+        # くれない（`_select_move` がこのフラグを見て代わりに動かす）。
+        self._grab_is_movable = bool(hit.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+
+        document = self.scene.document
+        entered_group_id: int | None = None
+        entered_getter = getattr(self.scene, "entered_group_id", None)
+        if callable(entered_getter):
+            entered_group_id = entered_getter()
 
         currently_selected = self.scene.selected_objects()
-        if obj in currently_selected and len(currently_selected) > 1:
-            targets = currently_selected
+        group_id = getattr(obj, "group_id", None)
+
+        if obj not in currently_selected and bool(
+            _event_modifiers(event) & Qt.KeyboardModifier.ControlModifier
+        ):
+            # Ctrl+press で「まだ選択されていない item」を掴んだ（finding #7）。
+            # ここでは選択しない: Qt 自身の release は「移動していない
+            # Ctrl+click」を選択のトグルとして扱うため、ここで先に選択すると
+            # release で再び OFF へトグルされてしまう。実際に選択して移動対象を
+            # 作り直すのは最初の move イベント（`_select_move` →
+            # `_promote_ctrl_add_pending`）まで遅らせる。
+            self._ctrl_add_pending = obj
+
+        # グループ内個別編集(グループ内個別編集契約 §F-2): 掴んだ obj がまだ
+        # 「入っていない」グループの一員で、かつそのグループの全メンバー(ロック
+        # 除く)が既に選択済み(=グループ全体が選択されている状態)なら、
+        # 「もう一度クリック」候補として記録する。実際に入るかは release で
+        # 移動量を見て判定する(ドラッグならグループとして動かす、クリックなら
+        # そのメンバーだけを選ぶ)。修飾キー押下時(Ctrl等での選択の追加/除去)は
+        # 対象外にする(§9.1 と同じ getattr ガード経由。Qt 標準の Ctrl+click
+        # トグルと意味が衝突しないようにするため、group.md §5 案A3 不採用の理由)。
+        if (
+            obj in currently_selected
+            and group_id is not None
+            and group_id != entered_group_id
+            and _event_modifiers(event) == Qt.KeyboardModifier.NoModifier
+        ):
+            # not locked だけでなく visible も要る（review finding #7）: 非表示メンバーを
+            # 含むグループは、Qt が非表示アイテムを選択できない以上「ロックのみ」判定だと
+            # 永久に全体選択へ到達できず、もう一度クリックしての個別編集に入れなかった。
+            unlocked_members = document.selectable_group_members(group_id)
+            if unlocked_members and all(m in currently_selected for m in unlocked_members):
+                self._group_entry_candidate = obj
+
+        if obj in currently_selected:
+            # 既に選択済みの item を掴んだ場合、Qt はここでは選択を変えない
+            # （press だけでは選択が変化しない）ため、移動対象は「現在選択されて
+            # いるものそのもの」でなければならない（finding #3、パートナー機能の
+            # 選択が壊れる回帰の修正）。以前は複数選択（len > 1）のときだけこの
+            # 分岐に入っていたが、単一選択でも同じ理由が成り立つ——単一選択時に
+            # else 分岐（グループ全体へ広げる）に落ちると、「一部だけ選択された
+            # 非 entered グループ」で 1 個だけドラッグしたときに Qt が動かさない
+            # 他メンバーまで移動対象に含めてしまい、モデルと画面がずれる。
+            # `rigid_group_targets`（要望10 追加決定 Option A）: `currently_selected`
+            # は Qt の選択なので非表示メンバーを絶対に含まない（`setSelected` が
+            # 非表示アイテムに無言で no-op なため）。選択が「あるグループの選べる
+            # 全メンバー」を指しているなら、その非表示メンバーも移動対象へ足す
+            # ——さもないとグループを掴んでドラッグしても非表示メンバーだけ
+            # その場に取り残される。
+            targets = self.scene.rigid_group_targets(currently_selected)
         else:
-            # M7契約 §7: 掴んだ obj がグループに属するなら、グループ全体を
-            # 移動アーム対象にする(グループ選択自体の拡張は scene 側の責務。
-            # ここでは undo 用の旧幾何記録の対象を広げるだけ)。
-            group_id = getattr(obj, "group_id", None)
-            if group_id is not None:
-                targets = [
-                    o
-                    for o in self.scene.document.objects
-                    if getattr(o, "group_id", None) == group_id and not getattr(o, "locked", False)
-                ]
+            # M7契約 §7 / グループ内個別編集契約 §F-2: 掴んだ obj がグループに
+            # 属するなら、グループ全体を移動アーム対象にする(グループ選択自体の
+            # 拡張は scene 側の責務。ここでは undo 用の旧幾何記録の対象を広げる
+            # だけ)。ただし「そのグループに既に入っている」間は広げない
+            # ——入っている間はメンバー単体だけを動かす(§F-2 の中核)。
+            # `Document.movable_group_members`（要望10 追加決定 Option A）:
+            # ロックされていなければ非表示でも移動対象に含める（非表示メンバーは
+            # 選択も当たり判定もできないが、グループとしては剛体で動く）。
+            if group_id is not None and group_id != entered_group_id:
+                targets = document.movable_group_members(group_id)
                 if not targets:
                     targets = [obj]
             else:
                 targets = [obj]
 
         self._select_press_pos = scene_pos
+        self._select_start = self._record_move_starts(targets)
+        self._move_session = self._build_move_session(targets)
+        begin_session = getattr(self.scene, "begin_move_session", None)
+        if callable(begin_session):
+            box_starts = self._move_session["box_starts"] if self._move_session else {}
+            begin_session(box_starts)
+        return False
+
+    def _record_move_starts(self, targets: list[BaseObject]) -> dict[int, dict[str, Any]]:
+        """`targets` それぞれの移動開始時点の旧幾何を `_select_start` 形式で返す。
+
+        `_select_press` と `_promote_ctrl_add_pending`（finding #7: Ctrl+drag で
+        未選択の item を掴んだ場合の移動対象の作り直し）が同じロジックを共有する
+        （二重実装によるドリフトを避けるため、ここへ抽出した）。
+        """
+        starts: dict[int, dict[str, Any]] = {}
         for target in targets:
             if getattr(target, "locked", False):
                 continue
             if target.type == "connector":
                 # 本体ドラッグでは固定端点を平行移動する(コネクタ編集UX契約 §3)。
-                self._select_start[target.id] = {
+                starts[target.id] = {
                     "_connector": True,
                     "source_point": list(target.source_point),
                     "target_point": list(target.target_point),
                 }
             elif geometry_kind(target.type) == "endpoints":
-                self._select_start[target.id] = {"p1": list(target.p1), "p2": list(target.p2)}
+                starts[target.id] = {"p1": list(target.p1), "p2": list(target.p2)}
             else:
-                self._select_start[target.id] = {"x": target.x, "y": target.y}
-        return False
+                starts[target.id] = {"x": target.x, "y": target.y}
+        return starts
+
+    def _promote_ctrl_add_pending(self) -> None:
+        """Ctrl+press で掴んだ未選択の item を、最初の move で実際に選択し直す（finding #7）。
+
+        Qt の `QGraphicsItem::mouseMoveEvent` は最初の move イベントで
+        `movingItemsInitialPositions` のスナップショットを「現在選択されている
+        item 全部 + 押された item」から取り、その**後**に押された item を選択する。
+        `CanvasView.mouseMoveEvent` は `tool_manager.handle_mouse_move`（＝この
+        メソッドを含む select move 処理）を `super().mouseMoveEvent()`（Qt 自身の
+        処理、上記スナップショット）より**前**に呼ぶ。したがって、ここで
+        Qt より先に実際に選択してしまえば、Qt 自身がスナップショットを取る
+        時点で既に「選択されている item」に含まれ、以後の Qt のドラッグと
+        `ToolManager` の移動対象・移動セッションが同じ集合を動かすようになる。
+
+        これをしないと 2 通りの desync が起きる:
+        (1) 元から選択されていた他の item は画面上では Qt に動かされるが、
+            `_select_start`/`_select_release` の対象に入っていないためモデルへ
+            コミットされない。
+        (2) 掴んだ item がグループの一員なら `_expand_group_selection` が
+            兄弟も選択に加えるが、Qt のスナップショットには乗っていないため
+            (0, 0) + delta へ瞬間移動し、それがそのままモデルへコミットされる。
+
+        素の Ctrl+click（move が一度も来ない）ではこのメソッドは一度も呼ばれない
+        ため、Qt 自身の release（移動していない Ctrl+click は選択をトグルする）が
+        そのまま働く——ここで先回りして選択してしまうと release で再び OFF へ
+        トグルされてしまうため、意図的に press ではなく最初の move まで遅らせて
+        いる（`_select_press` 側のコメント参照）。
+        """
+        obj = self._ctrl_add_pending
+        if obj is None:
+            return
+        self._ctrl_add_pending = None
+        item = self.scene.item_for(obj)
+        if item is not None:
+            item.setSelected(True)
+        # `rigid_group_targets`（要望10 追加決定 Option A）: Ctrl+drag で選択に
+        # 加えた結果が「あるグループの選べる全メンバー」を指すなら、そのグループの
+        # 非表示メンバーも移動対象へ足す（`_select_press` の同種コメント参照）。
+        selected = [o for o in self.scene.selected_objects() if not getattr(o, "locked", False)]
+        targets = self.scene.rigid_group_targets(selected)
+        self._select_start = self._record_move_starts(targets)
+        self._move_session = self._build_move_session(targets)
+        end_session = getattr(self.scene, "end_move_session", None)
+        if callable(end_session):
+            end_session()
+        begin_session = getattr(self.scene, "begin_move_session", None)
+        if callable(begin_session):
+            box_starts = self._move_session["box_starts"] if self._move_session else {}
+            begin_session(box_starts)
+
+    def _build_move_session(self, targets: list[BaseObject]) -> dict[str, Any] | None:
+        """吸着契約 §G-4: 選択移動セッションを press 時に 1 回だけ構築する。
+
+        union box（吸着判定の基準）に入れるのは box系メンバー全員と、line/arrow の
+        うち**両端とも自由**（`pN_id` が両方 None）なもの――接着端のある line は
+        動かした瞬間にその端も一緒に動く「その他の図形」の影響を受けるため、
+        自分自身の位置で吸着基準を作ると意味を成さない。connector も同じ理由で
+        union box には含めない（固定端点はあっても、本体そのものが接続先に
+        追従して動くため吸着基準にはできない）。ただし、どちらも union box から
+        除外されるだけで**移動対象（`_select_start`）ではあり続け**、他のメンバー
+        と同じセッションの delta がそのまま適用される（finding #1/#6: 以前は
+        「line は両端自由なときだけ・connector は常に raw delta」だったため、
+        セッション内で box が吸着した分だけ自由端・固定端点が追従せず、剛体移動
+        が崩れる回帰があった）。
+
+        吸着 OFF、または union box を構成できるメンバーが1つも無ければ None
+        （`_select_move`/`_select_release` は raw delta にフォールバックする）。
+
+        非表示メンバー（要望10 追加決定 Option A）は union box（吸着の基準・
+        吸着対象）には寄与しない——不可視なので、見えている図形どうしを揃える
+        吸着の根拠にはならない。ただし `box_starts` には残す: `_select_move` の
+        「掴んだ item が非movable」経路は非表示の box系メンバーへも明示 `setPos`
+        するため（`_grab_is_movable` 分岐）、`box_starts` に無いと
+        `session_snapped_position` が None を返し、その非表示メンバーだけ
+        `BaseItem._maybe_snap_position` の単独判定に落ちて他メンバーと違う delta
+        で独立にスナップしてしまう（剛体移動が崩れる）。
+        """
+        if not getattr(self.scene, "snap_enabled", False):
+            return None
+        ids = frozenset(t.id for t in targets)
+        union: Box | None = None
+        box_starts: dict[int, tuple[float, float]] = {}
+        for obj in targets:
+            if obj.type == "connector":
+                continue
+            if geometry_kind(obj.type) == "endpoints" and (
+                obj.p1_id is not None or obj.p2_id is not None
+            ):
+                continue
+            box = self.scene.snap_box_for_object(obj)
+            if box is None:
+                continue
+            if geometry_kind(obj.type) != "endpoints":
+                box_starts[obj.id] = (obj.x, obj.y)
+            if not obj.visible:
+                continue
+            union = box if union is None else union_box(union, box)
+        if union is None:
+            return None
+        target_boxes = self.scene.collect_snap_targets(exclude_ids=ids)
+        return {
+            "ids": ids,
+            "union_box": union,
+            "target_boxes": target_boxes,
+            "box_starts": box_starts,
+            "delta": None,
+        }
 
     def _select_move(self, event: Any, scene_pos: QPointF) -> bool:
         """line/arrow/connector をドラッグ中にライブ追従させる(§6.2、コネクタUX契約 §3)。
@@ -567,21 +867,114 @@ class ToolManager(QObject):
         で反映する（接続端は図形追従を維持したまま）。box を Qt がドラッグでき
         るよう、また単独 line/connector press 時に Qt がラバーバンド選択を開始
         しないよう、常に `False`（非消費）を返す。
+
+        先頭で `_promote_ctrl_add_pending()`（finding #7）を呼ぶ: Ctrl+press で
+        未選択の item を掴んでいた場合、Qt 自身がこの move イベントを処理する
+        （`CanvasView.mouseMoveEvent` の `super().mouseMoveEvent()`）より前に
+        実際へ選択し、移動対象・移動セッションを作り直す。
+
+        press からの移動量が `_DRAG_START_SCREEN_PX` 未満の間は「まだクリック」
+        として扱い、吸着判定・ライブ追従のいずれも行わない（finding #5）。
+        セッションがあれば delta を `(0.0, 0.0)` に固定して公開する――box系
+        メンバーは `BaseItem._maybe_snap_position` がこれを見て開始位置に留まる
+        （Qt 自身の生ドラッグを追認しない）。line/connector は `set_live_points`/
+        `set_live_body_offset` を一度も呼ばなければ press 時点のモデル座標の
+        ままなので、ここでは何もしないだけでよい。閾値を一度でも超えたら
+        `_select_dragging` を latch し、以後は release まで通常のドラッグとして
+        扱う（閾値付近でのちらつき防止）。
         """
+        self._promote_ctrl_add_pending()
         if self._select_press_pos is None or not self._select_start:
             return False
         dx = scene_pos.x() - self._select_press_pos.x()
         dy = scene_pos.y() - self._select_press_pos.y()
+        if not self._select_dragging:
+            threshold = scene_threshold(self.scene, _DRAG_START_SCREEN_PX)
+            if math.hypot(dx, dy) < threshold:
+                session = self._move_session
+                if session is not None:
+                    session["delta"] = (0.0, 0.0)
+                    update_delta = getattr(self.scene, "update_move_session_delta", None)
+                    if callable(update_delta):
+                        update_delta((0.0, 0.0))
+                self._clear_snap_guides()
+                return False
+            self._select_dragging = True
+        # 吸着契約 §G-4: セッションがあれば union box で 1 回だけ吸着判定し、
+        # box系メンバー全員・line/arrow(自由端)・connector(固定端点)へ同じ delta
+        # を適用する（複数選択/グループで各メンバーが独立に吸着してバラバラに
+        # なる問題の修正、finding #1/#6）。box系メンバー自身への適用は
+        # `BaseItem._maybe_snap_position`（`scene.session_snapped_position` 経由）
+        # が担当し、ここでは line/arrow/connector のライブ追従にだけ使う。
+        snap_dx, snap_dy = dx, dy
+        session = self._move_session
+        if session is not None:
+            if getattr(self.scene, "snap_enabled", False):
+                union_start = session["union_box"]
+                threshold = scene_threshold(self.scene, ALIGN_SNAP_SCREEN_PX)
+                grid_size = self.scene.grid_size_or_none()
+                proposed_xy = (union_start[0] + dx, union_start[1] + dy)
+                (snapped_x, snapped_y), guides = snap_move(
+                    union_start, proposed_xy, session["target_boxes"], grid_size, threshold
+                )
+                snap_dx = snapped_x - union_start[0]
+                snap_dy = snapped_y - union_start[1]
+                session["delta"] = (snap_dx, snap_dy)
+                self.scene.set_snap_guides(guides)
+                update_delta = getattr(self.scene, "update_move_session_delta", None)
+                if callable(update_delta):
+                    update_delta(session["delta"])
+            else:
+                # ドラッグ中に吸着が OFF に切り替わった場合のフォールバック
+                # （通常は press 時点の状態で固定されるが、念のため raw に戻す）。
+                session["delta"] = None
+                self._clear_snap_guides()
         document = self.scene.document
+        if not self._grab_is_movable:
+            # round2 finding #1: 掴んだ item（line/arrow/connector）が
+            # `ItemIsMovable=False` だと、Qt の既定 `mouseMoveEvent` は
+            # box系メンバーを一切動かさない（掴んだ item 自身が movable の
+            # ときだけ選択中の item をまとめて動かす実装のため）。ここで
+            # box系メンバーへ明示的に `setPos` して埋める。`setPos` は
+            # `itemChange(ItemPositionChange)` 経由で `BaseItem.
+            # _maybe_snap_position` を通るため、セッションがあれば
+            # `session_snapped_position` が union box 吸着後の同じ delta を
+            # 返し（box を直接掴んだときと同一の経路・同一の結果）、セッションが
+            # 無ければ（吸着 OFF）None が返って proposed（= raw delta）が
+            # そのまま使われる。ライブプレビューになるので release まで
+            # 待たずに他メンバーと一緒に動いて見える。
+            for oid, geom in self._select_start.items():
+                if "x" not in geom:
+                    continue
+                target_obj = document.object_by_id(oid)
+                if target_obj is None:
+                    continue
+                target_item = self.scene.item_for(target_obj)
+                if target_item is None:
+                    continue
+                # crop/テキスト編集中などで一時的に movable を外されたメンバー
+                # は Qt 自身も動かさないので、ここでも動かさない（Qt の挙動に
+                # 合わせる。round2 finding #1 FIX 手順 2）。
+                if not (target_item.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable):
+                    continue
+                target_item.setPos(geom["x"] + snap_dx, geom["y"] + snap_dy)
         for oid, geom in self._select_start.items():
             obj = document.object_by_id(oid)
             if obj is None:
                 continue
             item = self.scene.item_for(obj)
             if geom.get("_connector"):
+                # セッションがあれば union box での吸着後 delta を使う（他の
+                # box/line メンバーと同じ delta で剛体移動する、finding #1/#6）。
+                # セッションが無い（union box を構成する box/free line が選択に
+                # 無い、例えば connector 単体のドラッグ）なら snap_dx/dy は raw
+                # dx/dy のまま――そのときは従来どおり吸着しない
+                # （report snap.md §6: 「Connector body drag doesn't snap either,
+                # which is fine」は単体ドラッグの話であり、セッション内では
+                # 適用されない）。
                 set_live_body_offset = getattr(item, "set_live_body_offset", None)
                 if callable(set_live_body_offset):
-                    set_live_body_offset(dx, dy)
+                    set_live_body_offset(snap_dx, snap_dy)
                 continue
             if "p1" not in geom:
                 continue
@@ -590,6 +983,13 @@ class ToolManager(QObject):
                 continue
             p1 = geom["p1"]
             p2 = geom["p2"]
+            # 自由端は常にセッションの delta を使う（finding #1/#6: 以前は
+            # 「両端とも自由なときだけ」吸着後の delta を使い、片端でも接着済みの
+            # line の自由端は生の dx/dy のままだったため、box が吸着で数px
+            # 動いたのに自由端だけ追従せず剛体性が崩れていた）。セッションが
+            # 無ければ snap_dx/dy は raw dx/dy のままなので、単体ドラッグ
+            # （接着済み line 1本だけを選択して動かす等）の挙動は変わらない。
+            line_dx, line_dy = snap_dx, snap_dy
             # 接着端（p1_id/p2_id が非 None、項目8）は本体ドラッグで動かさない
             # （`ConnectorItem.set_live_body_offset` の固定端点のみ動かす規則と同じ、
             # §9.3）。両端とも接着済みなら動かせる自由端が無いため呼び出し自体を
@@ -597,9 +997,9 @@ class ToolManager(QObject):
             # emit するため、何も変わらないのに接続先へ空更新を撒くのを避ける）。
             live_kwargs: dict[str, list[float]] = {}
             if obj.p1_id is None:
-                live_kwargs["p1"] = [p1[0] + dx, p1[1] + dy]
+                live_kwargs["p1"] = [p1[0] + line_dx, p1[1] + line_dy]
             if obj.p2_id is None:
-                live_kwargs["p2"] = [p2[0] + dx, p2[1] + dy]
+                live_kwargs["p2"] = [p2[0] + line_dx, p2[1] + line_dy]
             if live_kwargs:
                 set_live_points(**live_kwargs)
         return False
@@ -607,16 +1007,79 @@ class ToolManager(QObject):
     def _select_release(self, event: Any, scene_pos: QPointF) -> bool:
         start_pos = self._select_press_pos
         old_geoms = self._select_start
+        candidate = self._group_entry_candidate
+        session = self._move_session
         self._select_press_pos = None
         self._select_start = {}
+        self._group_entry_candidate = None
+        # 移動が一度も無い（move イベント無し）Ctrl+click では
+        # `_promote_ctrl_add_pending` が一度も呼ばれないため、ここで確実に
+        # リセットする（finding #7。次の press まで残ると別の item への
+        # press に誤って持ち越されかねない）。
+        self._ctrl_add_pending = None
+        self._move_session = None
         self._clear_snap_guides()
-        if not old_geoms:
-            return False
+        end_session = getattr(self.scene, "end_move_session", None)
+        if callable(end_session):
+            end_session()
         dx: float | None = None
         dy: float | None = None
         if start_pos is not None:
             dx = scene_pos.x() - start_pos.x()
             dy = scene_pos.y() - start_pos.y()
+        # finding #5: 「クリック」か「ドラッグ」かを 1 回だけ判定する。通常は
+        # `_select_move` が閾値超過時に latch した `_select_dragging` をそのまま
+        # 使う。move イベントが一度も来ていない（`item.setPos()` を直接呼ぶ
+        # 既存テスト・プログラム的な移動など）場合のフォールバックとして、
+        # 生の press→release 距離でも判定する。
+        drag_threshold = scene_threshold(self.scene, _DRAG_START_SCREEN_PX)
+        is_drag = self._select_dragging or (dx is not None and math.hypot(dx, dy) >= drag_threshold)
+        # round2 finding #1 step3: `_select_dragging` を False に戻す前に捕まえて
+        # おく。box系メンバーの確定に使う（`_select_dragging` が True＝実際に
+        # `_select_move` を通る real drag が起きた）。
+        moved_via_select_move = self._select_dragging
+        self._select_dragging = False
+        # 次の press まで持ち越さない（`_select_press` が改めて実際の掴み対象で
+        # 上書きする。ここでリセットしないと、次に box を直接掴んで動かす前に
+        # このメソッドを介さない経路（テストで直接呼ぶ等）が残っている場合に
+        # 古い値が残る）。
+        self._grab_is_movable = True
+        # 吸着契約 §G-4: line/arrow(自由端)・connector(固定端点) の確定は、
+        # プレビューと同じ `_select_move` が最後に計算した delta を再利用する
+        # （生の dx/dy を使うとプレビューは吸着していたのに確定した線だけ
+        # 吸着前へずれる、§9.1 の Shift 制約と同じ「プレビューと確定は同じ値を
+        # 使う」規則。finding #1/#6）。セッションが無い/delta 未確定
+        # （`_select_move` が一度も走っていない、例えば setPos を直接呼ぶ既存
+        # テスト）なら生の dx/dy にフォールバックする。
+        move_dx, move_dy = dx, dy
+        if session is not None and session.get("delta") is not None and dx is not None:
+            move_dx, move_dy = session["delta"]
+        if candidate is not None and not is_drag:
+            # グループ内個別編集契約 §F-2: ドラッグではなくクリックだったので、
+            # 候補のグループへ実際に入り、その候補だけへ選択を絞り込む。
+            # 絞り込みを Qt 自身の release 処理に委ねない（finding #6）:
+            # Qt は release の scenePos が press の scenePos と厳密に一致した
+            # ときだけ選択を絞り込むため、ズーム倍率が高い状況で 1〜2 device px
+            # 程度の手ぶれ（`is_drag` が False＝`scene_threshold(_DRAG_START_
+            # SCREEN_PX)` 未満でドラッグとは判定しない範囲。task3 2026-09-25:
+            # ここは `_MOVE_EPS` ではなく画面px換算のこの閾値で判定している）が
+            # あると、「入っている」状態にはなるのに選択はグループ全体のまま
+            # ——という中途半端な状態が生じていた。`select_exactly` を直接
+            # 呼んで確実に候補だけへ絞り込む。ここは Qt 既定の release 処理
+            # (`super().mouseReleaseEvent`)より**前**に走る(`CanvasView.
+            # mouseReleaseEvent` の呼び出し順、報告書 group.md §3)。先にここで
+            # 選択と「入っている」フラグを確定させておくことで、直後に Qt が
+            # scenePos 厳密一致で行う絞り込み（起きる場合）は同じ結果を
+            # 再現するだけの idempotent な操作になる。
+            select_exactly = getattr(self.scene, "select_exactly", None)
+            if callable(select_exactly):
+                select_exactly([candidate])
+            else:
+                set_entered_group = getattr(self.scene, "set_entered_group", None)
+                if callable(set_entered_group):
+                    set_entered_group(candidate.group_id)
+        if not old_geoms:
+            return False
         document = self.scene.document
         undo_stack = self.scene.undo_stack
         if undo_stack is None:
@@ -629,19 +1092,46 @@ class ToolManager(QObject):
             if old_geom.get("_connector"):
                 # 本体ドラッグ: 固定端点(source_id/target_id が None の側)のみを
                 # 平行移動する。両端接続なら変化なし(コネクタUX契約 §3)。
+                # finding #1/#6: セッションがあれば move_dx/move_dy（吸着後の
+                # delta、無ければ raw dx/dy と同じ）を使う。以前は常に raw
+                # dx/dy を使っていたため、同じセッション内の box/line が吸着
+                # 分だけ動いたのに connector の固定端点だけ追従せず、剛体移動
+                # が崩れていた。
                 item = self.scene.item_for(obj)
-                if dx is not None and math.hypot(dx, dy) >= _MOVE_EPS:
+                if is_drag and dx is not None and math.hypot(move_dx, move_dy) >= _GEOM_NOOP_EPS:
                     if obj.source_id is None:
                         old_sp = old_geom["source_point"]
-                        new_sp = [old_sp[0] + dx, old_sp[1] + dy]
+                        new_sp = [old_sp[0] + move_dx, old_sp[1] + move_dy]
+                        # mergeable=False（レビュー3巡目 finding #9）: この
+                        # コマンドが単独（`len(commands) == 1`）で push される
+                        # と `undo_stack.push` はマクロを介さないため、既定の
+                        # mergeable=True のままだと半接着コネクタの本体ドラッグを
+                        # 2回別々に行っても隣接する同一 (obj.id, key) の
+                        # `SetPropertyCommand` 同士が1エントリへ吸収されてしまう
+                        # （`tests/test_line_anchor_snap.py` が既に理由付きで
+                        # 明記していた既知の落とし穴）。
                         commands.append(
-                            SetPropertyCommand(document, obj, "source_point", new_sp, list(old_sp))
+                            SetPropertyCommand(
+                                document,
+                                obj,
+                                "source_point",
+                                new_sp,
+                                list(old_sp),
+                                mergeable=False,
+                            )
                         )
                     if obj.target_id is None:
                         old_tp = old_geom["target_point"]
-                        new_tp = [old_tp[0] + dx, old_tp[1] + dy]
+                        new_tp = [old_tp[0] + move_dx, old_tp[1] + move_dy]
                         commands.append(
-                            SetPropertyCommand(document, obj, "target_point", new_tp, list(old_tp))
+                            SetPropertyCommand(
+                                document,
+                                obj,
+                                "target_point",
+                                new_tp,
+                                list(old_tp),
+                                mergeable=False,
+                            )
                         )
                 if item is not None:
                     clear_live = getattr(item, "clear_live", None)
@@ -649,12 +1139,25 @@ class ToolManager(QObject):
                         clear_live()
                 continue
             if "p1" in old_geom:
-                # LineItem は ItemIsMovable=False で pos を持たないため、
-                # 実マウス移動量から delta を導出する他ない（§6.2）。
+                # LineItem は ItemIsMovable=False で pos を持たないため、delta を
+                # 生の pos() 差分から取れず別経路で求める他ない（§6.2）。ここで
+                # 使う `move_dx`/`move_dy` は生マウス移動量そのものではなく、
+                # 移動セッション（吸着契約 §G-4）があればその吸着後delta、
+                # 無ければ raw dx/dy にフォールバックする値（このメソッド冒頭の
+                # `move_dx, move_dy = dx, dy` / `session["delta"]` 参照。
+                # task3 2026-09-25: 旧コメントは常に「実マウス移動量」と読めたが
+                # セッションがある限りそうではない）。
                 item = self.scene.item_for(obj)
-                if dx is not None and math.hypot(dx, dy) >= _MOVE_EPS:
+                if is_drag and dx is not None and math.hypot(move_dx, move_dy) >= _GEOM_NOOP_EPS:
                     p1 = old_geom["p1"]
                     p2 = old_geom["p2"]
+                    # finding #1/#6: 自由端は常にセッションの delta（move_dx/dy）
+                    # を使う。以前は「両端とも自由なときだけ」吸着後の delta を
+                    # 使い、片端でも接着済みの line の自由端は生の dx/dy の
+                    # ままだったため、同じセッション内で box が吸着した分だけ
+                    # 剛体移動が崩れていた。セッションが無ければ move_dx/dy は
+                    # raw dx/dy と同じなので、単体ドラッグの挙動は変わらない。
+                    line_dx, line_dy = move_dx, move_dy
                     # 接着端（p1_id/p2_id が非 None、項目8）は本体ドラッグで動かさない
                     # （コネクタの固定端点のみ書き戻す規則と同じ、§9.3）。redo/undo は
                     # 同じキー集合を触る必要があるため、new/old は接着していない側の
@@ -663,10 +1166,10 @@ class ToolManager(QObject):
                     new_partial: dict[str, list[float]] = {}
                     old_partial: dict[str, list[float]] = {}
                     if obj.p1_id is None:
-                        new_partial["p1"] = [p1[0] + dx, p1[1] + dy]
+                        new_partial["p1"] = [p1[0] + line_dx, p1[1] + line_dy]
                         old_partial["p1"] = p1
                     if obj.p2_id is None:
-                        new_partial["p2"] = [p2[0] + dx, p2[1] + dy]
+                        new_partial["p2"] = [p2[0] + line_dx, p2[1] + line_dy]
                         old_partial["p2"] = p2
                     if new_partial:
                         commands.append(SetGeometryCommand(document, obj, new_partial, old_partial))
@@ -686,13 +1189,36 @@ class ToolManager(QObject):
                 # rect/ellipse は ItemIsMovable=True で Qt がドラッグ中に item.pos()
                 # を実際に動かすため、生マウス delta ではなく実移動量を使う。
                 item = self.scene.item_for(obj)
-                if item is not None:
+                if not is_drag:
+                    # finding #5: 閾値未満の「クリック」では確定しない。吸着 ON
+                    # ならセッションが delta=(0,0) を公開しているため item.pos()
+                    # は既に old_geom と一致しているはずだが、吸着 OFF では
+                    # セッションによる位置の巻き戻しが働かず Qt の生ドラッグが
+                    # そのまま反映されている（既存の view/model 乖離バグ、
+                    # finding #5 の「side issue」）。ここで明示的に元へ戻す。
+                    if item is not None:
+                        sync_from_model = getattr(item, "sync_from_model", None)
+                        if callable(sync_from_model):
+                            sync_from_model()
+                    continue
+                if moved_via_select_move and move_dx is not None and move_dy is not None:
+                    # round2 finding #1 step3: 実ドラッグが `_select_move` を
+                    # 通った（＝ `_select_dragging` が latch された）なら、
+                    # プレビューと同じ確定 delta（move_dx/move_dy。セッション
+                    # ありなら吸着後、無しなら raw）から求める。掴んだ item が
+                    # 非 movable（line/arrow/connector）で box系メンバーを
+                    # `_select_move` 側で `setPos` した場合も、直接 box を
+                    # 掴んだ場合も同じ式になる（round1 #31 step3 の意図。
+                    # `item.pos()` に頼ると、box を直接掴んでいない経路で
+                    # Qt 自身が動かしていない可能性に依存してしまう）。
+                    new_x, new_y = old_geom["x"] + move_dx, old_geom["y"] + move_dy
+                elif item is not None:
                     new_x, new_y = item.pos().x(), item.pos().y()
                 elif dx is not None:
                     new_x, new_y = old_geom["x"] + dx, old_geom["y"] + dy
                 else:
                     continue
-                if math.hypot(new_x - old_geom["x"], new_y - old_geom["y"]) < _MOVE_EPS:
+                if math.hypot(new_x - old_geom["x"], new_y - old_geom["y"]) < _GEOM_NOOP_EPS:
                     continue
                 new_geom = {"x": new_x, "y": new_y}
             commands.append(SetGeometryCommand(document, obj, new_geom, old_geom))
@@ -728,6 +1254,10 @@ class ToolManager(QObject):
                 anchor_point, obj_id, anchor_name = snap
                 scene_pos = QPointF(anchor_point[0], anchor_point[1])
                 self._draw_p1_bind = (obj_id, anchor_name)
+        if self._tool in ("rect", "ellipse") and getattr(self.scene, "snap_enabled", False):
+            self._draw_snap_targets = self.scene.collect_snap_targets()
+        else:
+            self._draw_snap_targets = []
         self._draw_start = scene_pos
         pen = QPen(QColor("#3399ff"))
         pen.setStyle(Qt.PenStyle.DashLine)
@@ -760,6 +1290,34 @@ class ToolManager(QObject):
         constrained = constrain_to_axis_or_diagonal(anchor, point)
         return QPointF(constrained[0], constrained[1])
 
+    def _snap_draw_corner(self, scene_pos: QPointF) -> QPointF:
+        """rect/ellipse 作成中のドラッグ角を吸着する（吸着契約 §G-6）。
+
+        `_draw_move`（プレビュー）と `_draw_release`（確定）の**両方**がこれを通す
+        （`_draw_end_point` の Shift 制約と同じ「プレビューと確定は同じ関数を通す」
+        規則、§9.1）。line/arrow はアンカー磁石が既に優先されるため対象外（契約の
+        明示スコープ。`_find_draw_anchor_snap`/`_update_draw_anchor_hint` を使う）。
+
+        角を「サイズ0の box」として扱うことで、既存の `snapping.snap_move` を
+        そのまま再利用できる（左/中央/右が全て同じ値になり、最も近い整列線に
+        素直に吸着する）。
+
+        吸着対象プールは `_draw_press` が押下時に 1 回だけ集めたもの
+        （`_draw_snap_targets`）を使い回す（§G-8: 索引は押下時に1回だけ作る）。
+        """
+        if self._tool not in ("rect", "ellipse"):
+            return scene_pos
+        if not getattr(self.scene, "snap_enabled", False):
+            return scene_pos
+        point_box: Box = (scene_pos.x(), scene_pos.y(), 0.0, 0.0)
+        grid_size = self.scene.grid_size_or_none()
+        threshold = scene_threshold(self.scene, ALIGN_SNAP_SCREEN_PX)
+        (sx, sy), guides = snap_move(
+            point_box, (scene_pos.x(), scene_pos.y()), self._draw_snap_targets, grid_size, threshold
+        )
+        self.scene.set_snap_guides(guides)
+        return QPointF(sx, sy)
+
     def _draw_move(self, event: Any, scene_pos: QPointF) -> bool:
         if self._tool in ("line", "arrow") and self._draw_start is None:
             # press 前のホバー中でもヒントを更新する（レビュー major所見）。
@@ -785,6 +1343,7 @@ class ToolManager(QObject):
             )
         else:
             rect_item: QGraphicsRectItem = self._preview_item  # type: ignore[assignment]
+            scene_pos = self._snap_draw_corner(scene_pos)
             rect_item.setRect(QRectF(self._draw_start, scene_pos).normalized())
         return True
 
@@ -840,6 +1399,22 @@ class ToolManager(QObject):
                 anchor_point, obj_id, anchor_name = p2_snap
                 scene_pos = QPointF(anchor_point[0], anchor_point[1])
                 p2_bind = (obj_id, anchor_name)
+        else:
+            # round2 finding #2: クリックかドラッグかを、吸着**前**の生の移動量で
+            # まず判定する。`_snap_draw_corner` は近傍の整列線/グリッドへ角を
+            # 吸着するため、この判定より先に吸着してしまうと「整列線の数px
+            # 手前でのただのクリック」が吸着後の座標との距離で「ドラッグした」
+            # と誤認され、幅/高さがほぼ0の不可視オブジェクトが生成されてしまう
+            # （ab473f9 では `_snap_draw_corner` 自体が無かったため起きなかった
+            # 回帰）。ドラッグ作成のプレビュー（`_draw_move`）は元々この生距離を
+            # 経ずに毎回吸着し続けるので、ここで早期 return しても「見た目は
+            # 動いたのに確定しない」という不一致は起きない。
+            if self._tool in ("rect", "ellipse") and start is not None:
+                raw = math.hypot(scene_pos.x() - start.x(), scene_pos.y() - start.y())
+                if raw < _MOVE_EPS:
+                    self._cancel_preview()
+                    return True
+            scene_pos = self._snap_draw_corner(scene_pos)
         self._cancel_preview()
         if start is None:
             return True
@@ -889,6 +1464,8 @@ class ToolManager(QObject):
             self._preview_item = None
         self._draw_start = None
         self._draw_p1_bind = None
+        self._draw_snap_targets = []
+        self._clear_snap_guides()
         if self._draw_anchor_hint is not None:
             self._draw_anchor_hint.destroy()
             self._draw_anchor_hint = None

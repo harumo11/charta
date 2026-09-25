@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent import exec_env, schema
+from app.graphics import diagnostics
 
 _RESERVED = schema.RESERVED_KEYS
 
@@ -169,13 +170,18 @@ METHOD_SPECS: dict[str, MethodSpec] = {
     "critique": MethodSpec(
         summary="図の破綻を機械可読に点検する（完全に画面外・一部がはみ出して"
         "書き出すと切れる・退化寸法・重なり・遮蔽・文字あふれ・低コントラスト・"
-        "出力実寸で小さすぎる文字）。読み取り専用。",
+        "出力実寸で小さすぎる文字・塗りも線も無く不可視な図形）。読み取り専用。",
         example={"checks": ["overlap", "low_contrast"]},
         notes=(
             "PNG を書き出さないので render より安く、判定もぶれない。"
             "描いた直後に 1 回呼ぶと「見えているつもり」の失敗をまとめて潰せる",
             "各所見の corrected_call はそのまま送れる"
             "（move_objects / update_objects / order_objects のいずれか）",
+            # 定数から組み立てる（2026-09-25 追加）: 診断コードが増えても
+            # ここが手直し漏れで陳腐化しない（`app.graphics.diagnostics` は
+            # Qt 非依存で `app.agent.api` を import しないので、この向きの
+            # import は循環にならない）。
+            "checks に渡せる名前: " + ", ".join(diagnostics.CHECK_NAMES),
             "checks 省略で全件。ids を渡すと、その id を参照する所見だけに絞る",
             "async_=True で即座に job_id を返しワーカースレッドで解析する"
             "（オブジェクトが数百ある図向け）。結果は get_job で拾う",
@@ -361,7 +367,11 @@ METHOD_SPECS: dict[str, MethodSpec] = {
         summary="元に戻す/やり直す（MCP ツール名は undo_redo）。",
     ),
     "set_selection": MethodSpec(
-        summary="人間の選択状態を明示的に変更する（生成系は既定でこれを呼ばない）。",
+        summary=(
+            "人間の選択状態を明示的に変更する（生成系は既定でこれを呼ばない）。"
+            "ids がグループの一部だけなら、そのグループへ入ってから選択する"
+            "（グループ全体へは展開されない）。"
+        ),
     ),
     "highlight_objects": MethodSpec(
         summary="一時的なマーカーで対象を指し示す（ドキュメントには何も足さない）。",

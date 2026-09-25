@@ -153,6 +153,52 @@ class Document:
                 return obj
         return None
 
+    def selectable_group_members(self, group_id: int) -> list[BaseObject]:
+        """`group_id` のメンバーのうち、キャンバス上で実際に選択され得るものを返す。
+
+        「ロックされていない」だけでなく `visible` も要求する（レビュー finding #7）。
+        Qt の `QGraphicsItem.setSelected` は非表示アイテムに対しては何もしないため、
+        「グループ全体が選択されている」を「不可視でない全メンバーが選択に含まれる」で
+        判定する側（`ToolManager._select_press` のグループ内個別編集クリック候補判定・
+        `PropertyPanel._whole_group_selection`・`CanvasScene.select_exactly` の部分集合
+        判定・`CanvasView._handle_group_entry_key` の Esc 復帰）は、判定対象の集合を
+        ここに揃える必要がある。ここを「ロックのみ」のままにすると、非表示メンバーを
+        含むグループは「全メンバー選択」に決して到達できず、以後グループへ入れない／
+        複数選択の X/Y フォームへ落ちて平行移動できない（書くと崩壊する）という壊れ方
+        をする。
+        """
+        return [
+            obj
+            for obj in self.objects
+            if getattr(obj, "group_id", None) == group_id and not obj.locked and obj.visible
+        ]
+
+    def movable_group_members(self, group_id: int) -> list[BaseObject]:
+        """`group_id` のメンバーのうち、グループとして剛体移動する対象を返す。
+
+        「非表示メンバーの扱い」の主セッション決定（要望10 追加決定、2026-09-25、
+        Option A: PowerPoint 式）: ロックされていない非表示メンバーは、選択も
+        当たり判定もできない（`selectable_group_members` が対象外にする）が、
+        グループの構成要素であることに変わりはなく、移動・複製・貼付では可視
+        メンバーと剛体で一緒に動く。ロックされたメンバーは今までどおり動かない
+        （§9.1 の「ロックされたメンバーは今までどおりの意味を保つ」の対象）。
+
+        `selectable_group_members` が「選べる／入れる」の判定に使う集合、こちらが
+        「動く」の判定に使う集合——同じ `not obj.locked` を共有しつつ `visible` の
+        有無だけが違う。移動・スナップ・複製・貼付・削除・グループ化・z順操作
+        （前面化/背面化/一つ前/一つ後ろ）・プロパティパネルのグループ X/Y 平行移動は
+        すべてこちらを使う（人間の操作経路は `CanvasScene.rigid_group_targets`
+        経由。レビュー3巡目 finding #5/#6/#10/#14 で削除・グループ化・z順にも
+        拡張——以前はこれらだけ `scene.selected_objects()` を生のまま使っていたため、
+        非表示メンバーを削除で無言孤立させる／Ctrl+G で置き去りにする／前面化で
+        古い z のまま取り残す、という Option A の抜け穴になっていた）。
+        """
+        return [
+            obj
+            for obj in self.objects
+            if getattr(obj, "group_id", None) == group_id and not obj.locked
+        ]
+
     def index_of(self, obj: BaseObject) -> int:
         """オブジェクトの現在のインデックス（z順位置）を返す。"""
         return self.objects.index(obj)

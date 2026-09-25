@@ -6,8 +6,10 @@ document/project.json（`app/model/document.py`・`app/model/serialize.py`）と
 無関係——こちらはユーザー環境そのものの設定であり、プロジェクトを跨いで生きる。
 
 Qt 非依存（`app/prefs.py` は PySide6 を import しない）。呼び出し側
-（`app/ui/main_window.py`）が `Preferences` を読み書きし、Qt の
-`QColorDialog` カスタムスウォッチ等へ反映する。
+（`app/ui/main_window.py`）が `Preferences` を読み書きし、`palette_by_id(palette_id)` を
+`PropertyPanel`/`MaskEditPanel`/環境設定ダイアログの `ColorSwatchButton.set_palette`
+（ドロップダウン項目）と `SimpleColorDialog`（パレット行）へ渡す
+（2026-09-25: 独自の色ダイアログ導入に伴い、Qt 標準の色ダイアログは廃止済み）。
 """
 
 from __future__ import annotations
@@ -73,7 +75,13 @@ class Preferences:
     version: int = 1
     # パレット
     palette_id: str = ""  # "" = パレットなし。app.model.palettes の id
-    initial_color: str | None = None  # 新規図形の線色/文字色。None = 従来既定(#000000)
+    # 新規図形の線色/文字色。None = このフィールドで上書きしない(dataclass 既定のまま)。
+    # 2026-09-25 決定で rect/ellipse の stroke 既定が None(線なし)になったため、
+    # rect/ellipse には効かない(「なし」が既定のフィールドは初期色で埋めない。
+    # `ToolManager._apply_pref_defaults`)。line/arrow/freehand/connector/curve の stroke
+    # （curve の stroke 既定は "#000000" で None ではないため対象）と
+    # text/math の文字色には従来どおり効く。
+    initial_color: str | None = None
     # 新規オブジェクトの既定
     default_font_family: str = "Noto Sans CJK JP"
     default_font_size: float = 18.0

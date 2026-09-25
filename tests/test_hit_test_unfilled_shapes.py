@@ -1,9 +1,15 @@
 """塗りなし矩形/楕円の内部素通しのテスト（P4/P5 契約 (C) 項目11）。
 
 `RectEllipseItem.shape()`/`boundingRect()` の単体テスト（`tests/test_curve.py:253-289`
-の文法を踏襲）に加え、select ツール（`ToolManager._topmost_item_at` は Qt ネイティブの
-`itemAt` と等価）・ラバーバンド選択（`QGraphicsScene.setSelectionArea`）・connector
-ツール（`ToolManager._pick_connectable`）での回帰を統合テストとして固定する。
+の文法を踏襲）に加え、select ツール・ラバーバンド選択（`QGraphicsScene.
+setSelectionArea`）・connector ツール（`ToolManager._pick_connectable`）での回帰を
+統合テストとして固定する。`ToolManager._topmost_item_at`（実体は `app.scene.hit.
+topmost_item_at`）は `QGraphicsScene.itemAt` の**厳密な1点クエリとは等価ではない**
+（2026-09-25 task2）: Qt 自身の press 配送・`QGraphicsView::items(QPoint)` と同じ
+デバイスpx（整数）矩形クエリを使う（round2 finding #3）。図形の内部を素通しする
+挙動そのものは `IntersectsItemShape` を使う限り変わらないため、本ファイルの検証は
+影響を受けない。
+
 
 **選択は辺のみ・接続は箱全体**という役割分担のうち、後者は「箱型図形（rect/ellipse
 等）に限る」ことも合わせて固定する（line/arrow は bbox 判定に切り替えると斜め線で
@@ -151,7 +157,9 @@ def test_zero_size_rect_is_still_grabbable(qapp: Any) -> None:
 
 
 # --------------------------------------------------------------------------
-# 統合: select ツール（Qt ネイティブの itemAt と等価な `_topmost_item_at`）
+# 統合: select ツール（`_topmost_item_at` = `app.scene.hit.topmost_item_at`、
+# Qt 自身の press 配送と同じデバイスpx矩形クエリ。単純な `QGraphicsScene.itemAt`
+# の厳密な1点クエリとは等価ではない。2026-09-25 task2）
 # --------------------------------------------------------------------------
 
 
@@ -365,3 +373,84 @@ def test_connector_tool_still_attaches_to_a_horizontal_line_via_its_shape_band(q
     tm = ToolManager(scene)
     hit_obj = tm._pick_connectable(QPointF(100.0, 101.5))  # 線からわずかに外れた帯の中
     assert hit_obj is line, "水平線でも shape() の帯でコネクタが拾えること"
+
+
+# --------------------------------------------------------------------------
+# task2（2026-09-25）: 塗りなし矩形の縁（帯）が別のアイテムと重なるとき、
+# 左クリック（select ツール）と右クリックメニューが同じオブジェクトを拾うこと。
+# --------------------------------------------------------------------------
+
+
+def test_unfilled_rect_edge_overlap_left_and_right_click_pick_the_same_object(
+    qapp: Any,
+) -> None:
+    """塗りなし矩形 A の縁の帯（内部は素通し）に、塗りあり矩形 B の縁が
+    サブピクセル単位で重なる配置。`scene_pos = (197.52, 148.0)` は厳密な1点
+    クエリでは A（帯の内側）に当たるが、Qt 自身の press 配送と同じデバイスpx
+    矩形クエリでは B に当たる（round2 finding #3 と同じ食い違いの種類）。
+
+    task2 以前は select ツールの press（`ToolManager._topmost_item_at`）だけが
+    デバイスpx矩形クエリへ移行済みで、右クリックメニュー
+    （`MainWindow._topmost_object_at`）は厳密な1点クエリのままだった。共有
+    ヘルパ `app.scene.hit.topmost_item_at` に一本化した今は、左クリックの
+    ピック（`tm._topmost_item_at`）と右クリックメニューのピック
+    （`window._topmost_object_at`）が常に同じオブジェクトを返すことを固定する。
+    """
+    from app.ui.main_window import MainWindow
+
+    window = MainWindow()
+    window.resize(800, 600)
+    window.show()
+    qapp.processEvents()
+    try:
+        window.view._apply_zoom_factor(1.0 / window.view.transform().m11())
+        scene = window.scene
+        stack = window.undo_stack
+        document = scene.document
+        tm = window.tool_manager
+
+        # A: 塗りなし矩形。右縁(x=200)の帯（幅 max(stroke_width, 8px)）だけが
+        # 当たり判定を持つ（項目11）。
+        a = RectObject(
+            id=document.new_id(),
+            x=100.0,
+            y=100.0,
+            width=100.0,
+            height=100.0,
+            fill=None,
+            stroke="#000000",
+            stroke_width=2.0,
+        )
+        stack.push(AddObjectCommand(document, a))
+        # B: 塗りあり矩形。A の右縁の帯へサブピクセルの位置関係で重なる。
+        b = RectObject(
+            id=document.new_id(), x=202.3, y=130.0, width=40.0, height=40.0, fill="#DDDDDD"
+        )
+        stack.push(AddObjectCommand(document, b))
+
+        view = window.view
+        scene_pos = QPointF(197.52, 148.0)
+
+        # 前提確認: 厳密な1点クエリなら A、Qt 自身のデバイスpx矩形クエリなら B。
+        exact_items = scene.items(
+            scene_pos,
+            Qt.ItemSelectionMode.IntersectsItemShape,
+            Qt.SortOrder.DescendingOrder,
+            QTransform(),
+        )
+        exact_obj = getattr(exact_items[0], "obj", None) if exact_items else None
+        qt_pick = view.items(view.mapFromScene(scene_pos))
+        qt_obj = getattr(qt_pick[0], "obj", None) if qt_pick else None
+        assert exact_obj is a, "前提: 厳密な1点クエリは帯の内側の A を拾うこと"
+        assert qt_obj is b, "前提: Qt 自身のデバイスpx矩形クエリは B を拾うこと"
+
+        left_pick = getattr(tm._topmost_item_at(scene_pos, None), "obj", None)
+        right_pick = window._topmost_object_at(scene_pos)
+        assert left_pick is b, "select ツールの press ピックは Qt 自身のピックと一致すること"
+        assert right_pick is b, "右クリックメニューのピックも同じオブジェクトを拾うこと"
+        assert left_pick is right_pick, "左クリックと右クリックメニューが同じオブジェクトを拾う"
+    finally:
+        import shiboken6
+
+        if shiboken6.isValid(window):
+            window.close()

@@ -147,6 +147,120 @@ def test_invisible_objects_are_never_reported() -> None:
 
 
 # --------------------------------------------------------------------------
+# invisible（2026-09-25 追加。契約 §担当C・項目3。`test_invisible_objects_are_never_reported`
+# 直上のテストとは別物: あちらは `visible=False` フィールドの話、こちらは新しい診断コード
+# `invisible`（塗りも線も無い rect/ellipse/curve）の話。
+# --------------------------------------------------------------------------
+
+
+def test_shape_with_no_fill_and_no_stroke_is_invisible() -> None:
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke=None, stroke_width=0.0))
+    assert _codes(dx.analyze(snap, ("invisible",))) == ["invisible"]
+
+
+def test_shape_with_fill_is_not_invisible() -> None:
+    snap = _snapshot(_obj(1, "rect", fill="#D9D9D9", stroke=None, stroke_width=0.0))
+    assert dx.analyze(snap, ("invisible",)) == []
+
+
+def test_shape_with_stroke_is_not_invisible() -> None:
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke="#000000", stroke_width=2.0))
+    assert dx.analyze(snap, ("invisible",)) == []
+
+
+def test_shape_with_zero_stroke_width_and_no_fill_is_invisible() -> None:
+    """stroke 色があっても `stroke_width<=0` なら線は描かれない
+    （`app.graphics.strokes.is_stroked` と同じ判定）。"""
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke="#000000", stroke_width=0.0))
+    assert _codes(dx.analyze(snap, ("invisible",))) == ["invisible"]
+
+
+def test_invisible_shape_that_is_hidden_is_not_reported() -> None:
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke=None, stroke_width=0.0, visible=False))
+    assert dx.analyze(snap, ("invisible",)) == []
+
+
+def test_ellipse_and_curve_are_also_subject_to_invisible() -> None:
+    snap = _snapshot(
+        _obj(1, "ellipse", fill=None, stroke=None, stroke_width=0.0),
+        _obj(2, "curve", fill=None, stroke=None, stroke_width=0.0, z_index=1),
+    )
+    assert _codes(dx.analyze(snap, ("invisible",))) == ["invisible", "invisible"]
+
+
+def test_lines_and_text_are_not_subject_to_invisible() -> None:
+    """`invisible` は rect/ellipse/curve だけが対象。line/arrow/text は元々
+    別の語彙（`visible`・`stroke_width=0`）で「消す」を表現できるので対象外。"""
+    snap = _snapshot(
+        _obj(1, "line", stroke="#000000", stroke_width=0.0),
+        _obj(2, "text", color="#000000", text="x", z_index=1),
+    )
+    assert dx.analyze(snap, ("invisible",)) == []
+
+
+def test_invisible_fix_adds_a_stroke_not_a_fill() -> None:
+    """2026-09-25 訂正（レビュー所見#2/#3）: 修正案は塗りではなく線を戻す。
+
+    塗りで直すと (a) 開曲線が塗りの塊になり「曲線は対象外」というユーザー決定
+    （fill 既定 `#D9D9D9` の対象から curve を除く）と矛盾し、(b) 画像の上に
+    意図して置いた `fill=null` の枠を不透明な灰色で塗りつぶし、下の内容を
+    隠してしまう。線を戻せばどちらも起きず、`is_stroked` が True になって
+    `invisible` は収束する。欠けている方（stroke / stroke_width）だけを補い、
+    既にある方には触れない。
+    """
+    # stroke も stroke_width も欠けている（典型: 新規 rect を fill=None にしただけ）。
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke=None, stroke_width=0.0))
+    finding = dx.analyze(snap, ("invisible",))[0]
+    corrected = diagnose.suggest_fix(finding, snap)
+    assert corrected == {
+        "tool": "update_objects",
+        "arguments": {"items": [{"id": 1, "stroke": "#000000", "stroke_width": 2.0}]},
+        "note": (
+            "塗りも線も無く不可視なので線を戻します"
+            "（開曲線が塗りの塊になったり、下にある画像を塗りで隠したり"
+            "しないよう、塗りは提案しません）"
+        ),
+    }
+
+
+def test_invisible_fix_only_adds_the_missing_stroke_field() -> None:
+    # stroke_width はすでに正の値なので、stroke だけ足す。
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke=None, stroke_width=2.0))
+    finding = dx.analyze(snap, ("invisible",))[0]
+    corrected = diagnose.suggest_fix(finding, snap)
+    assert corrected["arguments"]["items"] == [{"id": 1, "stroke": "#000000"}]
+
+
+def test_invisible_fix_treats_an_empty_stroke_string_the_same_as_none() -> None:
+    """`app.graphics.strokes.is_stroked` は空文字も「線なし」として扱う。
+    ここがずれると、`stroke=""` の壊れた/手編集の project.json で
+    `{"id": N}` だけの何もしない corrected_call を返し、送り返しても
+    `invisible` が消えない非収束になる。"""
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke="", stroke_width=2.0))
+    finding = dx.analyze(snap, ("invisible",))[0]
+    corrected = diagnose.suggest_fix(finding, snap)
+    assert corrected["arguments"]["items"] == [{"id": 1, "stroke": "#000000"}]
+
+
+def test_invisible_fix_only_adds_the_missing_stroke_width_field() -> None:
+    # stroke 色はすでにあるので、stroke_width だけ足す（stroke キーは含めない）。
+    snap = _snapshot(_obj(1, "rect", fill=None, stroke="#000000", stroke_width=0.0))
+    finding = dx.analyze(snap, ("invisible",))[0]
+    corrected = diagnose.suggest_fix(finding, snap)
+    assert corrected["arguments"]["items"] == [{"id": 1, "stroke_width": 2.0}]
+
+
+def test_invisible_fix_for_a_curve_never_suggests_a_fill() -> None:
+    """開曲線に `fill` を提案すると塊になる（ユーザー決定「曲線は対象外」）。"""
+    snap = _snapshot(_obj(1, "curve", fill=None, stroke=None, stroke_width=0.0))
+    finding = dx.analyze(snap, ("invisible",))[0]
+    corrected = diagnose.suggest_fix(finding, snap)
+    items = corrected["arguments"]["items"]
+    assert "fill" not in items[0]
+    assert items[0] == {"id": 1, "stroke": "#000000", "stroke_width": 2.0}
+
+
+# --------------------------------------------------------------------------
 # overlap
 # --------------------------------------------------------------------------
 
@@ -395,6 +509,42 @@ def test_text_in_front_does_not_occlude() -> None:
     assert dx.analyze(snap, ("occluded",)) == []
 
 
+def test_text_with_its_own_background_occludes_like_a_filled_shape() -> None:
+    """箱全体を塗る自前の背景（`background`）を持つ text は、rect/ellipse の塗りと
+    同様に不透明とみなす（2026-09-25 追加。`reports/text.md` §9）。"""
+    snap = _snapshot(
+        _obj(1, "rect", box=(10.0, 10.0, 50.0, 50.0), fill="#ff0000", z_index=0),
+        _obj(
+            2,
+            "text",
+            box=(0.0, 0.0, 200.0, 200.0),
+            color="#000000",
+            text="x",
+            background="#ffffff",
+            z_index=1,
+        ),
+    )
+    assert _codes(dx.analyze(snap, ("occluded",))) == ["occluded"]
+
+
+def test_translucent_text_with_background_does_not_occlude() -> None:
+    """opacity<1 の背景付き text は不透明とみなさない（rect/ellipse と同じ扱い）。"""
+    snap = _snapshot(
+        _obj(1, "rect", box=(10.0, 10.0, 50.0, 50.0), fill="#ff0000", z_index=0),
+        _obj(
+            2,
+            "text",
+            box=(0.0, 0.0, 200.0, 200.0),
+            color="#000000",
+            text="x",
+            background="#ffffff",
+            opacity=0.5,
+            z_index=1,
+        ),
+    )
+    assert dx.analyze(snap, ("occluded",)) == []
+
+
 def test_exactly_stacked_objects_are_reported_as_occluded() -> None:
     """座標を指定せずに N 個作ると全部同じ場所に積まれる — エージェントが実際にやる失敗。
 
@@ -479,6 +629,180 @@ def test_contrast_is_skipped_over_an_image() -> None:
 def test_faded_text_loses_contrast_and_is_reported() -> None:
     snap = _snapshot(_obj(1, "text", color="#000000", font_size=60.0, text="hi", opacity=0.15))
     assert _codes(dx.analyze(snap, ("low_contrast",))) == ["low_contrast"]
+
+
+def test_white_text_on_its_own_navy_background_is_not_low_contrast() -> None:
+    """契約の具体例（`reports/text.md` §9）: 白文字＋紺背景、アートボードは白。
+
+    自前の背景を無視すると、アートボード白を背景と誤認して「白文字が読めない」
+    という偽の警告が出て、しかも修正案が文字色を黒に変えて図を壊す。
+    """
+    snap = _snapshot(
+        _obj(1, "text", color="#ffffff", font_size=60.0, text="hi", background="#001f3f"),
+        background="#ffffff",
+    )
+    assert dx.analyze(snap, ("low_contrast",)) == []
+
+
+def test_text_own_background_takes_priority_over_the_shape_behind_it() -> None:
+    """自前の背景を持つ text は、下に別の図形があってもそちらではなく
+    自分の背景で判定する。"""
+    snap = _snapshot(
+        _obj(1, "rect", box=(0.0, 0.0, 400.0, 200.0), fill="#ff0000", z_index=0),
+        _obj(
+            2,
+            "text",
+            box=(20.0, 20.0, 100.0, 40.0),
+            color="#ffffff",
+            font_size=60.0,
+            text="hi",
+            background="#001f3f",
+            z_index=1,
+        ),
+    )
+    findings = dx.analyze(snap, ("low_contrast",))
+    assert findings == [], "白文字+紺背景は読めるので警告してはいけない"
+
+
+def test_text_own_background_is_still_checked_for_contrast() -> None:
+    """自前の背景があっても、コントラストが実際に不足していれば従来どおり警告する
+    （自前の背景は「無条件に免除」ではない）。"""
+    snap = _snapshot(
+        _obj(1, "text", color="#dddddd", font_size=60.0, text="hi", background="#eeeeee")
+    )
+    findings = dx.analyze(snap, ("low_contrast",))
+    assert _codes(findings) == ["low_contrast"]
+    assert findings[0]["background"] == "#eeeeee"
+    assert findings[0]["background_source"] == "object:1"
+
+
+def test_translucent_own_background_blends_the_glyph_over_the_blended_box() -> None:
+    """2026-09-25 訂正（レビュー所見#1）: 文字インクは背景の上に**二重合成**される
+    のが正しい。以前のテスト名・アサーションは「単一合成が正しい」としていたが、
+    それは実際の描画（画面・PNG・PDF はすべて `TextItem.paint` が
+    `fillRect(背景)` の直後に同じ opacity で文字インクを重ねるだけで、
+    中間レイヤーを作らない）と逆だった。実測: 白文字・不透明度 0.5・
+    紺背景 `#001f3f`・白いアートボードで、画面/PNG/PDF はいずれもコントラスト比
+    1.94 相当を描画する（単一合成モデルの 3.31 はどの出力にも現れない。
+    SVG だけがグループ opacity で単一合成になるが、それは area B の担当）。
+    required=3.0 に対し 1.94 は不足するので、このケースは警告が必要。
+    """
+    snap = _snapshot(
+        _obj(
+            1,
+            "text",
+            color="#ffffff",
+            font_size=60.0,
+            text="hi",
+            background="#001f3f",
+            opacity=0.5,
+        ),
+        background="#ffffff",
+    )
+    findings = dx.analyze(snap, ("low_contrast",))
+    assert _codes(findings) == ["low_contrast"]
+    assert findings[0]["ratio"] == pytest.approx(1.94, abs=0.01)
+    assert findings[0]["background"] == "#808f9f"
+    assert findings[0]["background_source"] == "object:1"
+
+
+def test_translucent_own_background_high_opacity_is_still_readable() -> None:
+    """二重合成でも、不透明度が高ければ十分読める（過大な警告を出さないことの対）。"""
+    snap = _snapshot(
+        _obj(
+            1,
+            "text",
+            color="#ffffff",
+            font_size=60.0,
+            text="hi",
+            background="#001f3f",
+            opacity=0.9,
+        ),
+        background="#ffffff",
+    )
+    assert dx.analyze(snap, ("low_contrast",)) == []
+
+
+def test_double_blend_matches_the_finding_ratio() -> None:
+    """所見の `ratio` が実際に使っているモデル（`blend_over` を背景に対して
+    もう一度掛ける二重合成）と一致することを、`legibility` の生の計算で固定する。
+    """
+    from app.graphics import legibility
+
+    under = "#ffffff"
+    own_bg = "#001f3f"
+    opacity = 0.5
+    background = legibility.blend_over(own_bg, under, opacity)
+    expected_ratio = legibility.contrast_ratio(
+        legibility.blend_over("#ffffff", background, opacity), background
+    )
+    snap = _snapshot(
+        _obj(
+            1,
+            "text",
+            color="#ffffff",
+            font_size=60.0,
+            text="hi",
+            background=own_bg,
+            opacity=opacity,
+        ),
+        background=under,
+    )
+    findings = dx.analyze(snap, ("low_contrast",))
+    assert findings[0]["ratio"] == pytest.approx(round(expected_ratio, 2))
+
+
+def test_background_behind_uses_an_overlapping_texts_own_background() -> None:
+    """背景付き text の上に別の text が重なるとき、`background_behind` はその
+    背景を rect/ellipse の塗りと同様に背景源として扱う。"""
+    snap = _snapshot(
+        _obj(
+            1,
+            "text",
+            box=(0.0, 0.0, 300.0, 100.0),
+            color="#ffffff",  # 自分の背景に対しても読める色にしておく
+            text="base",
+            background="#001f3f",
+            z_index=0,
+        ),
+        _obj(
+            2,
+            "text",
+            box=(20.0, 20.0, 100.0, 40.0),
+            color="#ffffff",
+            text="over",
+            z_index=1,
+        ),
+    )
+    assert dx.analyze(snap, ("low_contrast",)) == []
+    background, source = dx.background_behind(snap, snap.objects[1])
+    assert background == "#001f3f"
+    assert source == "object:1"
+
+
+def test_text_without_its_own_background_still_falls_through() -> None:
+    """背景の無い text はグリフの隙間だらけなので、従来どおり透過してさらに下を見る。"""
+    snap = _snapshot(
+        _obj(
+            1,
+            "text",
+            box=(0.0, 0.0, 300.0, 100.0),
+            color="#000000",
+            text="base",
+            z_index=0,
+        ),
+        _obj(
+            2,
+            "text",
+            box=(20.0, 20.0, 100.0, 40.0),
+            color="#aaaaaa",
+            text="over",
+            z_index=1,
+        ),
+    )
+    background, source = dx.background_behind(snap, snap.objects[1])
+    assert source == "artboard"
+    assert background == "#ffffff"
 
 
 def test_transparent_shape_behind_falls_through_to_the_artboard() -> None:

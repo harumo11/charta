@@ -9,6 +9,12 @@ from __future__ import annotations
 
 from app.model.objects import BaseObject
 
+#: 塗り(fill)と線(stroke)を持つ型。以前は `app.graphics.diagnostics._FILL_TYPES`
+#: と `app.agent.diagnose._FILL_TYPES` に同じ集合が 2 重に定義されており、
+#: 2026-09-25 レビュー2巡目 finding #1/#7 で「2 か所を必ず揃えること」という
+#: コメント頼みの同期になっていた。ここへ一本化し、両モジュールはここから import する。
+FILL_TYPES = frozenset({"rect", "ellipse", "curve"})
+
 
 def is_stroked(obj: BaseObject) -> bool:
     """obj に線を描くべきかどうか。

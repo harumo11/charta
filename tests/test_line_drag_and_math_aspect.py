@@ -142,6 +142,13 @@ def test_mixed_selection_box_moves_via_qt_line_follows_via_tool_both_commit_on_r
     qapp.processEvents()
     assert len(scene.selected_objects()) == 2
 
+    # 吸着契約 §G-4: このテストの意図は box+line 混在ドラッグが 1 マクロで確定する
+    # ことの検証であり、吸着そのものはここでは検証しない。複数選択の union box
+    # （rect(300,300,100,80) と line(10,10)-(80,60) を包む大きな箱）はドラッグ先で
+    # 上端がアートボード上端(0)から 5px という近さになり、意図せず吸着してしまう
+    # （dy=-15 が -10 に化ける）。無効化して生の dx/dy のまま検証する。
+    scene.set_snap_enabled(False)
+
     tm.set_tool("select")
     press_pos = QPointF(350.0, 340.0)  # rect 本体上(line とは無関係な位置)
     dx, dy = 25.0, -15.0

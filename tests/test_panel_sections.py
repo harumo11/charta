@@ -1,19 +1,13 @@
-"""PropertyPanel のセクション見出し独立行化の回帰テスト（P2契約・担当B）。
+"""PropertyPanel の行台帳・見出し全廃（要望6）の回帰テスト。
 
-`_HeaderedLabel`（見出しをラベル欄に埋め込む複合ラベル。旧実装）を削除し、見出しは
-`QFormLayout.addRow(widget)`（スパン行）として独立させた。これにより:
-
-* 見出しの有無がフィールド行の高さ（QFormLayout の上寄せ）に影響しなくなる
-  （ユーザー報告の項目3/項目4 の主因対策）。
-* `section` は `PropSpec` のデータとして持つため、line/arrow のように x/y を
-  持たない型でも「スタイル」見出しが正しい行（stroke の直前）に付く。
-  旧実装は「COMMON_PROPS に無い最初の key」という位置ベースの推論だったため、
-  「スタイル」が p1（始点）行に付いてしまうバグを構造的に持っていた（ユーザー報告）。
-
-見出しを独立行にすると「PROPERTIES[type] の並び順 == QFormLayout の行番号」という
-旧テストの前提が崩れるため、公開ヘルパ（row_for_key/field_widget_for/
-label_widget_for/keys_in_form/section_rows）が全モード（object/multi/artboard）で
-正しく機能することをここで固定する。
+`PropSpec.section`（見出しラベルをスパン行として挿む旧方式）は 2026-09-25 の
+ユーザー要望で全廃され、`PropSpec.group` の変わり目に 1px の区切り線を挿む
+方式へ移行した（`separator_rows()`/`groups_in_form()`。以前の `section_rows()`
+は削除済み）。この移行に伴い「PROPERTIES[type] の並び順 == QFormLayout の
+行番号」という前提はまだ成り立たない（B/I/U が1行にまとまる・区切り行が
+割り込むため）。公開ヘルパ（row_for_key/field_widget_for/label_widget_for/
+keys_in_form）が全モード（object/multi/artboard）で正しく機能することを
+ここで固定する。
 """
 
 from __future__ import annotations
@@ -26,7 +20,7 @@ from PySide6.QtWidgets import QFormLayout, QLabel
 
 from app.commands.commands import AddObjectCommand
 from app.model.objects import ImageObject, new_object
-from app.model.properties import PROPERTIES
+from app.model.properties import GROUP_GEOMETRY, PROPERTIES
 from app.ui.main_window import MainWindow
 
 # --------------------------------------------------------------------------
@@ -97,58 +91,137 @@ def _make_and_select(env: dict[str, Any], obj_type: str) -> Any:
 
 
 # --------------------------------------------------------------------------
-# 見出し行はスパン行（LabelRole が None、SpanningRole が role="section" の QLabel）
+# 見出し全廃（要望6）: role="section" のラベルはどのモードにも存在しない
 # --------------------------------------------------------------------------
 
 
-def test_section_headers_are_spanning_rows_with_role_section(env: dict[str, Any]) -> None:
+@pytest.mark.parametrize("obj_type", _ALL_TYPES)
+def test_no_section_role_label_anywhere_in_object_mode(env: dict[str, Any], obj_type: str) -> None:
     panel = env["panel"]
-    _make_and_select(env, "rect")
+    _make_and_select(env, obj_type)
 
-    header_rows = [row for row, _text in panel.section_rows()]
-    assert header_rows, "rect は最低1つの見出し行（変形/スタイル）を持つ"
     form = panel._form
-    for row in header_rows:
-        label_item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
-        assert label_item is None, "見出し行はラベル欄を持たないスパン行であること"
-        span_item = form.itemAt(row, QFormLayout.ItemRole.SpanningRole)
-        assert span_item is not None
-        widget = span_item.widget()
-        assert isinstance(widget, QLabel)
-        assert widget.property("role") == "section"
+    for row in range(form.rowCount()):
+        for role in (
+            QFormLayout.ItemRole.LabelRole,
+            QFormLayout.ItemRole.FieldRole,
+            QFormLayout.ItemRole.SpanningRole,
+        ):
+            item = form.itemAt(row, role)
+            if item is None:
+                continue
+            widget = item.widget()
+            if isinstance(widget, QLabel):
+                assert widget.property("role") != "section"
+
+
+def test_no_section_role_label_in_multi_and_artboard_modes(env: dict[str, Any]) -> None:
+    scene, panel, app = env["scene"], env["panel"], env["app"]
+
+    # artboard（未選択）
+    scene.clearSelection()
+    app.processEvents()
+    _assert_no_section_role_label(panel)
+
+    # multi（rect + rect）
+    _make_and_select(env, "rect")
+    rect_b = new_object("rect", id=scene.document.new_id(), x=10.0, y=10.0, width=5.0, height=5.0)
+    _add(env, rect_b)
+    scene.item_for(rect_b).setSelected(True)
+    app.processEvents()
+    _assert_no_section_role_label(panel)
+
+
+def _assert_no_section_role_label(panel: Any) -> None:
+    form = panel._form
+    for row in range(form.rowCount()):
+        for role in (
+            QFormLayout.ItemRole.LabelRole,
+            QFormLayout.ItemRole.FieldRole,
+            QFormLayout.ItemRole.SpanningRole,
+        ):
+            item = form.itemAt(row, role)
+            if item is None:
+                continue
+            widget = item.widget()
+            if isinstance(widget, QLabel):
+                assert widget.property("role") != "section"
 
 
 # --------------------------------------------------------------------------
-# line/arrow: 「スタイル」は stroke の直前、「変形」は p1 の直前
-# （旧実装は「COMMON_PROPS に無い最初の key」という位置ベースの推論のため、
-# 「スタイル」が p1（始点）行に付いてしまうバグを持っていた——ユーザー報告の固定）
+# 区切り線（要望6）: グループの変わり目にだけ挿む。先頭・末尾には無い。
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("obj_type", _ALL_TYPES)
+def test_separators_appear_only_between_groups_never_at_edges(
+    env: dict[str, Any], obj_type: str
+) -> None:
+    panel = env["panel"]
+    _make_and_select(env, obj_type)
+
+    separators = panel.separator_rows()
+    last_row = panel._form.rowCount() - 1
+    for row in separators:
+        assert row != 0, "先頭行に区切りが入っている"
+        assert row != last_row, "末尾行に区切りが入っている"
+
+    # groups_in_form() の group 数 - 1 が区切りの数と一致する
+    # （隣接するグループの境目ごとに 1 本）。
+    groups = panel.groups_in_form()
+    assert len(separators) == max(len(groups) - 1, 0)
+
+
+def test_separators_appear_between_groups_in_multi_mode(env: dict[str, Any]) -> None:
+    scene, panel, app = env["scene"], env["panel"], env["app"]
+    rect = new_object("rect", id=scene.document.new_id(), x=0.0, y=0.0, width=10.0, height=10.0)
+    line = new_object("line", id=scene.document.new_id(), p1=[0.0, 0.0], p2=[10.0, 10.0])
+    _add(env, rect)
+    _add(env, line)
+    scene.item_for(rect).setSelected(True)
+    scene.item_for(line).setSelected(True)
+    app.processEvents()
+
+    separators = panel.separator_rows()
+    last_row = panel._form.rowCount() - 1
+    for row in separators:
+        assert row != 0
+        assert row != last_row
+    groups = panel.groups_in_form()
+    assert len(separators) == max(len(groups) - 1, 0)
+
+
+# --------------------------------------------------------------------------
+# グループ分け（旧「スタイル」「変形」見出しの後継）:
+# geometry グループが x（または line/arrow の p1）を含み、appearance グループが
+# stroke を含む。旧実装は「COMMON_PROPS に無い最初の key」という位置ベースの
+# 推論だったため、line/arrow で「スタイル」が p1 行に付くバグを持っていた
+# （ユーザー報告）。group はデータ（PropSpec.group）として持つのでこの種の
+# バグは構造的に起きない。
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("obj_type", ["line", "arrow"])
-def test_line_style_header_precedes_stroke_not_p1(env: dict[str, Any], obj_type: str) -> None:
+def test_line_stroke_and_p1_are_in_the_expected_groups(env: dict[str, Any], obj_type: str) -> None:
     panel = env["panel"]
     _make_and_select(env, obj_type)
 
-    sections = dict(panel.section_rows())
-    assert sections[panel.row_for_key("stroke") - 1] == "スタイル"
-    assert sections[panel.row_for_key("p1") - 1] == "変形"
-
-
-# --------------------------------------------------------------------------
-# 「変形」見出しは x の直前（x を持つ全型）
-# --------------------------------------------------------------------------
+    groups = dict(panel.groups_in_form())
+    assert "p1" in groups[GROUP_GEOMETRY]
+    stroke_group = panel._key_group["stroke"]
+    assert "stroke" in groups[stroke_group]
+    assert stroke_group != GROUP_GEOMETRY
 
 
 @pytest.mark.parametrize(
     "obj_type", ["rect", "image", "text", "math", "freehand", "curve", "ellipse"]
 )
-def test_transform_header_precedes_x(env: dict[str, Any], obj_type: str) -> None:
+def test_x_is_in_the_geometry_group(env: dict[str, Any], obj_type: str) -> None:
     panel = env["panel"]
     _make_and_select(env, obj_type)
 
-    sections = dict(panel.section_rows())
-    assert sections[panel.row_for_key("x") - 1] == "変形"
+    groups = dict(panel.groups_in_form())
+    assert "x" in groups[GROUP_GEOMETRY]
 
 
 # --------------------------------------------------------------------------

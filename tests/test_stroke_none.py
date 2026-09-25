@@ -42,8 +42,7 @@ import numpy as np
 import pytest
 import shiboken6
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage, QPainter
-from PySide6.QtWidgets import QColorDialog, QPushButton
+from PySide6.QtGui import QImage, QPainter
 
 from app.agent import diagnose, schema
 from app.agent.api import AgentAPI
@@ -70,6 +69,7 @@ from app.scene.items.curve_item import CurveItem
 from app.scene.items.freehand_item import FreehandItem
 from app.scene.items.shape_item import LineItem, RectEllipseItem, pen_for
 from app.ui.main_window import MainWindow
+from app.ui.widgets import ColorSwatchButton, SimpleColorDialog
 
 _SVG_NS = "http://www.w3.org/2000/svg"
 _NS = {"svg": _SVG_NS}
@@ -661,6 +661,12 @@ def test_stroke_is_nullable_only_for_filled_shapes() -> None:
 
 
 def test_color_opt_button_has_none_and_pick_actions(env: dict[str, Any]) -> None:
+    """2026-09-25（要望8/11/12）: 色ウィジェットは `ColorSwatchButton` に統一した。
+    メニューはパレット色（未選択なら基本色8色）＋「なし」＋「色を選択…」を
+    末尾に持つ（`reports/color.md` §4）。旧テストの「アクションは2つ」という
+    前提はパレット色の追加で崩れるため、固定位置での unpack ではなく
+    「「なし」と「色を選択…」がこの順で末尾にある」ことを確認する。
+    """
     scene = env["scene"]
     rect = _add(
         env,
@@ -671,11 +677,11 @@ def test_color_opt_button_has_none_and_pick_actions(env: dict[str, Any]) -> None
     _select_only(env, rect)
 
     button = env["panel"].field_widget_for("fill")
-    assert isinstance(button, QPushButton)
+    assert isinstance(button, ColorSwatchButton)
     menu = button.menu()
     assert menu is not None
-    actions = menu.actions()
-    assert [a.text() for a in actions] == ["色を選択…", "なし"]
+    texts = [a.text() for a in menu.actions() if not a.isSeparator()]
+    assert texts[-2:] == ["なし", "色を選択…"]
 
 
 def test_color_opt_none_action_sets_null_in_one_undo(env: dict[str, Any]) -> None:
@@ -690,7 +696,7 @@ def test_color_opt_none_action_sets_null_in_one_undo(env: dict[str, Any]) -> Non
 
     button = panel.field_widget_for("stroke")
     index_before = stack.index()
-    _pick_action, none_action = button.menu().actions()
+    none_action = next(a for a in button.menu().actions() if a.text() == "なし")
     none_action.trigger()
 
     assert rect.stroke is None
@@ -700,11 +706,14 @@ def test_color_opt_none_action_sets_null_in_one_undo(env: dict[str, Any]) -> Non
     assert rect.stroke == "#000000"
 
 
-def test_color_opt_pick_color_uses_non_native_dialog(
+def test_color_opt_pick_color_uses_the_simple_color_dialog(
     env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """所見(S1、fill/color_opt と共通)の stroke 側での固定。「色を選択…」アクションも
-    `DontUseNativeDialog` を要求すること。"""
+    """2026-09-25: `QColorDialog` はアプリから消え、色ダイアログの唯一の経路は
+    `SimpleColorDialog.get_color`（要望12）。「色を選択…」アクションがこの
+    1関数だけを通ることを、stroke（color_opt）側でも固定する（fill 側は
+    `tests/test_panel_edit_m8.py::test_rect_fill_pick_action_opens_the_simple_color_dialog`）。
+    """
     scene, panel = env["scene"], env["panel"]
     rect = _add(
         env,
@@ -717,15 +726,15 @@ def test_color_opt_pick_color_uses_non_native_dialog(
     button = panel.field_widget_for("stroke")
     captured: dict[str, Any] = {}
 
-    def _fake_get_color(*args: Any, **kwargs: Any) -> QColor:
-        captured.update(kwargs)
-        return QColor()  # invalid → 変更しない
+    def _fake_get_color(*args: Any, **kwargs: Any) -> None:
+        captured["called"] = True
+        return None  # キャンセル相当 → 変更しない
 
-    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(_fake_get_color))
-    pick_action, _none_action = button.menu().actions()
+    monkeypatch.setattr(SimpleColorDialog, "get_color", staticmethod(_fake_get_color))
+    pick_action = next(a for a in button.menu().actions() if a.text() == "色を選択…")
     pick_action.trigger()
 
-    assert captured.get("options") == QColorDialog.ColorDialogOption.DontUseNativeDialog
+    assert captured.get("called") is True
 
 
 @pytest.mark.parametrize(
@@ -736,18 +745,23 @@ def test_color_opt_pick_color_uses_non_native_dialog(
     ],
     ids=["line_stroke", "text_color"],
 )
-def test_plain_color_row_has_no_menu(
+def test_plain_color_row_has_no_null_action(
     env: dict[str, Any], obj_type: str, key: str, kwargs: dict[str, Any]
 ) -> None:
-    """kind="color"（null 不可）の行はメニューを付けない — クリックで直接ダイアログ
-    のまま（従来どおり）。"""
+    """kind="color"（null 不可）の行は `ColorSwatchButton` のメニュー自体は持つ
+    （要望11: 全色行が同じ部品）が、「なし」アクションは出さない（一括で None
+    を送れない対象への操作を UI 上提示しない）。2026-09-25 に
+    `menu() is None` から反転した（`reports/color.md` §6 の既定の記載どおり）。
+    """
     scene, panel = env["scene"], env["panel"]
     obj = _add(env, new_object(obj_type, id=scene.document.new_id(), **kwargs))
     _select_only(env, obj)
 
     button = panel.field_widget_for(key)
-    assert isinstance(button, QPushButton)
-    assert button.menu() is None
+    assert isinstance(button, ColorSwatchButton)
+    menu = button.menu()
+    assert menu is not None
+    assert "なし" not in [a.text() for a in menu.actions()]
 
 
 def test_mask_color_none_action_uses_the_transparent_label(env: dict[str, Any]) -> None:
@@ -770,8 +784,7 @@ def test_mask_color_none_action_uses_the_transparent_label(env: dict[str, Any]) 
     button = panel.field_widget_for("mask_color")
     menu = button.menu()
     assert menu is not None
-    _pick_action, none_action = menu.actions()
-    assert none_action.text() == "透明（切り取り）"
+    none_action = next(a for a in menu.actions() if a.text() == "透明（切り取り）")
 
     none_action.trigger()
     assert image.mask_color is None
@@ -805,7 +818,7 @@ def test_multi_selection_edits_fill_via_color_opt_menu(env: dict[str, Any]) -> N
     button = panel.field_widget_for("fill")
     menu = button.menu()
     assert menu is not None
-    _pick_action, none_action = menu.actions()
+    none_action = next(a for a in menu.actions() if a.text() == "なし")
     none_action.trigger()
 
     assert r1.fill is None
@@ -814,9 +827,11 @@ def test_multi_selection_edits_fill_via_color_opt_menu(env: dict[str, Any]) -> N
 
 def test_multi_rect_and_line_share_stroke_row_as_plain_color(env: dict[str, Any]) -> None:
     """回帰の固定: rect（stroke=color_opt）+ line（stroke=color）を同時選択しても
-    「線色」行が消えないこと（P2契約: color/color_opt を互換扱いにし、実効 kind を
-    狭い方=color に寄せる）。line が null を許容しないので、この行にはメニューを
-    出さない（一括で None を送る操作を UI 上提示しない）。
+    「線色」行が消えないこと（color/color_opt を互換扱いにし、実効 kind を狭い方
+    =color に寄せる）。line が null を許容しないので、この行のメニューには
+    「なし」アクションを出さない（一括で None を送る操作を UI 上提示しない。
+    2026-09-25 に `menu() is None` から反転——メニュー自体は他の色行と同じ
+    `ColorSwatchButton` が常に持つため）。
     """
     scene, app, panel = env["scene"], env["app"], env["panel"]
     rect = _add(env, RectObject(id=scene.document.new_id(), x=0.0, y=0.0, width=40.0, height=30.0))
@@ -828,8 +843,10 @@ def test_multi_rect_and_line_share_stroke_row_as_plain_color(env: dict[str, Any]
 
     assert "stroke" in panel.keys_in_form(), "混在で「線色」行が消える回帰"
     button = panel.field_widget_for("stroke")
-    assert isinstance(button, QPushButton)
-    assert button.menu() is None
+    assert isinstance(button, ColorSwatchButton)
+    menu = button.menu()
+    assert menu is not None
+    assert "なし" not in [a.text() for a in menu.actions()]
 
 
 # --------------------------------------------------------------------------

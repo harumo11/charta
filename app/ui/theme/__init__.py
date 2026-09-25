@@ -9,12 +9,39 @@
 from __future__ import annotations
 
 from PySide6.QtGui import QColor, QFont, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleFactory
 
 from app.ui.theme.qss import build_qss
 from app.ui.theme.tokens import LIGHT, Theme, _set_current_theme, current_theme
 
 __all__ = ["Theme", "LIGHT", "current_theme", "apply_theme"]
+
+
+class _ChartaStyle(QProxyStyle):
+    """Fusion に「左 Alt 単押しでメニューバーへ移る」動作だけを無効化した被せもの（要望2）。
+
+    Qt の既定（Fusion）は `SH_MenuBar_AltKeyNavigation` が有効で、Alt を押して離すと
+    フォーカスの位置に関係なく `QMenuBar` がキーボードフォーカスを奪う。キャンバスの
+    テキストインプレース編集中やプロパティパネルの入力欄にフォーカスがあっても発生し、
+    IME（fcitx5）の既定の切替キー（左 Alt 単押し）と衝突して、確定前に編集フォーカスが
+    奪われる・入力中の文字が消えるという実害があった（実測は `reports/altkey.md` §2）。
+    この 1 hint だけを 0 にし、他は Fusion の挙動へそのまま委譲する。
+
+    **`QApplication.setStyle()` でアプリ全体に 1 個だけ適用すること。** ウィジェット単位の
+    `widget.setStyle(QProxyStyle(...))` は機能としては効くが、終了時に segfault することを
+    実測済みのため使わないこと（`reports/altkey.md` §2）。
+    """
+
+    def styleHint(
+        self,
+        hint: QStyle.StyleHint,
+        option: object = None,
+        widget: object = None,
+        returnData: object = None,
+    ) -> int:
+        if hint == QStyle.StyleHint.SH_MenuBar_AltKeyNavigation:
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
 
 
 def _build_palette(t: Theme) -> QPalette:
@@ -47,7 +74,7 @@ def apply_theme(app: QApplication, theme: Theme = LIGHT) -> None:
     Fusion スタイル → 現在テーマの登録 → QPalette → フォント → QSS の順で行う。
     キャンバス上のオブジェクト既定フォント（Noto Sans CJK JP）はここでは触れない。
     """
-    app.setStyle("Fusion")
+    app.setStyle(_ChartaStyle(QStyleFactory.create("Fusion")))
     _set_current_theme(theme)
 
     app.setPalette(_build_palette(theme))

@@ -20,11 +20,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import TYPE_CHECKING, Any
 
 from app.graphics import diagnostics
 from app.graphics.routing import resolved_bounding_box
+from app.graphics.strokes import FILL_TYPES
 
 if TYPE_CHECKING:
     from app.model.document import Document
@@ -35,7 +37,6 @@ CHECK_NAMES = diagnostics.CHECK_NAMES
 #: 文字採寸が必要な検査。これ以外しか要求されていないなら `QFontMetricsF` を呼ばない。
 _CHECKS_NEEDING_TEXT_METRICS = frozenset({"text_overflow"})
 
-_FILL_TYPES = frozenset({"rect", "ellipse", "curve"})
 _TEXTUAL_TYPES = frozenset({"text", "math"})
 #: `update_objects` で width/height を直接書ける型（幾何が box のもの）。
 #: line/arrow は p1/p2、connector はアンカーが真実源なので縮められない。
@@ -77,8 +78,11 @@ def _object_snapshot(
         visible=bool(obj.visible),
         z_index=z_index,
         group_id=getattr(obj, "group_id", None),
-        fill=getattr(obj, "fill", None) if obj.type in _FILL_TYPES else None,
+        fill=getattr(obj, "fill", None) if obj.type in FILL_TYPES else None,
+        stroke=getattr(obj, "stroke", None) if obj.type in FILL_TYPES else None,
+        stroke_width=(float(getattr(obj, "stroke_width", 0.0)) if obj.type in FILL_TYPES else 0.0),
         color=getattr(obj, "color", None) if obj.type in _TEXTUAL_TYPES else None,
+        background=getattr(obj, "background", None) if obj.type == "text" else None,
         has_alpha=bool(getattr(obj, "has_alpha", False)),
         text=str(getattr(obj, "text", "")),
         font_size=float(getattr(obj, "font_size", 0.0)),
@@ -240,6 +244,35 @@ def suggest_fix(
             "arguments": {"items": [{"id": obj.id, "width": 120.0, "height": 80.0}]},
             "note": "幅・高さを正の値にします（値は目安なので図に合わせて変えてください）",
         }
+    if code == "invisible":
+        # 2026-09-25 訂正: 塗りではなく線を戻す（`diagnostics.check_invisible`
+        # の docstring 参照）。開曲線に塗りを与えると塊になり（曲線は
+        # `DEFAULT_SHAPE_FILL` の対象外というユーザー決定に反する）、画像の上の
+        # 意図的な `fill=null` の枠を不透明な灰色で塗りつぶして下を隠して
+        # しまう、という 2 つの実害があったため、rect/ellipse/curve のすべてで
+        # 塗りは一切提案しない。既定値は `CurveObject`（唯一 stroke が非 None の
+        # 既定を持つ塗り型）の dataclass 既定から取り、ハードコードを避ける。
+        from app.model.objects import CurveObject
+
+        curve_defaults = {f.name: f.default for f in dataclasses.fields(CurveObject)}
+        item: dict[str, Any] = {"id": obj.id}
+        # `is_stroked`（`app.graphics.strokes`）と同じ判定にする: 空文字も
+        # None と同じ「線なし」。ここがずれると、`stroke=""` の壊れた/手編集の
+        # project.json では何も補わない corrected_call を返してしまい、送り
+        # 返しても `invisible` が消えない（収束しない修正案は嘘と同じ）。
+        if not obj.stroke:
+            item["stroke"] = curve_defaults["stroke"]
+        if obj.stroke_width <= 0.0:
+            item["stroke_width"] = curve_defaults["stroke_width"]
+        return {
+            "tool": "update_objects",
+            "arguments": {"items": [item]},
+            "note": (
+                "塗りも線も無く不可視なので線を戻します"
+                "（開曲線が塗りの塊になったり、下にある画像を塗りで隠したり"
+                "しないよう、塗りは提案しません）"
+            ),
+        }
     if code == "overlap":
         return {
             "tool": "move_objects",
@@ -328,11 +361,29 @@ def suggest_fix(
     if code == "low_contrast":
         from app.graphics import legibility
 
+        background = finding["background"]
+        color = legibility.readable_color(background)
+        if obj.opacity < 1.0 and (
+            legibility.contrast_ratio(
+                legibility.blend_over(color, background, obj.opacity), background
+            )
+            < finding["required"]
+        ):
+            # 半透明だと、文字色をどれだけ振っても合成後の色が背景側へ沈んで
+            # しまい、色の変更だけでは収束しない（`diagnostics._effective_background`
+            # の二重合成 docstring 参照）。不透明度も 1.0 に戻し、そのときの
+            # 背景（自前背景があればそれ、無ければ `background` がそのまま
+            # 不透明時の下地と一致する）に対して読める色を選び直す。
+            full_background = obj.background if obj.background is not None else background
+            color = legibility.readable_color(full_background)
+            return {
+                "tool": "update_objects",
+                "arguments": {"items": [{"id": obj.id, "color": color, "opacity": 1.0}]},
+                "note": "半透明では文字色だけでは読みやすくならないため、不透明度も 1.0 に戻します",
+            }
         return {
             "tool": "update_objects",
-            "arguments": {
-                "items": [{"id": obj.id, "color": legibility.readable_color(finding["background"])}]
-            },
+            "arguments": {"items": [{"id": obj.id, "color": color}]},
             "note": "背景に対してコントラストの取れる文字色にします",
         }
     if code == "small_text":

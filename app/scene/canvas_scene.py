@@ -9,13 +9,16 @@ from __future__ import annotations
 import math
 import sys
 import warnings
+from collections.abc import Sequence
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QUndoStack
 from PySide6.QtWidgets import QGraphicsScene
 
+from app.graphics.boxes import rotated_aabb
 from app.model.document import Document
-from app.model.objects import BaseObject
+from app.model.objects import BaseObject, binding_slots
+from app.scene.anchor_snap import logical_box_for_item
 from app.scene.items import create_item
 from app.scene.items.base_item import BaseItem
 
@@ -28,6 +31,44 @@ _GUIDE_COLOR = QColor(255, 0, 170, 200)
 #: これらのキーが変わったら orthogonal コネクタの経路を計算し直す。
 #: 経路回避は「自分の接続先以外」の図形の位置・大きさ・可視性にも依存するため。
 _REROUTE_TRIGGER_KEYS = frozenset({"x", "y", "width", "height", "rotation", "visible", "routing"})
+
+
+def _objects_bound_to(document: Document, exclude_ids: frozenset[int]) -> frozenset[int]:
+    """`exclude_ids` のいずれかへ接着チェーンで辿り着けるオブジェクトの id 集合。
+
+    `collect_snap_targets` は以前、line 1本ごとに
+    `any(routing.binding_reaches(document, mid, obj.id) for mid in exclude_ids)` を
+    呼んでいた。`binding_reaches` は内部で `Document.object_by_id`（線形走査）を
+    繰り返すため、選択オブジェクト数×未選択 line 数の掛け算で押下ごとに
+    O(選択数 × line数 × 総オブジェクト数) になり、数百オブジェクト規模で
+    押下が数百ms〜数秒ブロックしていた（finding #3/#7、性能規約 §G-8 違反）。
+
+    ここでは「id → 自分を指している側の id 一覧」の逆方向隣接表を 1 回だけ
+    総オブジェクト数ぶん作り、`exclude_ids` から逆方向に BFS する。これは
+    「obj から自分の `binding_slots` を辿って exclude_ids のどれかへ到達できるか」
+    （旧実装の判定）を転置しただけで意味は変えていない――A→B（A が B に接着）の
+    forward edge を逆にすると B→A になり、「B（を含む exclude_ids）から逆方向へ
+    到達できる集合」＝「forward に exclude_ids へ到達できる集合」に一致する。
+    `bound` に visited 相当の重複防止を持たせているため、line 同士が循環して
+    接着し合っていても（弦・line 同士の接着、§9.3）無限ループしない。
+    """
+    if not exclude_ids:
+        return frozenset()
+    dependents: dict[int, list[int]] = {}
+    for obj in document.objects:
+        for id_key, _anchor_key, _point_key in binding_slots(obj.type):
+            bound_to_id = getattr(obj, id_key)
+            if bound_to_id is not None:
+                dependents.setdefault(bound_to_id, []).append(obj.id)
+    bound: set[int] = set()
+    stack: list[int] = list(exclude_ids)
+    while stack:
+        current = stack.pop()
+        for dependent_id in dependents.get(current, ()):
+            if dependent_id not in bound:
+                bound.add(dependent_id)
+                stack.append(dependent_id)
+    return frozenset(bound)
 
 
 class CanvasScene(QGraphicsScene):
@@ -45,6 +86,9 @@ class CanvasScene(QGraphicsScene):
     #: `set_document()` で document が差し替わった（P3契約 §4.1）。`ToolManager` 等が
     #: 新 document へリスナー登録し直すために購読する。
     document_replaced = Signal()
+    #: 「入っているグループ」が変わった（グループ id か None）。ステータスバー等の
+    #: 表示用（グループ内個別編集契約 §F-1）。
+    entered_group_changed = Signal(object)
 
     def __init__(self, document: Document) -> None:
         super().__init__()
@@ -62,11 +106,32 @@ class CanvasScene(QGraphicsScene):
         self.snap_enabled: bool = True
         self.snap_guides: list[Guide] = []
 
+        # 選択移動セッション（吸着契約 §G-4）。`ToolManager._select_press` が
+        # box系メンバーの開始位置(x,y)を `begin_move_session` で登録し、
+        # `_select_move` が毎イベント `update_move_session_delta` で確定 delta を
+        # 更新する。`BaseItem._maybe_snap_position` は `session_snapped_position`
+        # 経由でこれを読み、複数選択/グループでも全員へ同じ delta を適用する
+        # （ToolManager 側の計算結果をそのまま公開するだけの単純な受け渡し役で、
+        # 判定ロジック自体は持たない）。
+        self._move_session_starts: dict[int, tuple[float, float]] | None = None
+        self._move_session_delta: tuple[float, float] | None = None
+
         # グループ選択拡張の再入防止ガード（selectionChanged フィードバックループ回避）。
         self._expanding_selection: bool = False
 
+        # 「入っているグループ」状態（PowerPoint 式のグループ内個別編集、契約 §F-1）。
+        # None の間は従来どおり「グループの誰かを選ぶと全員選択に展開される」。
+        # 非 None の間はそのグループだけ展開をスキップし、メンバー単体の選択・
+        # 編集・移動を許す。
+        self._entered_group_id: int | None = None
+
         # orthogonal コネクタの経路再計算を 1 イベントループに 1 回へまとめるフラグ。
         self._reroute_pending: bool = False
+
+        # グループ状態の再検証（findings #3/#4/#9）を 1 イベントループに 1 回へ
+        # まとめるフラグ。`_reroute_pending` と同じ合流方式（`_schedule_group_revalidate`
+        # 参照）。
+        self._group_revalidate_pending: bool = False
 
         # crop モード中の ImageItem（ビュー状態。CanvasView/ToolManager が参照する）。
         self._active_crop_item: BaseItem | None = None
@@ -113,18 +178,141 @@ class CanvasScene(QGraphicsScene):
         後続のリスナー（LayerPanel 等）にも通知が届かなくなる。
         """
         self._try_add_item_for(obj)
+        if getattr(obj, "group_id", None) is not None:
+            # 削除の undo で（入っていない）グループのメンバーが復元された場合
+            # （round2 finding #1）: 復元前から選択されていた残りのメンバーは
+            # 古い集合のままなので、そのグループが「部分選択のまま展開されて
+            # いない」状態になり得る。`_expand_group_selection` は
+            # `selectionChanged` 時にしか走らないため、ここで明示的に再検証を
+            # 予約する（`_reroute_pending` と同じ合流方式。`_schedule_group_
+            # revalidate` は entered なグループには手を出さないので、入っている
+            # グループのメンバー復元と衝突しない）。
+            self._schedule_group_revalidate()
+        if self._entered_group_id is not None and getattr(obj, "group_id", None) == (
+            self._entered_group_id
+        ):
+            # 削除の undo で入っているグループのメンバーが復元された（finding #5）。
+            # 枠（`drawForeground`）は「汚れた item 領域」だけの再描画では広がった
+            # 分の辺が描かれないままになるため、明示的にフル再描画する。
+            self.update()
         self._schedule_connector_reroute()
 
     def on_object_removed(self, obj: BaseObject) -> None:
         """`document.remove_object` の通知。対応 item を除去する。"""
+        # `remove_item_for` は item だけを消し obj 自体（group_id 含む）は変えない
+        # が、判定はこの時点の値で行う（finding #5）。
+        group_id = getattr(obj, "group_id", None)
         self.remove_item_for(obj)
+        if self._entered_group_id is not None and group_id == self._entered_group_id:
+            # 入っているグループの枠は削除されたメンバー分だけ縮む。「汚れた item
+            # 領域」だけの再描画では縮んだ辺が古いまま残るため、明示的にフル
+            # 再描画する（finding #5）。
+            self.update()
+            # 削除で入っているグループのメンバーが 2 個未満に減った場合も、
+            # `on_object_changed` の `group_id` 変化と同じ規則で自動的に出る
+            # （契約 §F-1）。削除は `group_id` を変えないのでここで判定する。
+            self._exit_entered_group_if_too_small()
         self._schedule_connector_reroute()
 
     def on_object_changed(self, obj: BaseObject, keys: tuple[str, ...]) -> None:
         """`document.set_values` の通知。対応 item をモデル値に同期する。"""
         self.sync_item(obj)
+        if "group_id" in keys and self._entered_group_id is not None:
+            # グループ構成が変わった（group/ungroup の redo/undo、Ctrl+G 等を
+            # 含む）。まず「入っている」グループのメンバーが 2 個未満に減って
+            # いたら自動的に出る（契約 §F-1）。まだ 2 個以上残っていても、
+            # 選択自体は変わらないまま選択中のものが別のグループへ移った
+            # 場合（Ctrl+G で新グループへ移る、findings #4/#9）は
+            # `selectionChanged` が発火しないため、ここで明示的に「選択にその
+            # グループのメンバーが 1 つも無いか」も見る。この 2 つはどちらも
+            # 同一 RPC/操作内で `group_objects` 等を呼んだ直後に同期的に
+            # 成立していないといけない（`tests/test_group_member_edit.py` が
+            # processEvents を挟まずに直後の状態を検査する）。
+            if not self._exit_entered_group_if_too_small():
+                self._exit_entered_group_if_unselected()
+        if self._entered_group_id is not None and (
+            getattr(obj, "group_id", None) == self._entered_group_id or "group_id" in keys
+        ):
+            # 枠（メンバー全体の外接矩形）はメンバーの幾何・構成が変わるたび
+            # フル再描画する（finding #5。「汚れた item 領域」だけの再描画だと
+            # 古い辺が残る/新しい辺が描かれない）。
+            self.update()
+        if "group_id" in keys or (
+            getattr(obj, "group_id", None) is not None and {"visible", "locked"} & set(keys)
+        ):
+            # 選択自体を変えない group_id 変化（undo/redo によるグループ化解除の
+            # 巻き戻し、エージェントのグループ化等）の後、「入っていない」
+            # グループの部分選択を全メンバーへ広げ直す（finding #3）。
+            # round2 finding #1: メンバーが再び選択可能になった場合（レイヤー
+            # パネルの目/鍵アイコンでの un-hide・unlock、undo/redo、エージェントの
+            # update_objects を含む）も同じ穴を持つ——「全体選択」は
+            # `selectable_group_members`（not locked かつ visible）で判定して
+            # いるため、非表示/ロック中は最初から部分選択扱いで正しく群展開を
+            # 免れているが、可視/ロック解除に戻った瞬間に「入っていない部分
+            # 選択」へ変わる。`selectionChanged` は発火しないので、ここで
+            # 明示的に拾う。`set_values` はマクロ内で対象数ぶん連続して呼ばれる
+            # ため、都度展開すると中間状態で誤判定しかねない——`_reroute_pending`
+            # と同じ合流方式で 1 イベントループに 1 回だけ実行する。
+            self._schedule_group_revalidate()
         if set(keys) & _REROUTE_TRIGGER_KEYS:
             self._schedule_connector_reroute()
+
+    def _exit_entered_group_if_too_small(self) -> bool:
+        """入っているグループのメンバーが 2 個未満に減っていたら出る（契約 §F-1）。
+
+        出たら True。`on_object_changed`（group_id 変化）と `on_object_removed`
+        （削除）の両方から呼ぶ（finding #5）。
+        """
+        if self._entered_group_id is None:
+            return False
+        remaining = sum(1 for o in self.document.objects if o.group_id == self._entered_group_id)
+        if remaining < 2:
+            self.set_entered_group(None)
+            return True
+        return False
+
+    def _exit_entered_group_if_unselected(self) -> None:
+        """入っているグループのメンバーが選択に 1 つも無ければ「入っている」状態を解除する。
+
+        グループ内個別編集契約 §F-1: 選択にそのグループのメンバーが 1 つも
+        無くなったら自動的に出る。`_expand_group_selection`（selectionChanged
+        時）と `on_object_changed`（Ctrl+G 等、選択を変えずに group_id だけ
+        変わったとき、findings #4/#9）の両方がこの 1 関数を通ることで、
+        判定がずれない。
+        """
+        if self._entered_group_id is None:
+            return
+        if not any(o.group_id == self._entered_group_id for o in self.selected_objects()):
+            self.set_entered_group(None)
+
+    def _schedule_group_revalidate(self) -> None:
+        """グループ状態の再検証（finding #3）を予約する（同一ターン内は 1 回にまとめる）。
+
+        `_schedule_connector_reroute` と同じ合流方式。undo/redo・複数メンバーの
+        グループ化マクロは `set_values` を対象数ぶん連続して呼ぶため、その都度
+        検証すると中間状態で誤判定しかねない。
+        """
+        if self._group_revalidate_pending:
+            return
+        self._group_revalidate_pending = True
+        QTimer.singleShot(0, self, self._revalidate_group_state)
+
+    def _revalidate_group_state(self) -> None:
+        """予約されていたグループ状態の再検証を実行する（finding #3。モデルには書かない）。
+
+        undo/redo・エージェントのグループ化等、選択そのものは変えないまま
+        group_id だけが変わった場合、`selectionChanged` が発火しないため
+        `_expand_group_selection` が走らない。ここで改めて呼ぶことで、
+        「入っていない」グループの部分選択（例: 3 メンバーのグループを undo で
+        復元したのに 1 メンバーしか選択されていない）を全メンバーへ広げ直す
+        （さもないとその後のドラッグでグループの内部レイアウトが崩れる）。
+        `_expand_group_selection` 自身が「選択にそのグループのメンバーが
+        1 つも無ければ出る」判定も兼ねるため、ここでは 2 個未満チェックだけ
+        先に行う。
+        """
+        self._group_revalidate_pending = False
+        self._exit_entered_group_if_too_small()
+        self._expand_group_selection()
 
     def _schedule_connector_reroute(self) -> None:
         """orthogonal コネクタの経路再計算を予約する（同一ターン内は 1 回にまとめる）。
@@ -169,6 +357,9 @@ class CanvasScene(QGraphicsScene):
         self._cancel_active_mask_session()
         self._cancel_active_node_edit()
         self._cancel_active_text_edit()
+        # id は document を跨いで再利用されるため、旧 document の group_id を
+        # 新 document へ持ち越さない（契約 §F-1: `set_document` で必ず解除）。
+        self.set_entered_group(None)
         for item in list(self._items.values()):
             destroy_bindings = getattr(item, "destroy_bindings", None)
             if callable(destroy_bindings):
@@ -374,15 +565,82 @@ class CanvasScene(QGraphicsScene):
         self.snap_guides = guides
         self.update()
 
-    def other_boxes_excluding(self, item: BaseItem | None) -> list[Box]:
-        """`item`（移動中アイテム）以外のスナップ吸着先 bbox 一覧を返す。
+    def snap_rect_for_item(self, item: BaseItem) -> Box | None:
+        """`item` のスナップ用 box（scene 座標、回転考慮）を返す（吸着契約 §G-3）。
 
-        line/arrow/connector（`GEOMETRY != "box"`）は x/y/width/height を真実源として
-        持たないため除外する。非表示オブジェクトもスナップ対象から除外する。
-        アートボード自身も 1 つの box として含める（縁・中央線への吸着で、
-        画像等をアートボードに余白なくフィットさせられるようにする）。
+        移動側（このアイテム自身がドラッグ対象のときの「自分の箱」）・対象側
+        （他アイテムへ吸着するときの「相手の箱」）の**両方**がこの 1 関数を通る
+        （報告書 snap.md 原因D対応: 別々に実装すると、回転済みアイテムが
+        「見えている辺」と「モデルの生の box」のどちらで判定されるか食い違う）。
+
+        - connector: 対象外（None）。
+        - line/arrow（`GEOMETRY == "endpoints"`）: `anchor_snap.logical_box_for_item`
+          （接着解決済みのライブ座標。アンカー再設計契約と同じ「唯一の真実源」）。
+        - text: `TextItem.snap_rect_local()`（背景色があれば箱全体、無ければ見えている
+          文字ブロック。報告書 snap.md 原因B対応）を `item.mapRectToScene()` で
+          scene 座標へ変換する（回転・位置は Qt の実際の変換に委譲するため、
+          手計算のずれが起きない）。
+        - それ以外の box 系（rect/ellipse/image/math/freehand/curve）:
+          `item.live_geometry()` の x/y/width/height + rotation を
+          `boxes.rotated_aabb()` で軸並行外接矩形化する。
         """
-        exclude_obj = getattr(item, "obj", None) if item is not None else None
+        obj = getattr(item, "obj", None)
+        if obj is None or obj.GEOMETRY == "connector":
+            return None
+        if obj.GEOMETRY == "endpoints":
+            box = logical_box_for_item(item)
+            if box is not None:
+                return box
+            rect = item.sceneBoundingRect()
+            return (rect.x(), rect.y(), rect.width(), rect.height())
+        snap_rect_local = getattr(item, "snap_rect_local", None)
+        if callable(snap_rect_local):
+            scene_rect = item.mapRectToScene(snap_rect_local())
+            return (scene_rect.x(), scene_rect.y(), scene_rect.width(), scene_rect.height())
+        live_geometry = getattr(item, "live_geometry", None)
+        geom = live_geometry() if callable(live_geometry) else None
+        if geom is not None and "width" in geom:
+            box: Box = (
+                float(geom["x"]),
+                float(geom["y"]),
+                float(geom["width"]),
+                float(geom["height"]),
+            )
+            return rotated_aabb(box, float(geom.get("rotation", 0.0)))
+        return (float(obj.x), float(obj.y), float(obj.width), float(obj.height))
+
+    def snap_box_for_object(self, obj: BaseObject) -> Box | None:
+        """`obj` のスナップ用 box を返す（`item_for` 経由で `snap_rect_for_item` に委譲）。
+
+        item が無い（未登録）場合のみモデル値から直接組み立てるフォールバックを持つ
+        （通常到達しない。全オブジェクトは `AddObjectCommand` で item も同時に作られる）。
+        """
+        item = self.item_for(obj)
+        if item is not None:
+            return self.snap_rect_for_item(item)
+        if obj.GEOMETRY == "connector":
+            return None
+        if obj.GEOMETRY == "endpoints":
+            x1, y1 = obj.p1
+            x2, y2 = obj.p2
+            return (min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+        return rotated_aabb((obj.x, obj.y, obj.width, obj.height), float(obj.rotation))
+
+    def collect_snap_targets(self, exclude_ids: frozenset[int] = frozenset()) -> list[Box]:
+        """吸着対象となる box 一覧（scene 座標）を返す（吸着契約 §G-3）。
+
+        押下時に 1 回だけ呼ぶことを想定する性能設計（吸着契約 §G-8。ドラッグ中の
+        各マウス移動イベントで毎回オブジェクトを走査し直さない）。
+
+        - アートボード自身を含める（縁・中央線への吸着で、画像等をアートボードに
+          余白なくフィットさせられるようにする）。
+        - `exclude_ids`（現在動かしている全オブジェクトの id）に含まれるものは除外する。
+        - connector・非表示オブジェクトは除外する。
+        - `exclude_ids` に接着している（連鎖も辿る）line/arrow は除外する――動かした
+          瞬間にその接着端も一緒に動くため、「動かないはずの吸着先」として扱うと
+          自己参照的になる（吸着契約 §G-3）。
+        """
+        bound = _objects_bound_to(self.document, exclude_ids)
         boxes: list[Box] = [
             (
                 0.0,
@@ -392,14 +650,53 @@ class CanvasScene(QGraphicsScene):
             )
         ]
         for obj in self.document.objects:
-            if obj is exclude_obj:
-                continue
-            if obj.GEOMETRY != "box":
+            if obj.id in exclude_ids:
                 continue
             if not obj.visible:
                 continue
-            boxes.append((obj.x, obj.y, obj.width, obj.height))
+            if obj.GEOMETRY == "connector":
+                continue
+            if obj.GEOMETRY == "endpoints" and obj.id in bound:
+                continue
+            box = self.snap_box_for_object(obj)
+            if box is not None:
+                boxes.append(box)
         return boxes
+
+    # ------------------------------------------------------------------
+    # 選択移動セッション（吸着契約 §G-4）
+    # ------------------------------------------------------------------
+    def begin_move_session(self, box_starts: dict[int, tuple[float, float]]) -> None:
+        """`ToolManager._select_press` が移動アーム時に呼ぶ。box系メンバーの
+        開始位置(x,y)を登録し、delta を未確定（None）に戻す。
+        """
+        self._move_session_starts = dict(box_starts)
+        self._move_session_delta = None
+
+    def update_move_session_delta(self, delta: tuple[float, float]) -> None:
+        """`ToolManager._select_move` が毎イベント呼ぶ。吸着後の確定 delta を公開する。"""
+        self._move_session_delta = delta
+
+    def end_move_session(self) -> None:
+        """`ToolManager._select_release`/`set_tool` がドラッグ終了時に呼ぶ。"""
+        self._move_session_starts = None
+        self._move_session_delta = None
+
+    def session_snapped_position(self, obj_id: int) -> tuple[float, float] | None:
+        """`obj_id` がセッション中の box系メンバーなら、吸着後の絶対座標を返す。
+
+        セッションが無い／このメンバーが対象でない／delta がまだ確定していない
+        （`_select_move` が一度も走っていない）場合は None を返し、呼び出し元
+        （`BaseItem._maybe_snap_position`）は従来の単独アイテム判定にフォール
+        バックする。
+        """
+        if self._move_session_starts is None or self._move_session_delta is None:
+            return None
+        start = self._move_session_starts.get(obj_id)
+        if start is None:
+            return None
+        dx, dy = self._move_session_delta
+        return (start[0] + dx, start[1] + dy)
 
     # ------------------------------------------------------------------
     # z順再同期（M7契約 §5）
@@ -425,27 +722,102 @@ class CanvasScene(QGraphicsScene):
         self.update()
 
     # ------------------------------------------------------------------
-    # グループ選択拡張（M7契約 §5）
+    # グループ選択拡張・グループ内個別編集（M7契約 §5、グループ内個別編集契約 §F-1）
     # ------------------------------------------------------------------
+    def entered_group_id(self) -> int | None:
+        """「入っている」グループの id を返す（入っていなければ None）。"""
+        return self._entered_group_id
+
+    def set_entered_group(self, group_id: int | None) -> None:
+        """「入っている」グループを設定する（None で解除）。同値は no-op（emit しない）。"""
+        if group_id == self._entered_group_id:
+            return
+        self._entered_group_id = group_id
+        self.entered_group_changed.emit(group_id)
+
+    def select_exactly(self, objs: Sequence[BaseObject]) -> None:
+        """選択をちょうど `objs` の集合にする（グループ内個別編集契約 §F-1）。
+
+        `objs` のうち 1 つのグループに属する部分が、そのグループの**真部分集合**
+        （そのグループの全メンバーではない）なら、そのグループへ「入って」から
+        選択する（以後 `_expand_group_selection` がそのグループを展開しない）。
+        0/複数グループに跨る一部選択、またはグループ全体そのものなら「入っている」
+        状態を解除し、通常の展開に任せる（複数グループに跨る一部選択がそれぞれ
+        正しく展開されるのは、選択確定後に 1 回だけ呼ぶ `_expand_group_selection`
+        自身の仕事）。
+
+        呼び出し順が重要（advisor 所見）: 先に `set_entered_group` してから
+        `clearSelection()` すると、`clearSelection()` が同期発火する
+        `selectionChanged`（→ `_expand_group_selection`）が「選択が空になった」
+        ことでその場で入ったばかりの状態を自動解除してしまう。`clearSelection()`
+        →（この時点の自動解除は「これから選択を丸ごと差し替える」ので無害）→
+        `set_entered_group()` → `_expanding_selection` ガード下で `setSelected`
+        の連続呼び出し（個々の呼び出しごとの展開を抑止）→ 最後に 1 回だけ
+        `_expand_group_selection()` を呼んで確定させる、の順を守る。
+        """
+        target_group_id: int | None = None
+        touched_group_ids = {o.group_id for o in objs if o.group_id is not None}
+        if len(touched_group_ids) == 1:
+            group_id = next(iter(touched_group_ids))
+            # 「選択され得るメンバー」は not locked だけでなく visible も要る
+            # （review finding #7）: Qt は非表示アイテムを選択できないため、非表示
+            # メンバーを持つグループは「ロックのみ」の判定だと全体選択に永久に
+            # 到達できず、個別編集モードへ一度も入れなくなる。判定はモデルだけで
+            # 行う `Document.selectable_group_members` に揃える（F/D2 の他の
+            # 判定箇所と共有）。
+            full_members = {o.id for o in self.document.selectable_group_members(group_id)}
+            # 判定は「objs のうちそのグループの選択可能メンバーである分」だけで行う
+            # （objs に無関係な非グループオブジェクトや非表示メンバーが混じっていても
+            # 正しく判定するため。finding #7: 非表示メンバーを含めたままだと
+            # subset_ids が full_members の部分集合になれず、展開判定自体が動かない）。
+            subset_ids = {o.id for o in objs if o.group_id == group_id and o.id in full_members}
+            if subset_ids and subset_ids < full_members:
+                target_group_id = group_id
+
+        self.clearSelection()
+        self.set_entered_group(target_group_id)
+        self._expanding_selection = True
+        try:
+            for obj in objs:
+                item = self._items.get(obj.id)
+                if item is not None:
+                    item.setSelected(True)
+        finally:
+            self._expanding_selection = False
+        self._expand_group_selection()
+
     def _expand_group_selection(self) -> None:
         """選択された item が group_id を持つ場合、同一グループの全 item を選択に加える。
 
         `_expanding_selection` で再入を防止する（`setSelected` が本メソッドの
         購読する `selectionChanged` を再発火させ得るため）。ロックされた
-        オブジェクトは選択拡張の対象から除く。
+        オブジェクトは選択拡張の対象から除く。「入っている」グループ（`entered_group_id`）
+        は展開対象から除く——これがグループ内個別編集の要（メンバー単体の選択を
+        維持できる）。選択が「入っている」グループのメンバーを 1 つも含まなく
+        なったら（空選択を含む）、自動的にそのグループから出る（契約 §F-1）。
         """
         if self._expanding_selection:
             return
-        group_ids: set[int] = set()
+        selected_objs: list[BaseObject] = []
         for item in self.selectedItems():
             obj = getattr(item, "obj", None)
-            if obj is not None and obj.group_id is not None:
+            if obj is not None:
+                selected_objs.append(obj)
+        self._exit_entered_group_if_unselected()
+        group_ids: set[int] = set()
+        for obj in selected_objs:
+            if obj.group_id is not None and obj.group_id != self._entered_group_id:
                 group_ids.add(obj.group_id)
         if not group_ids:
             return
         to_select: list[BaseItem] = []
-        for obj in self.document.objects:
-            if obj.group_id in group_ids and not obj.locked:
+        for group_id in group_ids:
+            # `selectable_group_members`（not locked かつ visible）を使う——非表示
+            # メンバーは Qt の `setSelected` が無言で no-op にする対象なので、そこへ
+            # わざわざ含めない（要望10 追加決定 Option A: 非表示メンバーは移動・
+            # 複製では剛体の一部だが、選択はできない。`CanvasScene.
+            # rigid_group_targets`/`Document.movable_group_members` が「動く」側）。
+            for obj in self.document.selectable_group_members(group_id):
                 item = self._items.get(obj.id)
                 if item is not None and not item.isSelected():
                     to_select.append(item)
@@ -532,6 +904,9 @@ class CanvasScene(QGraphicsScene):
         self._cancel_active_mask_session()
         self._cancel_active_node_edit()
         self._cancel_active_text_edit()
+        # `_detach` と同じ理由（id は再利用され得るため、古い「入っている」
+        # グループ id を残さない。グループ内個別編集契約 §F-1）。
+        self.set_entered_group(None)
         for item in list(self._items.values()):
             self.removeItem(item)
         self._items.clear()
@@ -567,6 +942,66 @@ class CanvasScene(QGraphicsScene):
             if obj is not None:
                 result.append(obj)
         return result
+
+    def rigid_group_targets(self, objs: Sequence[BaseObject]) -> list[BaseObject]:
+        """`objs` を、非表示メンバーも含めた剛体移動対象へ展開する（要望10 追加
+        決定、2026-09-25 Option A: PowerPoint 式）。
+
+        呼び出し元（レビュー3巡目 finding #7 で「ONE ヘルパ」という言い切りを
+        訂正——実際にここを通すのは人間の操作経路のみ）:
+        - `ToolManager._select_press`（既に選択済みの item を掴んだ分岐）・
+          `_promote_ctrl_add_pending`。
+        - `EditController.copy_selection`/`duplicate_selection`/
+          `EditController._selected_rigid()`（`group_selected`/
+          `delete_selected`/`bring_to_front`/`send_to_back`/`bring_forward`/
+          `send_backward` の4つの z順操作が共有する。finding #5/#6/#10/#14
+          で追加）。
+        - `ToolManager._select_press` の未選択分岐（グループをまだ選んでいない
+          press）と `PropertyPanel._add_group_xy_rows` は、既に group_id を
+          手元に持っているため `Document.movable_group_members(group_id)` を
+          直接呼ぶ（同じ展開を意味する、こちらを通す必要はない）。
+        - `align_selected`/`distribute_selected` はここを通さない
+          （メンバーを個別に揃える設計のため、グループを道連れにしない）。
+
+        中核 API（`duplicate_objects`・`delete_objects`・`group_objects`・
+        `reorder_objects`）自体はここを通さない——対象を明示的に受け取る契約の
+        まま変えない（エージェント経路が指定していない id を黙って足さない
+        ため。`duplicate_selection` のdocstring参照）。
+
+        `objs` に含まれるオブジェクトの `group_id` ごとに、そのグループの
+        `Document.selectable_group_members`（選べる全メンバー、非表示除く）が
+        `objs` に**すべて**含まれているか見る。含まれていれば「グループ全体を
+        指している」とみなし、`Document.movable_group_members`（ロックのみ除く、
+        非表示含む）との差分——ロックされていない非表示メンバー——を戻り値へ
+        追加する。含まれていなければ（人間が意図的に一部だけ選んだ／エージェントが
+        明示的に一部の id だけを渡した）何も足さない。
+
+        「入っている」グループ（`entered_group_id`）はグループ内個別編集の対象
+        なので展開しない——ここを展開してしまうと、メンバー単体をドラッグした
+        つもりが非表示の兄弟まで一緒に動いてしまい、グループ内個別編集契約
+        §F-2 の「入っている間はメンバー単体だけを動かす」が破れる。
+
+        「選べる全メンバーが揃っているときだけ足す」という判定にすることで、
+        どんな入力に対しても安全に呼べる（部分選択を誤って全体扱いしない）。
+        """
+        present_ids = {o.id for o in objs}
+        group_ids = {
+            gid
+            for o in objs
+            if (gid := getattr(o, "group_id", None)) is not None and gid != self._entered_group_id
+        }
+        if not group_ids:
+            return list(objs)
+        extra: list[BaseObject] = []
+        for group_id in group_ids:
+            selectable_ids = {o.id for o in self.document.selectable_group_members(group_id)}
+            if not selectable_ids or not selectable_ids <= present_ids:
+                continue
+            for member in self.document.movable_group_members(group_id):
+                if member.id not in present_ids:
+                    extra.append(member)
+                    present_ids.add(member.id)
+        return list(objs) + extra if extra else list(objs)
 
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:
         """アートボード背景色を塗り、続けてグリッド（可視時）を描く。"""

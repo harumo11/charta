@@ -12,15 +12,13 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFontComboBox,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -48,6 +46,7 @@ from app.prefs import (
     STROKE_WIDTH_MIN,
     Preferences,
 )
+from app.ui.widgets import ColorSwatchButton, FontFamilyCombo
 
 #: パレット未選択を表す QComboBox の userData（"" = palette_id 上も「なし」と一致）。
 _NO_PALETTE_DATA = ""
@@ -170,7 +169,10 @@ class PrefsDialog(QDialog):
         combo = self._initial_color_combo
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("既定（黒）", None)
+        # 2026-09-25: 矩形/楕円は線なしが既定になったため、この初期色は
+        # 線を既定で持つ型（line/arrow/freehand/connector/curve）の線色と
+        # text/math の文字色にしか効かない（rect/ellipse には効かない）。
+        combo.addItem("既定（黒・線/文字色のみ）", None)
         if palette is not None:
             for color in palette.colors:
                 combo.addItem(_color_icon(color), color, color)
@@ -198,6 +200,9 @@ class PrefsDialog(QDialog):
             self._on_register_styles is not None and palette is not None
         )
         self._register_button.setText("このプロジェクトに styles として登録")
+        # 背景色ボタンのメニューも、ダイアログ内で選択中のパレットに追従させる
+        # （まだ OK していない選択でも、その場でメニューの色が変わる方が自然）。
+        self._bg_button.set_palette(palette)
 
     def _on_register_clicked(self) -> None:
         if self._on_register_styles is None:
@@ -221,18 +226,18 @@ class PrefsDialog(QDialog):
         group = QGroupBox("新規オブジェクトの既定")
         form = QFormLayout(group)
 
-        self._font_combo = QFontComboBox()
-        self._font_combo.setCurrentFont(QFont(prefs.default_font_family))
-        # ユーザーが実際にフォント欄を操作したかのダーティフラグ（所見 S7）。
-        # 未インストール／別名のファミリを `setCurrentFont` すると `QFontComboBox`
-        # は近縁の別ファミリへ自動的に置き換わる（実測: "Helvetica" ->
-        # "Nimbus Sans [UKWN]"）。無条件に `currentFont().family()` を採用すると、
-        # 自動保存間隔だけ変えて OK を押した等、フォント欄に触れていない操作でも
-        # 既定フォントが無言で書き換わってしまう。接続は初期値設定の**後**に
-        # 行う（プログラム的な `setCurrentFont` で誤ってダーティにしないため、
-        # 上のパレットコンボと同じ流儀）。
+        self._font_combo = FontFamilyCombo()
+        self._font_combo.set_family(prefs.default_font_family)
+        # ユーザーが実際にフォント欄を操作したかのダーティフラグ（要望1で
+        # `QFontComboBox` から `FontFamilyCombo` に置き換えても同じ意味を保つ）。
+        # `FontFamilyCombo.family_chosen` は `activated`（ユーザー操作）でしか
+        # 発火しないため、無条件に採用しても自動保存間隔だけ変えて OK を押した
+        # 等の無関係な操作で既定フォントが書き換わることはないが、契約どおり
+        # 明示的なダーティフラグとして残す（`_collect_font_family` の分岐・
+        # 既存テストの意味を保つ）。
         self._font_dirty = False
-        self._font_combo.currentFontChanged.connect(self._on_font_changed)
+        self._font_value = prefs.default_font_family
+        self._font_combo.family_chosen.connect(self._on_font_changed)
         form.addRow("フォント", self._font_combo)
 
         self._font_size_spin = QDoubleSpinBox()
@@ -271,8 +276,9 @@ class PrefsDialog(QDialog):
 
         return group
 
-    def _on_font_changed(self, _font: QFont) -> None:
+    def _on_font_changed(self, value: str) -> None:
         self._font_dirty = True
+        self._font_value = value
 
     # ------------------------------------------------------------------
     # セクション3: 新規アートボードの既定
@@ -305,9 +311,10 @@ class PrefsDialog(QDialog):
         form.addRow("DPI", self._artboard_dpi_spin)
 
         self._bg_color_value = prefs.artboard_background
-        self._bg_button = QPushButton()
-        self._apply_bg_button_color(self._bg_color_value)
-        self._bg_button.clicked.connect(self._on_bg_button_clicked)
+        self._bg_button = ColorSwatchButton(nullable=False)
+        self._bg_button.set_palette(self._current_palette())
+        self._bg_button.set_value(prefs.artboard_background)
+        self._bg_button.color_chosen.connect(self._on_bg_chosen)
         form.addRow("背景色", self._bg_button)
 
         note = QLabel("新規作成時に適用（現在のドキュメントは変わりません）")
@@ -316,25 +323,11 @@ class PrefsDialog(QDialog):
 
         return group
 
-    def _apply_bg_button_color(self, color: str) -> None:
-        self._bg_color_value = color
-        self._bg_button.setText(color)
-        self._bg_button.setStyleSheet(f"background-color: {color};")
-
-    def _on_bg_button_clicked(self) -> None:
-        # DontUseNativeDialog: ネイティブ色ダイアログの環境（実測: xcb + GNOME）
-        # では `QColorDialog.setCustomColor` で載せたパレットスウォッチが表示
-        # されない（所見 S1）。この画面自体はパレットの表示先ではないが、
-        # 統一のため他の色選択ボタンと同じオプションを付ける。
-        color = QColorDialog.getColor(
-            QColor(self._bg_color_value),
-            self,
-            "背景色",
-            options=QColorDialog.ColorDialogOption.DontUseNativeDialog,
-        )
-        if not color.isValid():
-            return
-        self._apply_bg_button_color(color.name())
+    def _on_bg_chosen(self, value: str | None) -> None:
+        # 非 nullable（`nullable=False`）なので None は来ないはずだが、
+        # `color_chosen` のシグネチャ（`object`）に合わせてガードしておく。
+        if value is not None:
+            self._bg_color_value = value
 
     # ------------------------------------------------------------------
     # セクション4: 自動保存・書き出し
@@ -415,21 +408,17 @@ class PrefsDialog(QDialog):
 
     def _collect_font_family(self, unchanged_value: str) -> str:
         """フォント欄が実際に操作されていれば新しい family を、そうでなければ
-        `unchanged_value`（元の prefs 値）をそのまま返す（所見 S7）。
+        `unchanged_value`（元の prefs 値）をそのまま返す。
 
-        採用時は `QFontDatabase` のファウンドリ接尾辞（例:
-        "Nimbus Sans [UKWN]" の " [UKWN]"）を除去する。この接尾辞込みの文字列が
-        `TextObject.font_family` に入ると SVG の `font-family` へそのまま出力され、
-        角括弧付きは正当な CSS ファミリ名ではないため閲覧側でフォールバックする
-        （出力品質を損なう）。
+        `FontFamilyCombo.family_chosen` は `app/model/fonts.py::strip_foundry_suffix`
+        済みの値をユーザー操作（`activated`）でだけ運ぶため、この関数は
+        `_on_font_changed` が記録した値をそのまま採用するだけでよい（旧
+        `QFontComboBox` 時代はここで角括弧接尾辞（例 "Nimbus Sans [UKWN]"）を
+        剥がしていたが、その責務はコンボ自身に移った）。
         """
         if not self._font_dirty:
             return unchanged_value
-        family = self._font_combo.currentFont().family()
-        bracket = family.find(" [")
-        if bracket != -1 and family.endswith("]"):
-            family = family[:bracket]
-        return family
+        return self._font_value
 
     def accept(self) -> None:  # noqa: D102 (Qt override、docstring はクラス docstring 参照)
         self._edited_prefs = self._collect_prefs()

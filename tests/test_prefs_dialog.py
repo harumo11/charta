@@ -10,8 +10,7 @@ from typing import Any
 
 import pytest
 import shiboken6
-from PySide6.QtGui import QColor, QFont, QGuiApplication
-from PySide6.QtWidgets import QColorDialog
+from PySide6.QtGui import QGuiApplication
 
 from app.commands.commands import SetPropertyCommand
 from app.model.document import Document
@@ -19,6 +18,7 @@ from app.model.palettes import PALETTES, palette_by_id
 from app.prefs import Preferences, load_prefs, prefs_path, save_prefs
 from app.ui.main_window import MainWindow
 from app.ui.prefs_dialog import PrefsDialog
+from app.ui.widgets import SimpleColorDialog
 
 _MATERIAL = palette_by_id("material")
 assert _MATERIAL is not None
@@ -119,9 +119,14 @@ def test_accept_preserves_fields_not_shown_in_dialog(qapp: Any) -> None:
 def test_background_color_button_updates_edited_prefs(
     qapp: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(lambda *a, **k: QColor("#123456")))
+    """2026-09-25（要望8/11/12）: 背景色ボタンは `ColorSwatchButton` に統一した。
+    `.click()` は（メニュー付きボタンなので）メニューを開くだけで `clicked` を
+    発火しない。「色を選択…」アクションを直接 trigger する。
+    """
+    monkeypatch.setattr(SimpleColorDialog, "get_color", staticmethod(lambda *a, **k: "#123456"))
     dialog = PrefsDialog(Preferences())
-    dialog._bg_button.click()
+    pick_action = next(a for a in dialog._bg_button.menu().actions() if a.text() == "色を選択…")
+    pick_action.trigger()
     dialog.accept()
     assert dialog.edited_prefs().artboard_background.lower() == "#123456"
 
@@ -166,27 +171,30 @@ def test_font_untouched_preserves_original_family_even_if_widget_normalizes(qapp
 
 
 def test_font_touched_marks_dirty_and_adopts_new_family(qapp: Any) -> None:
+    """2026-09-25（要望1）: フォント欄は `FontFamilyCombo` に統一した。値の確定は
+    `activated`（ユーザー操作）でだけ起きるため、`setCurrentFont` の代わりに
+    実際のユーザー操作を模して `activated` を発火させる。
+    """
     dialog = PrefsDialog(Preferences(default_font_family="Noto Sans CJK JP"))
     assert dialog._font_dirty is False
-    dialog._font_combo.setCurrentFont(QFont("Arial"))
+    combo = dialog._font_combo
+    assert combo.count() > 0
+    combo.setCurrentIndex(0)
+    combo.activated.emit(0)
     assert dialog._font_dirty is True
     dialog.accept()
-    assert dialog.edited_prefs().default_font_family == dialog._font_combo.currentFont().family()
+    assert dialog.edited_prefs().default_font_family == combo.family()
 
 
 def test_collect_font_family_strips_foundry_suffix_when_dirty(qapp: Any) -> None:
-    """`QFontDatabase` のファウンドリ接尾辞（例 "Nimbus Sans [UKWN]"）付きの文字列が
-    そのまま `font_family` に入ると SVG の `font-family` として不正になる。"""
-
-    class _FakeCombo:
-        def currentFont(self) -> QFont:
-            font = QFont()
-            font.setFamily("Nimbus Sans [UKWN]")
-            return font
-
+    """`FontFamilyCombo.family_chosen` は `app/model/fonts.py::strip_foundry_suffix`
+    済みの値をユーザー操作（`activated`）でだけ運ぶため、この責務はコンボ自身に
+    移った（D1 の `tests/test_widget_font_family_combo.py` が単体で固定する）。
+    ここではダイアログ側がその値をそのまま採用するだけであることを固定する。
+    """
     dialog = PrefsDialog(Preferences())
     dialog._font_dirty = True
-    dialog._font_combo = _FakeCombo()
+    dialog._font_value = "Nimbus Sans"  # `family_chosen` が運んできた想定の値
     assert dialog._collect_font_family("ignored") == "Nimbus Sans"
 
 
@@ -283,12 +291,19 @@ def test_main_window_autosave_timer_active_by_default(window: Any) -> None:
     assert window._autosave_timer.isActive()
 
 
-def test_apply_palette_swatches_loads_qcolordialog_custom_colors(qapp: Any) -> None:
+def test_property_panel_and_mask_panel_get_the_saved_palette_on_construction(qapp: Any) -> None:
+    """2026-09-25（要望8/11/12）: `QColorDialog.setCustomColor`（プロセス全体の
+    static state）は廃止し、`PropertyPanel`/`MaskEditPanel` へ直接 `prefs` を
+    渡す方式に置き換えた（`MainWindow._apply_palette_swatches` は削除済み）。
+    構築時点で両パネルが保存済みのパレットを認識していることを固定する。
+    """
     save_prefs(Preferences(palette_id=_MATERIAL.id))
     w = MainWindow()
     try:
-        for i, color in enumerate(_MATERIAL.colors):
-            assert QColorDialog.customColor(i).name().lower() == color.lower()
+        assert w.property_panel._palette is not None
+        assert w.property_panel._palette.id == _MATERIAL.id
+        assert w.mask_edit_panel._color_button._palette is not None
+        assert w.mask_edit_panel._color_button._palette.id == _MATERIAL.id
     finally:
         w.close()
 
@@ -333,7 +348,11 @@ def test_open_preferences_accept_persists_and_applies(
     assert window.prefs.autosave_interval_s == 0
     assert not window._autosave_timer.isActive()
     assert load_prefs().palette_id == _MATERIAL.id
-    assert QColorDialog.customColor(0).name().lower() == _MATERIAL.colors[0].lower()
+    # `_apply_palette_swatches`（`QColorDialog.setCustomColor`）は廃止済み。
+    # 新しいパレットは `refresh_palette()` 経由で両パネルへ直接反映される。
+    assert window.property_panel._palette is not None
+    assert window.property_panel._palette.id == _MATERIAL.id
+    assert window.mask_edit_panel._color_button._palette.id == _MATERIAL.id
     # `self.prefs` は参照を差し替えず中身だけ更新するため、コンストラクタで同じ
     # オブジェクトを受け取った ToolManager/ExportController からも新しい値が
     # 即座に見える（`_update_prefs_in_place` の存在理由そのもの）。
@@ -410,6 +429,13 @@ def test_open_preferences_clears_style_memory_when_creation_defaults_change(
     従来は sticky defaults(style memory)が永久に勝ち続けていた。
     `open_preferences` が作成既定の変化を検知して `clear_style_memory()` を
     呼ぶことで、変更後の最初の生成から新しい既定が効くようにする。
+
+    rect/ellipse は 2026-09-25 決定で stroke の既定が None（線なし）になり、
+    `initial_color` の影響を受けなくなった（`reports/rectdefault.md` §3。
+    `_apply_pref_defaults` は dataclass 既定が None のフィールドを色で
+    埋めない）。この検証テストの主題は「style memory のリセット」であって
+    rect 固有の初期色挙動ではないので、`initial_color` が従来どおり効く
+    line で検証する。
     """
     from PySide6.QtCore import QPointF, Qt
 
@@ -418,7 +444,7 @@ def test_open_preferences_clears_style_memory_when_creation_defaults_change(
             return Qt.MouseButton.LeftButton
 
     tm = window.tool_manager
-    tm.set_tool("rect")
+    tm.set_tool("line")
     tm.handle_mouse_press(_FakeEvent(), QPointF(10, 10))
     tm.handle_mouse_move(_FakeEvent(), QPointF(110, 90))
     tm.handle_mouse_release(_FakeEvent(), QPointF(110, 90))
@@ -440,7 +466,7 @@ def test_open_preferences_clears_style_memory_when_creation_defaults_change(
     monkeypatch.setattr("app.ui.main_window.PrefsDialog", _FakeDialog)
     window.open_preferences()
 
-    tm.set_tool("rect")
+    tm.set_tool("line")
     tm.handle_mouse_press(_FakeEvent(), QPointF(200, 200))
     tm.handle_mouse_move(_FakeEvent(), QPointF(260, 240))
     tm.handle_mouse_release(_FakeEvent(), QPointF(260, 240))
@@ -533,21 +559,48 @@ def test_offscreen_titlebar_geometry_falls_back_to_default_logic(qapp: Any) -> N
 
 
 # --------------------------------------------------------------------------
-# QColorDialog: ネイティブダイアログ回避オプション（所見 S1）
+# 色ダイアログ: 唯一の経路が SimpleColorDialog であること（要望12）
 # --------------------------------------------------------------------------
 
 
-def test_bg_button_requests_non_native_color_dialog(
+def test_bg_button_pick_action_opens_the_simple_color_dialog(
     qapp: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`grep -rn QColorDialog app/` が 0 件になった（`QColorDialog` はアプリから
+    完全に消えた）ことの一角。背景色ボタンの「色を選択…」も
+    `SimpleColorDialog.get_color` の1関数だけを通ることを固定する。
+    """
     captured: dict[str, Any] = {}
 
-    def _fake_get_color(*args: Any, **kwargs: Any) -> QColor:
-        captured.update(kwargs)
-        return QColor()  # invalid → ボタンの色は変えない
+    def _fake_get_color(*args: Any, **kwargs: Any) -> None:
+        captured["called"] = True
+        return None  # キャンセル相当 → ボタンの色は変えない
 
-    monkeypatch.setattr(QColorDialog, "getColor", staticmethod(_fake_get_color))
+    monkeypatch.setattr(SimpleColorDialog, "get_color", staticmethod(_fake_get_color))
     dialog = PrefsDialog(Preferences())
-    dialog._bg_button.click()
+    pick_action = next(a for a in dialog._bg_button.menu().actions() if a.text() == "色を選択…")
+    pick_action.trigger()
 
-    assert captured.get("options") == QColorDialog.ColorDialogOption.DontUseNativeDialog
+    assert captured.get("called") is True
+
+
+def test_qcolordialog_is_not_used_anywhere_in_the_app() -> None:
+    """色ダイアログの唯一の経路が `SimpleColorDialog` であること（要望8/11/12）を、
+    `app/` 配下のどのファイルにも `QColorDialog`/`setCustomColor` という文字列が
+    一切現れないことで固定する（契約 §5 の「`grep -rn QColorDialog app/` が
+    0 件」を文字どおり満たす。コメント・docstring 内の「かつて使っていた」という
+    説明も、正規表現の抜け道になる import 文の書き方（複数行 import・エイリアス・
+    `getattr` 経由の間接参照）を見逃さないためにも、2026-09-25 の doc パスで
+    すべて「Qt 標準の色ダイアログ」等の言い換えへ改めた。以前はコメント/docstring
+    行をスキップする緩い正規表現だったため、複数行 import やエイリアス経由の
+    呼び出しをすり抜けていた——このテストはそれ自体の回帰でもある）。
+    """
+    import pathlib
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    offenders: list[str] = []
+    for path in (repo_root / "app").rglob("*.py"):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if "QColorDialog" in line or "setCustomColor" in line:
+                offenders.append(f"{path}:{lineno}:{line.strip()}")
+    assert offenders == [], f"QColorDialog/setCustomColor がまだ言及されている: {offenders}"

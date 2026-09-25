@@ -144,11 +144,20 @@ myproject/
 **rect / ellipse**（塗り+線を持つ図形）
 | フィールド | 型 | 説明 |
 |---|---|---|
-| `fill` | str or null | 塗り色 `#RRGGBB` / null=透明 |
-| `stroke` | str or null | 線色。**null=線なし**（`fill` の塗りなしと対称。2026-08-21 項目12） |
+| `fill` | str or null | 塗り色 `#RRGGBB` / null=透明。**既定 `DEFAULT_SHAPE_FILL`（`#D9D9D9`）**（2026-09-25 要望9） |
+| `stroke` | str or null | 線色。**null=線なし**（`fill` の塗りなしと対称。2026-08-21 項目12）。**既定 null**（2026-09-25 要望9） |
 | `stroke_width` | float | 線幅。**0 も線なし**（画面・SVG ともに描かない。判定は `app/graphics/strokes.is_stroked` に一本化） |
 | `dash` | str | "solid"/"dash"/"dot" |
 | `corner_radius` | float | rect のみ・角丸半径 |
+
+> 注釈（既定値・2026-09-25 ユーザー決定）: rect/ellipse の既定は「**線なし＋薄いグレー塗り**」。
+> 線なし（stroke=null）と塗りなし（fill=null）の両立は新規図形を完全に不可視にするため、塗りを
+> 既定で持たせた。既定は dataclass 側に置く（人間のツールとエージェントの `create_objects` が同じ
+> 既定を使う。§9.3 の routing と同じ理由で tool_manager だけを変えない）。新規矩形は不透明なので、
+> 画像の上に枠だけを描くときは塗りを「なし」にする。**curve は対象外**（開曲線が塗りの塊になる
+> ため、従来どおり黒線・塗りなし）。環境設定の「新規図形の初期色」は **dataclass 既定が null の
+> フィールドを色で埋めない**（`ToolManager._apply_pref_defaults`）ので rect/ellipse には効かない。
+> 旧 project.json は fill/stroke を明示保存しているので見た目は変わらない。
 
 > 注釈: line/arrow/freehand/connector の `stroke` は非 null（`str`）のまま。線そのものが
 > 実体のオブジェクトを不可視にすると「削除すべきものが図に残る」だけになるため
@@ -180,7 +189,8 @@ myproject/
 | `bold`, `italic`, `underline` | bool | — |
 | `color` | str | 文字色 |
 | `align` | str | "left"/"center"/"right" |
-| `valign` | str | "top"/"middle"/"bottom"（既定 "top"。vertical-align 語彙。align が CSS 語彙のため "center" は使わず、取り違えを避ける） |
+| `background` | str or null | 背景色。null=背景なし。**箱全体（0,0,width,height）**を塗る（2026-09-25 要望4）。名前を `fill` にしないのは styles.py の「text と図形の見た目キーを暗黙に読み替えない」方針と、複数選択パネルがキー名で共通行を作る（rect の「塗り」と統合されてしまう）ため |
+| `valign` | str | "top"/"middle"/"bottom"（**既定 "middle"**。2026-09-25 要望7 で "top" から変更。`valign` キーの無い旧ファイル（2026-08-07 の導入前）は `TextObject._from_dict_own` が "top" で読む。vertical-align 語彙。align が CSS 語彙のため "center" は使わず、取り違えを避ける） |
 
 **math**（数式）
 | フィールド | 型 | 説明 |
@@ -225,6 +235,11 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 `export/svg_exporter.py` で `Document` を走査し、オブジェクトごとに SVG 要素を生成する。理由は Qt の `QSvgGenerator` が SVG アイテム・画像・フォントで劣化/欠落を起こすため（検証済み）。
 - rect/ellipse/line/arrow/freehand/curve → ネイティブ SVG 要素（`<rect>`,`<ellipse>`,`<path>` 等）。矢じりは `<marker>` 定義。curve は `<path fill-rule="evenodd">`（画面の `QPainterPath` 既定 `OddEvenFill` と一致させるため。`app/graphics/curves.py` の `curve_segments`/`path_d` を画面（`CurveItem`）と共有し、d 属性の食い違いを構造的に防ぐ）。
 - text → 既定は `<text>`（編集可能なまま。フォント依存の警告を出す）。アウトライン化 ON 時は `QPainterPath.addText` → パスの `d` 属性（2026-08-02 に既定を反転。上記 PDF 節の経緯参照）。
+  背景色（`background`）は両分岐とも `<rect>` を先頭に出す（空テキストでも背景は出す）。
+  **背景あり＋不透明度 < 1 のときだけ、opacity を `<g>` ではなく子要素（背景 `<rect>` と文字）ごとに
+  付ける**——Qt（画面/PNG/PDF）はアイテムの不透明度を描画命令ごとに合成するため、`<g opacity>`
+  （グループを 1 回合成）だと文字色が画面と食い違う。背景なし・不透明度 1 の出力は従来とバイト単位で同一。
+  rect/ellipse の塗り＋線で同種の差が残っている（既存・範囲外）。
 - image → `<image>` に Base64 埋め込み。クロップ・補正を反映した最終ビットマップを埋める。
 - math → matplotlib が生成した数式 SVG を `<g transform=...>` として**そのまま入れ子挿入**（ベクター保持）。
 - z順は要素の出力順で表現。回転・不透明度は `transform` / `opacity` 属性。
@@ -260,7 +275,8 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
 - **当たり判定（2026-08-21 項目11）**: `RectEllipseItem.shape()` は**塗りの有無で分岐**する——
   塗りあり（`fill` が非 None）は輪郭パスと帯の和、**塗りなしは輪郭沿いの帯（最小 8px）だけ**。
   Illustrator / Inkscape の標準挙動で、注釈用の枠に重なった線を掴めるようにするのが目的。
-  `RectObject.fill` の既定は `None` なので**ほぼ全ての矩形が対象**になる（意図どおり）。
+  2026-09-25 に rect/ellipse の `fill` 既定が `#D9D9D9` になったため（要望9）、この素通しが
+  効くのは**ユーザーが塗りを「なし」にした矩形/楕円**（画像の上の枠など）だけになった。
   楕円は `addEllipse` なので bbox 四隅の外側はヒットしない（副次バグの解消）。
   z 順を無視した「線を常に優先」は**入れない**（塗りありの矩形が上にあるならそれが選ばれる）。
   - **`boundingRect` は帯の半分（最小 4px）を下限にする**。さもないと Qt の BSP インデックスが
@@ -272,33 +288,122 @@ Qt 検証結果（「## 4」）に基づき、形式ごとに経路を分ける�
     退化する（水平線の AABB は高さ 0、斜め線は外接矩形が広大）ので `shape()` 判定のまま。
   - ラバーバンド選択（`IntersectsItemShape`）は**囲めば従来どおり選択できる**（帯に交差するため）。
     矩形の内部だけを通るマーキーでは選択されない。
+  - **左クリック（選択ツール）と右クリック（コンテキストメニュー）の拾いは `app/scene/hit.py::
+    topmost_item_at` に一本化**（2026-09-25）。Qt の press 配送と同じデバイス px 矩形のクエリ
+    （`view.items(view.mapFromScene(pos))` 相当）で、厳密な点クエリとは縁の近傍で結果が違う。
+    左クリックはそのボタンを受け付ける item に絞るが、右クリックは `button=None`（NoButton の装飾
+    だけを除外）で引く——選択ハンドルは LeftButton しか受け付けないので、右ボタンで絞ると
+    ハンドルを飛ばして下の別オブジェクトにメニューが効いてしまう（親をたどって持ち主へ戻す）。
+    エージェントのハイライト（`HighlightItem`）は `shape()` を空にして当たり判定から外してある
+    （さもないとハイライト中のオブジェクトをドラッグすると画面だけ動いてモデルが動かない）。
+- **クリックとドラッグの判定は画面 px**（`ToolManager._DRAG_START_SCREEN_PX = 3.0` を
+  `scene_threshold` でシーン距離へ換算）。`_MOVE_EPS`（シーン 1px）は作図/フリーハンド/
+  コネクタの縮退判定にだけ残る。縮小表示で「ただのクリック」が吸着で 20px 動く事故を防ぐ。
+
+### 9.1a グループ内の個別編集（2026-09-25 要望10）
+- **PowerPoint 式**: グループのメンバーを 1 回クリックするとグループ全体が選択され、**選択中の
+  メンバーを動かさずにもう一度クリックすると、そのグループに「入り」そのメンバーだけが選択**される
+  （プロパティパネルはそのメンバーの単一フォームになる）。入っている間は同じグループの別メンバーの
+  クリックでそのメンバーに絞り込み、ドラッグは選択中のものだけを動かす（`group_id` は保たれる）。
+  グループ外をクリックすると自動的に出る。ダブルクリックの既存動作（テキスト編集・crop・
+  ノード編集・LaTeX）は変えていない。
+- 状態は `CanvasScene.entered_group_id()` / `set_entered_group()` / シグナル
+  `entered_group_changed`。`_expand_group_selection` は入っているグループを展開しない。
+  選択にそのグループのメンバーが無くなる・`set_document`・グループ構成の変化（undo を含む）で
+  自動解除。`CanvasScene.select_exactly(objs)` は選択をちょうどその集合にする（1 つのグループの
+  一部だけならそのグループに入る）——レイヤーパネルの行クリックとエージェントの
+  `set_selection` がこれを使う。
+- 入っている間はグループ全体の外接矩形を破線で `CanvasView.drawForeground` に描く（書き出しに
+  写らない）。**Esc の優先順位**: テキスト編集 > crop > マスク編集 > ノード編集 > アートボードの
+  グリップドラッグ > curve 下書き > ドラッグ中（マウスボタン押下中は Esc でグループを出ない）>
+  グループから出る（グループ全体の選択に戻る）。
+- グループ解除（UI の `ungroup_selected`）はメンバーが 1 個だけ選択されていても**グループ全体**を
+  解除する（エージェントの `order_objects("ungroup")` は従来どおり一部だけ解除できる）。
+  **単独メンバーのグループを作らない**: 入った状態での Ctrl+G・削除・一部の複製/貼付の後に
+  1 個だけ残ったグループは解除する。複製/貼付のクローンは z 順で積む。
+- **非表示メンバー（Option A・主セッション決定）**: ロックされていない非表示メンバーは選択も
+  当たり判定もできないが、グループの一員として**移動・パネルの X/Y・複製・貼付・削除・
+  グループ化・z 順操作で可視メンバーと一緒に動く**。ロックされたメンバーは従来どおり動かない。
+  判定は `Document.selectable_group_members`（ロックなし＋可視＝「選べる/入れる」）と
+  `Document.movable_group_members`（ロックなし＝「動く」）の 2 つに一本化し、人間の操作経路は
+  `CanvasScene.rigid_group_targets` を通す。吸着の幾何と破線枠は可視メンバーだけで作る。
+- グループ全体（ちょうど 1 グループの全メンバー）を選んだときのパネルの X/Y はグループの外接矩形の
+  左上を示し、編集すると全メンバーを同じ差分だけ平行移動する（`TranslateGroupCommand`、1 undo）。
+  グループに**入っている間**は、ドラッグと同じく選択中のメンバーだけを動かす。
+  幅/高さ/回転の行は出さない（以前は X を書くと全メンバーの x が同じ値になりグループが崩れた）。
+
+### 9.1b 吸着（スマートガイド、2026-09-25 要望13）
+- 閾値は**画面 px**（`app/scene/snapping.py::ALIGN_SNAP_SCREEN_PX = 8`）をビューの拡大率で
+  シーン距離へ換算（`anchor_snap.scene_threshold` と同じ換算）。以前のシーン 6px 固定は、
+  アートボード自動フィット後の縮小表示で画面 2〜3px しかなく「吸着しない」原因だった。
+- 軸ごとに**オブジェクト/アートボードの線（左/中央/右・上/中央/下）を優先し、閾値内に無いときだけ
+  グリッド**。吸着に使う矩形は移動側・対象側で同じ関数（`CanvasScene.snap_rect_for_item`）:
+  回転した box は回転後の外接矩形、text は**背景色があれば箱、無ければ見えている文字ブロック**
+  （`TextItem.snap_rect_local`）、line/arrow は実効端点の外接矩形。コネクタ・非表示・移動中の
+  もの自身・移動中のものに接着している線（`binding_reaches`）は対象外。
+- **移動は 1 回だけ計算した差分を全員に適用**（押下時に移動セッション、全体の外接矩形で吸着）。
+  複数選択・グループ・line/arrow の本体ドラッグ（両端が自由なとき）も吸着する。プレビューと
+  確定は同じ差分から作る。リサイズは動いている辺だけを吸着（回転 0 のとき。縦横比固定は主辺を
+  吸着して他方を比から計算）。rect/ellipse のドラッグ作成の角も吸着（プレビューと確定が同じ関数）。
+- ガイド `("v", x)` / `("h", y)` は `drawForeground` に描くので書き出しに写らない。吸着 OFF
+  （表示メニュー/環境設定）ですべて無効。
 
 ### 9.2 プロパティパネル
 - 選択オブジェクトの型に応じてフィールドを動的生成。**数値直接入力**（x/y/幅/高さ/回転/線幅）を必須とする（ドラッグに加え厳密指定できることが研究図で重要）。
 - 変更は必ず `QUndoCommand` 経由でモデルに適用（パネルから直接モデルを書き換えない）。
-- **行の体裁（2026-08-21 項目3・4）**: セクション見出し（「変形」「スタイル」「アートボード」）は
-  `QFormLayout.addRow(widget)` の**独立スパン行**として出す。以前はラベル欄に縦 2 段で埋め込んで
-  いたため（旧 `_HeaderedLabel`）、その行だけ**ラベル文字の中心が入力欄より 22px 下にずれて**いた
-  （`QFormLayout` は行がフィールドより高いときフィールドを上寄せする）。見出しの位置は
-  `PropSpec.section`（`app/model/properties.py`・Qt 非依存）で**データとして持つ**——
-  従来の「`COMMON_PROPS` に無い最初のキー」という推論は x/y を持たない line/arrow で
-  「スタイル」を始点（`p1`）行に付けてしまっていた。
+- **行の並びとグループ（2026-09-25 要望5・6）**: セクション見出し（「変形」「スタイル」
+  「アートボード」）は**廃止**した（ユーザー要望: 何の助けにもならない）。代わりに各
+  `PropSpec.group`（`GROUP_*` 定数、`app/model/properties.py`・Qt 非依存）の変わり目に
+  **1px の区切り線**（objectName `propertyPanelSeparator` のスパン行）を入れる。判定は
+  「隣接する**可視**行の group が変わる位置」（先頭・末尾には入れない。`requires` で隠れた行は
+  無視）で、単一選択・複数選択・artboard の 3 モードが同じ行生成関数を共有する。並びは
+  名前 | 位置と形 | 内容（文字・数式） | 見た目（色・線・**不透明度は末尾＝色の行の下**）|
+  矢じり/マスク | 表示・ロック。型をまたいで同じ group 定数を使うので、複数選択の積集合でも
+  区切りが一貫する。`PropSpec.section` と `section_rows()` は削除済み。
+  見出しを独立スパン行にしていた旧方式の教訓（ラベル欄に縦 2 段で埋め込むと、その行だけ
+  **ラベル文字の中心が入力欄より 22px 下にずれる**。`QFormLayout` は行がフィールドより高いと
+  フィールドを上寄せする）は区切り行にもそのまま当てはまる。
+- **見た目の違いは `kind` を増やさず `PropSpec.widget` で表す**（`kind` は値の型で、エージェントの
+  スキーマ生成と `validate.coerce` が読む。未知の kind は検証を素通りする）。
+  `widget="font_family"`（kind=text）はインストール済みフォントのドロップダウン
+  `FontFamilyCombo`（`app/ui/widgets/font_family_combo.py`。項目は `app/model/fonts.py::
+  unique_families` でファウンドリ接尾辞 ` [urw]` 等を落として重複除去。**`activated`＝ユーザー
+  操作でだけコミット**、未インストールの値は「〇〇（未インストール）」として別フォントに
+  黙って置き換えない。複数選択でも出す）。`widget="toggle"`（kind=bool）はアイコンの
+  トグルボタン（太字/斜体/下線。同じ `row` の連続 spec を 1 行にまとめ、行ラベルは
+  `row_label`「書式」。qtawesome に off 版グリフが無いので、オフ=灰色／オン=アクセント色＋背景）。
+  dataclass のフィールドではない合成キーを `PROPERTIES` に入れてはいけない
+  （`schema.properties_for` がエージェントへ書き込み可能キーとして公開してしまう）。
+- **ホイール**: パネル内のコンボ/スピンは、フォーカスが無い間のホイールで値を変えない
+  （`app/ui/widgets/wheel_guard.py`。パネルをスクロールしただけで値が変わり undo が積まれていた）。
+- **undo の粒度**: スピンのティック・スクラブは 1 ジェスチャ 1 undo に統合（mergeWith。
+  複数選択は `SetMultiPropertyCommand`、グループ X/Y は `TranslateGroupCommand`）、色・列挙・
+  チェック・トグル・フォントの選択は**離散操作なので 1 回 1 undo**（統合すると「赤→青」が
+  1 エントリに潰れて途中の値へ戻れない）。text/math の本文・フォント変更は箱の追従
+  （§9.4a）を同じ undo に添える（`SetPropertyWithFollowCommand`）。
   行高は `Theme.control_h`（32px）と `#propertyPanelForm` スコープの QSS の種別別 `min-height`
   で全行揃える（Qt の QSS の `min-height` は内容矩形の高さなので、種別ごとの固有余白を
   差し引いた値を与える。実測値の根拠は `qss.py` のコメント参照）。
   **検証は `tests/test_panel_row_metrics.py` が全 10 型 + multi + artboard で
   「ラベルと入力欄の中心が ±1px」「行高が全行同一」を実測で固定する。**
 - **行番号を外から引くのは公開ヘルパ経由**（`row_for_key` / `field_widget_for` /
-  `label_widget_for` / `keys_in_form` / `section_rows`）。見出しがスパン行になった結果、
-  `itemAt(row, FieldRole)` の index 引きは見出し行で見出しラベル自身を返すため、
-  「`PROPERTIES[type]` の並び順 == 行番号」という以前の前提はもう成り立たない。
-- **色の指定は単一のスウォッチボタン**（2026-08-21 項目12）。`kind="color_opt"`（null 可）は
-  クリックで小さな `QMenu`（「色を選択…」/ `PropSpec.null_label`）を出す。以前の
-  「透明」`QCheckBox` + ボタンの 2 部品は廃止した——1 プロパティ 2 部品は UI を増やすうえ、
-  チェックボックスは QSS 上の高さが他の入力欄と違って行高不揃いの一因であり、
-  「なし」解除時に直前の色を復元する隠し状態がトグル往復で色を失う回帰も起こしていた。
-  ボタン面に hex テキストは出さない（`sizeHint` が値依存になると行高・行幅が色を変える
-  たびに揺れる）。現在値は tooltip に出す。
+  `label_widget_for` / `keys_in_form` / `separator_rows` / `groups_in_form`）。区切り行と
+  B/I/U のまとめ行があるため、「`PROPERTIES[type]` の並び順 == 行番号」は成り立たない
+  （`field_widget_for("bold")` はそのキーのトグルボタンを返す）。
+- **色の指定は単一のスウォッチボタン `ColorSwatchButton`**（`app/ui/widgets/
+  color_swatch_button.py`。プロパティパネルの全色行・artboard 背景・環境設定の背景色・マスク編集
+  パネルの覆い色の共通部品）。以前の「透明」`QCheckBox` + ボタンの 2 部品は 2026-08-21 に廃止
+  （行高不揃いと、トグル往復で色を失う回帰の原因）。
+  - **面**（2026-09-25 要望8）: 背景はテーマの通常色のまま、左に色のチップ（null は赤の斜線）、
+    大文字 hex / `null_label` / 「混在」、右端に ▾。**`setStyleSheet` を一切使わない**——以前は
+    ボタンの stylesheet に背景色を入れており、子の QMenu とツールチップまで黒くなって読めなかった
+    （要望8の直接原因）。`sizeHint` は値に依存しない（色を変えても行高・行幅が揺れない）。
+  - **メニュー**（要望11）: `app/model/palettes.py::dropdown_colors(palette)` = 環境設定の
+    パレット 8 色（未設定なら `BASIC_COLORS`）＋黒・白（重複除去）、区切り、`null_label`
+    （null 可のみ）、区切り、「色を選択…」。現在値の項目は checked（`QMenu::icon:checked` の QSS）。
+    `color_chosen` シグナルはユーザー操作でだけ出る。パレット変更は `PropertyPanel.
+    refresh_palette()` / `MaskEditPanel.refresh_palette()` で反映（`MainWindow` が環境設定の確定後に呼ぶ）。
+  - 同値判定は大文字小文字を無視する。
   複数選択では `color` と `color_opt` を互換扱いにし、実効 kind を狭い方（`color`）へ寄せる
   ——rect と line を同時選択したときに「線色」行が消えるのを防ぐため。
 
@@ -406,6 +511,38 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
 - **保存/書き出し中の扱い**: crop/mask/ノード編集と同じ立場で、編集中でも
   Ctrl+S/Ctrl+E/自動保存は確定済みのモデルをそのまま書き出す（詳細は
   `.claude/working/architecture/export.md`）。
+- **変換中の文字列（IME の preedit）**: `commit_text_edit` は先に
+  `QGuiApplication.inputMethod().commit()` を呼び、それでも preedit が残っていれば確定文字列として
+  エディタへ送ってから本文を読む（Ctrl+Enter・ツール切替・外側クリックで変換中の日本語が消えない）。
+  キャンセルは `inputMethod().reset()`。
+
+### 9.4b テキストの箱の寸法・余白・背景（2026-09-25 要望3・4・7）
+- **上だけ字面まで詰める**（ユーザー決定）: `text_outline._layout_lines` が最初の行について
+  ベースラインより上の字面の高さ `top_extent = max(その行の各フォントの typo ascender（OS/2
+  sTypoAscender）, その行のインク上端)` を求め、`trim = first_line.ascent() - top_extent` だけ
+  **ブロック全体を上へ詰める**（行間と下端のディセンダ余白はそのまま＝g/y が箱からはみ出さない）。
+  字面が行の上端を超えるフォント（アクセント付き大文字など）では trim が負になり、箱が字面を
+  含むまで広がる。全消費者（`measure_text` / `draw_text_block` / `text_to_path` / `wrapped_lines` /
+  `valign_offset`）が同じ関数を通り、エディタは `valign_offset - text_top_trim` に置く。
+  レイアウト結果は `_LAYOUT_CACHE`（上限 1024、超過で全消去）でメモ化。
+- **コード上の余白 `TEXT_MARGIN`（8px）は縦横とも撤廃**。幅 = `ceil(自然幅) + 1`（折返しの丸め
+  誤差に対する安全余裕）、`MIN_TEXT_WIDTH/HEIGHT` は空テキスト（プレースホルダ）のときだけ。
+  既存図のテキストは箱の中で最大 trim ぶん（middle なら trim/2）上へ動く（要望どおりの変化）。
+- **箱の追従**（`app/scene/items/box_follow.py::box_follow_geometry` が text/math の唯一の入口。
+  パネル単一/複数・`update_objects`・`apply_style` が共有、`commit_text` も同じ高さ規則
+  `refit_text_height` を使う）: 高さは「ちょうど内容に合っていた箱なら伸縮、ユーザーが手で広げた
+  箱ならあふれるときだけ伸びる（縮まない）」——背景色の余白を作る手段が箱を広げることだけなので、
+  後の編集で潰さない。本文の変更では幅を保つ（入力は固定幅で折り返す）が、**1 行ラベルの
+  太字/斜体/フォント変更では幅も内容に合わせる**（`TEXT_MARGIN` 撤廃で余裕が 1px になり、太字を
+  押しただけで単語が途中で折れる退行があったため）。整列（align）と縦位置（valign）のアンカー辺を
+  保つので x/y も動くことがある。呼び出し側が x/y/width/height を明示したらそちらを優先する。
+- **背景色**: `TextItem.paint` が最初に箱全体を塗る（編集モード・アウトライン分岐の前。編集中は
+  エディタの内容に合わせて背景も伸びる）。SVG は §8 の text 参照。診断の `low_contrast` は自前の
+  背景を最優先の背景色として扱う（白文字＋紺背景を誤警告しない）。
+- **空テキストのプレースホルダ破線**は画面だけに描き、書き出し（PNG/PDF/クリップボード/エージェントの
+  render）には出さない（`paint` の `widget is None` で判定。`scene.render()` は常に None を渡す）。
+- 縦位置の既定は middle（§7.2）。作成直後は箱＝ブロックなので top と同じ見た目で、複数行を確定すると
+  箱の垂直中心が保たれる（上下対称に伸びる）。
 
 ### 9.5 SAM3 選択的マスキング（旧: 背景除去の削除経緯）
 
@@ -492,6 +629,22 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
   （反応しないのに操作できそうに見えるのはアフォーダンスの嘘）。`ZoomPill` と重なる位置では出さない
   （浮遊ウィジェットがクリックを食う）。
 
+### 9.9 日本語入力（IME）と Alt キー（2026-09-25 要望2）
+- **主因は IME 未接続**: PySide6 の wheel に同梱の Qt には fcitx 用の入力メソッドプラグインが
+  無く、`QT_IM_MODULE=fcitx`（im-config の fcitx5 環境）では Qt が compose にフォールバックして
+  IME に一度もつながらない（左 Alt の切替も日本語入力もできない）。`main.py::
+  _configure_input_method` が `QApplication` 生成の直前に、同梱プラグインに fcitx が無ければ
+  `QT_IM_MODULE=ibus` に書き換え、fcitx5 の IBus フロントエンド経由で接続する（ibus-daemon が
+  無く fcitx5 がある環境では `IBUS_USE_PORTAL=1`。空でない `QT_IM_MODULES` が設定済みなら尊重）。
+  システムの fcitx5 プラグインを `QT_PLUGIN_PATH` で読ませる案は Qt の private ABI 不一致で不可。
+- **副因は Alt 単押しのメニューバー移動**（Fusion の `SH_MenuBar_AltKeyNavigation`）。
+  `app/ui/theme/__init__.py` の `_ChartaStyle(QProxyStyle)` を**アプリ全体に**設定して無効化した
+  （ウィジェット単位の `setStyle(QProxyStyle)` は終了時に segfault するので禁止）。副作用: Alt で
+  メニューバーをキーボード操作できない、Alt で開いているポップアップが閉じない（Esc は閉じる）。
+  メニュー項目に `&` ニーモニックは元から無い。
+- IME が有効になるのはテキスト入力欄にフォーカスがあるときだけ（編集していないキャンバスでは
+  `ImEnabled=False` なので、V/R などのツールショートカットを IME が横取りしない）。
+
 ### 9.7 環境設定（Preferences）とカラーパレット（2026-08-15 追加）
 
 `project.json`（プロジェクト固有）とは別に、**プロジェクトを跨いで生きるユーザー
@@ -512,13 +665,18 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
   を使い、無関係なフィールドを巻き戻さない。
 - **カラーパレット**: `app/model/palettes.py`（Qt 非依存）に 6 種ビルトイン
   （material/apple/seaborn_deep/tableau10/okabe_ito/kusumi、各 8 色）。
-  環境設定で選ぶと (a) `QColorDialog.setCustomColor` でプロセス全体のカスタム
-  色スウォッチに載る、(b) 新規図形の初期色（線色/文字色。塗りには介入しない）、
-  (c) 「このプロジェクトに styles として登録」ボタンで `document.styles` へ
-  1 undo ステップで登録できる。全 `QColorDialog.getColor` 呼び出しは
-  `options=QColorDialog.ColorDialogOption.DontUseNativeDialog` を渡す
-  （GTK/portal 等のネイティブ色ダイアログを使う環境では Qt 側のカスタム色配列
-  が画面に出ず、パレット機能が無言で無効になるため）。
+  環境設定で選ぶと (a) 色のドロップダウン（`ColorSwatchButton`、§9.2）と「色を選択…」の
+  ダイアログのパレット行に載る、(b) 新規図形の初期色（線を既定で持つ型の線色と文字色。
+  塗りと、線なしが既定の rect/ellipse の線には介入しない）、(c) 「このプロジェクトに styles として
+  登録」ボタンで `document.styles` へ 1 undo ステップで登録できる。
+- **色ダイアログは `SimpleColorDialog`（`app/ui/widgets/simple_color_dialog.py`）だけ**
+  （2026-09-25 要望12）。パレット 8 色の行（主）・基本色 8 色（`palettes.BASIC_COLORS`）・HEX 入力・
+  OK/キャンセルのみで、スペクトル/明度ピッカー・HSV/RGB スピン・カスタム色は無い。アプリ内で
+  色ダイアログを開く経路はすべて `SimpleColorDialog.get_color(initial, palette, parent, title)`
+  （テストの差し替え口）を通る。Qt 標準の色ダイアログとそのカスタム色（`setCustomColor`）は
+  廃止し、`app/` に名前が残らないことをテストで固定している
+  （`tests/test_prefs_dialog.py::test_qcolordialog_is_not_used_anywhere_in_the_app`。コメント中の
+  言及も検出するので、説明で旧名に触れるときは書き方に注意）。
 - **新規オブジェクト/アートボードの既定**: `ToolManager._apply_pref_defaults`
   がフォント/線幅/コネクタ routing/初期色を、`_default_document()` がアートボード
   既定を適用する（`prefs` を渡さない 0 引数呼び出しは互換のため残しつつ、
@@ -543,10 +701,10 @@ text オブジェクトの編集は旧 `QDialog` 方式（`TextItem.edit_text()`
   終了は `normalGeometry()` を保存する（スキーマは変えず「次回が画面いっぱいの
   非最大化ウィンドウになる」実害だけ防ぐ）。
 - **設定ダイアログ**: `app/ui/prefs_dialog.py`（house style は `math_item.
-  edit_latex` と同じ QDialog + QDialogButtonBox）。`QFontComboBox` はユーザーが
-  実際に操作した（`currentFontChanged` を受けた）ときだけ新しい family を採用し、
-  未操作なら渡された値をそのまま持ち越す（未インストールフォントの環境で開いた
-  だけで既定フォントがファウンドリ接尾辞付きの別名に化けるのを防ぐ）。
+  edit_latex` と同じ QDialog + QDialogButtonBox）。フォント欄はプロパティパネルと同じ
+  `FontFamilyCombo`（§9.2）で、ユーザーが実際に選んだ（`family_chosen`）ときだけ新しい family を
+  採用し、未操作なら渡された値をそのまま持ち越す（未インストールフォントの環境で開いた
+  だけで既定フォントが別名に化けるのを防ぐ）。背景色ボタンは**ダイアログ内で選択中の**パレットを使う。
 - **`math_fontset`**（2026-08-21 追加。既定 `"cm"` = Computer Modern、論文標準）:
   選択肢は `"cm"/"stix"/"stixsans"/"dejavusans"/"dejavuserif"`。ホワイトリストは
   `app/prefs.py` の `MATH_FONTSET_VALUES` と `app/math/mathtext_render.py` の
@@ -701,12 +859,15 @@ printf '{"jsonrpc":"2.0","id":1,"method":"describe_state","params":{}}\n' \
 **診断層は 2 段構え**（速度とスレッド安全性のための分離）:
 - `app/graphics/diagnostics.py`: Qt 非依存の純関数。`Document` のスナップショット
   （dataclass。bbox・テキスト採寸済みの寸法などを先に確定させたもの）を受け取り、
-  `CHECK_NAMES` の 8 種を検出する: `offscreen`（完全に外で描かれない）/ **`clipped`**
+  `CHECK_NAMES` の 9 種を検出する: `offscreen`（完全に外で描かれない）/ **`clipped`**
   （一部がはみ出しており書き出すと切れる。2026-08-07 追加 — 画面上は「端に寄って
   いる」ようにしか見えないのに論文図では実害がある、最も気づきにくい破綻）/
   `degenerate` / `overlap` / `occluded` / `text_overflow` / `low_contrast` /
-  `small_text`。`Document` にも Qt にも触れないので、ワーカースレッドへ出しても
-  競合しない。
+  `small_text` / **`invisible`**（rect/ellipse/curve が塗りも線も持たず完全に不可視。
+  2026-09-25 追加）。`invisible` の修正案は**塗りではなく線（stroke/stroke_width）を戻す**
+  ——塗りを戻すと、開曲線が塗りの塊になり（曲線は既定の塗りの対象外）、画像の上に
+  意図して置いた塗りなしの枠が下の画像を隠すため。`Document` にも Qt にも触れないので、
+  ワーカースレッドへ出しても競合しない。
 - **修正案は「送り返せば直る」ことが要件**。例えば `clipped` でアートボードより
   大きいオブジェクトに「動かす」案を返すと、送り返しても同じ警告が出続けて往復が
   終わらない。この場合は縮める案を返す（`fits` フラグで分岐）。収束することを

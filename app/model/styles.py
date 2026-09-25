@@ -45,6 +45,7 @@ STYLE_KEYS: tuple[str, ...] = (
     "arrow_size",
     # 文字・数式
     "color",
+    "background",
     "font_family",
     "font_size",
     "bold",

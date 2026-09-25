@@ -147,3 +147,22 @@ def test_the_new_agent_features_are_reachable_over_mcp(
     """2026-08-07 に足した 3 ツールが実際に橋を渡っていること。"""
     for tool in ("critique", "layout_objects", "apply_style"):
         assert tool in bridge_tools, f"{tool} の MCP ラッパが無い"
+
+
+def test_render_canvas_and_critique_docstrings_list_every_diagnostic_code() -> None:
+    """レビュー所見#4: `invisible` 追加後、`render_canvas`/`critique` の
+    docstring の「全診断コードを返す」列挙が古いままだと、エージェントが
+    読んでも新しいコードの存在や呼び方（`checks=["invisible"]`）に気づけない。
+    """
+    from app.graphics import diagnostics
+
+    tree = ast.parse(_BRIDGE.read_text(encoding="utf-8"))
+    docstrings: dict[str, str] = {
+        node.name: ast.get_docstring(node) or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in ("render_canvas", "critique")
+    }
+    assert set(docstrings) == {"render_canvas", "critique"}
+    for name, doc in docstrings.items():
+        for code in diagnostics.CHECK_NAMES:
+            assert code in doc, f"{name} の docstring に診断コード {code!r} が無い"

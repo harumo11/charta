@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.model.objects import BaseObject
-from app.scene.snapping import snap_move
+from app.scene.anchor_snap import scene_threshold
+from app.scene.snapping import ALIGN_SNAP_SCREEN_PX, snap_move
 
 if TYPE_CHECKING:
     from app.model.document import Document
@@ -141,7 +142,7 @@ class BaseItem(QGraphicsObject):
         return super().itemChange(change, value)
 
     def _maybe_snap_position(self, proposed: QPointF) -> QPointF | None:
-        """ドラッグ移動中の提案 pos をスナップ吸着させる（M7契約 §6）。
+        """ドラッグ移動中の提案 pos をスナップ吸着させる（吸着契約 §G-4）。
 
         `_syncing` 中（モデル→ビュー同期による setPos）や scene 未接続時は
         素通りする（None を返し、呼び出し元は元の value をそのまま使う）。
@@ -153,6 +154,20 @@ class BaseItem(QGraphicsObject):
         スナップしてしまうと、ハンドルが計算した原点座標が近接オブジェクトの
         エッジやグリッドへ誤って吸着し、意図したリサイズ結果を書き換えてしまう
         （M7レビュー所見: リサイズ中の move スナップ誤発火）。
+
+        **セッション優先（吸着契約 §G-4）**: `ToolManager` が select ツールの
+        ドラッグ中に「移動セッション」（複数選択/グループ全体を包む union box で
+        1 回だけ吸着判定し、全員へ同じ delta を適用する）を張っている間は、
+        `scene.session_snapped_position()` の結果をそのまま使う。これにより
+        複数選択・グループでも各メンバーが独立に吸着してバラバラの delta に
+        なる問題（報告書 snap.md §4-1）を避ける。ガイドはセッション側
+        （`ToolManager._select_move`）が設定するので、ここでは設定し直さない。
+
+        セッションが無い（またはこの item が対象でない・delta 未確定）ときは
+        従来どおりの単独アイテム判定にフォールバックする（`item.setPos()` を
+        直接呼ぶ既存テスト・プログラム的な移動が引き続き動く前提）。複数選択
+        (グループ含む) がセッション経由でない場合は、独立吸着による相対配置の
+        崩れを避けるため引き続きスナップを無効化する。
         """
         if self._syncing or self._resizing:
             return None
@@ -161,6 +176,11 @@ class BaseItem(QGraphicsObject):
             return None
         if not getattr(scene, "snap_enabled", False):
             return None
+        session_lookup = getattr(scene, "session_snapped_position", None)
+        if callable(session_lookup):
+            snapped_session = session_lookup(self.obj.id)
+            if snapped_session is not None:
+                return QPointF(snapped_session[0], snapped_session[1])
         if self.isSelected() and len(scene.selectedItems()) > 1:
             # 複数選択(グループ含む)を一緒にドラッグする経路では、各メンバーが
             # 独立にスナップ吸着すると相対配置が崩れる（M7レビュー所見:
@@ -168,19 +188,41 @@ class BaseItem(QGraphicsObject):
             # 動いている場合のみスナップを無効化する。選択されていない単独の
             # item を setPos するケース（プログラム的な移動）には影響しない。
             return None
-        width = getattr(self, "_w", None)
-        if width is None:
-            width = self.obj.width
-        height = getattr(self, "_h", None)
-        if height is None:
-            height = self.obj.height
-        moving_box = (float(proposed.x()), float(proposed.y()), float(width), float(height))
-        proposed_xy = (float(proposed.x()), float(proposed.y()))
-        other_boxes = scene.other_boxes_excluding(self)
+        current_box = None
+        box_for_item = getattr(scene, "snap_rect_for_item", None)
+        if callable(box_for_item):
+            current_box = box_for_item(self)
+        pos = self.pos()
+        if current_box is None:
+            width = getattr(self, "_w", None)
+            if width is None:
+                width = self.obj.width
+            height = getattr(self, "_h", None)
+            if height is None:
+                height = self.obj.height
+            current_box = (float(pos.x()), float(pos.y()), float(width), float(height))
+        # 現在位置(pos)から proposed への平行移動量を、回転/text の字面オフセット
+        # を織り込んだ現在の box にそのまま適用する（回転や字面オフセットが
+        # あっても、剛体としての平行移動量は box 表現に依らず一定なため）。
+        ddx = float(proposed.x()) - float(pos.x())
+        ddy = float(proposed.y()) - float(pos.y())
+        moving_box = (current_box[0] + ddx, current_box[1] + ddy, current_box[2], current_box[3])
+        proposed_xy = (moving_box[0], moving_box[1])
+        collect_targets = getattr(scene, "collect_snap_targets", None)
+        other_boxes = (
+            collect_targets(exclude_ids=frozenset({self.obj.id}))
+            if callable(collect_targets)
+            else []
+        )
         grid_size = scene.grid_size_or_none()
-        (snapped_x, snapped_y), guides = snap_move(moving_box, proposed_xy, other_boxes, grid_size)
+        threshold = scene_threshold(scene, ALIGN_SNAP_SCREEN_PX)
+        (snapped_x, snapped_y), guides = snap_move(
+            moving_box, proposed_xy, other_boxes, grid_size, threshold
+        )
         scene.set_snap_guides(guides)
-        return QPointF(snapped_x, snapped_y)
+        dx = snapped_x - moving_box[0]
+        dy = snapped_y - moving_box[1]
+        return QPointF(proposed.x() + dx, proposed.y() + dy)
 
     # ------------------------------------------------------------------
     # Undo コマンド発行

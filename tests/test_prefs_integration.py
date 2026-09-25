@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QMessageBox
 
 from app.commands.commands import SetPropertyCommand
 from app.model.document import Document
+from app.model.objects import DEFAULT_SHAPE_FILL
 from app.prefs import Preferences
 from app.scene.canvas_scene import CanvasScene
 from app.tools.tool_manager import ToolManager
@@ -61,7 +62,13 @@ def _click(tm: ToolManager, tool: str, p: QPointF) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_rect_creation_uses_pref_stroke_width_and_initial_color(qapp: Any) -> None:
+def test_rect_creation_uses_pref_stroke_width_but_not_initial_color(qapp: Any) -> None:
+    """rect/ellipse は 2026-09-25 決定で stroke の既定が None（線なし）になったため、
+    `initial_color` は上書きしない（`_apply_pref_defaults` は dataclass 既定が None の
+    フィールドを色で埋めない。`reports/rectdefault.md` §3 の「initial_color が線を
+    復活させる穴」を閉じる変更）。stroke_width は非 None 既定（2.0）のままなので従来どおり
+    prefs が効く。fill にも介入しない（既定の DEFAULT_SHAPE_FILL のまま）。
+    """
     prefs = Preferences(default_stroke_width=5.0, initial_color="#123456")
     env = _make_env(prefs)
     _drag(env["tm"], "rect", QPointF(10, 10), QPointF(110, 90))
@@ -70,26 +77,62 @@ def test_rect_creation_uses_pref_stroke_width_and_initial_color(qapp: Any) -> No
     assert len(objs) == 1
     rect = objs[0]
     assert rect.stroke_width == 5.0
-    assert rect.stroke == "#123456"
-    # fill には介入しない（「塗りなし」という既定を維持する）。
-    assert rect.fill is None
+    assert rect.stroke is None
+    # fill には介入しない（既定の DEFAULT_SHAPE_FILL のまま）。
+    assert rect.fill == DEFAULT_SHAPE_FILL
+
+
+def test_line_creation_uses_pref_stroke_width_and_initial_color(qapp: Any) -> None:
+    """line/arrow は stroke の dataclass 既定が非 None（"#000000"）のままなので、
+    `initial_color` は従来どおり効く（rect/ellipse とは異なり穴を閉じる対象ではない）。
+    """
+    prefs = Preferences(default_stroke_width=5.0, initial_color="#123456")
+    env = _make_env(prefs)
+    _drag(env["tm"], "line", QPointF(10, 10), QPointF(110, 90))
+
+    objs = env["document"].objects
+    assert len(objs) == 1
+    line = objs[0]
+    assert line.stroke_width == 5.0
+    assert line.stroke == "#123456"
+
+
+def test_ellipse_creation_uses_pref_stroke_width_but_not_initial_color(qapp: Any) -> None:
+    """rect と同じ穴閉じ（§C-1 契約項目1後半「初期色を設定しても新規 rect/ellipse は
+    線なしのまま」）を ellipse でも固定する。
+    """
+    prefs = Preferences(default_stroke_width=5.0, initial_color="#123456")
+    env = _make_env(prefs)
+    _drag(env["tm"], "ellipse", QPointF(10, 10), QPointF(110, 90))
+
+    objs = env["document"].objects
+    assert len(objs) == 1
+    ellipse = objs[0]
+    assert ellipse.stroke_width == 5.0
+    assert ellipse.stroke is None
+    assert ellipse.fill == DEFAULT_SHAPE_FILL
 
 
 def test_style_memory_wins_over_pref_defaults_after_edit(qapp: Any) -> None:
-    """同種を一度作ったあと色を変えると、以後は style memory（sticky defaults）が勝つ。"""
+    """同種を一度作ったあと色を変えると、以後は style memory（sticky defaults）が勝つ。
+
+    rect は stroke の既定が None（線なし）になり `initial_color` の影響を受けなく
+    なったため（`reports/rectdefault.md` §3）、この sticky defaults 自体の挙動は
+    `initial_color` が効く line で検証する。
+    """
     prefs = Preferences(default_stroke_width=5.0, initial_color="#123456")
     env = _make_env(prefs)
     tm = env["tm"]
     document = env["document"]
     stack = env["stack"]
 
-    _drag(tm, "rect", QPointF(10, 10), QPointF(110, 90))
+    _drag(tm, "line", QPointF(10, 10), QPointF(110, 90))
     first = document.objects[0]
     assert first.stroke == "#123456"  # prefs が適用された直後の値
     stack.push(SetPropertyCommand(document, first, "stroke", "#ABCDEF", first.stroke))
     stack.push(SetPropertyCommand(document, first, "stroke_width", 9.0, first.stroke_width))
 
-    _drag(tm, "rect", QPointF(200, 200), QPointF(260, 240))
+    _drag(tm, "line", QPointF(200, 200), QPointF(260, 240))
     second = document.objects[-1]
     assert second.stroke == "#ABCDEF"
     assert second.stroke_width == 9.0
@@ -159,6 +202,9 @@ def test_style_memory_reset_lets_pref_defaults_apply_again(qapp: Any) -> None:
     """所見: `_style_memory` は最初の生成時から永久に環境設定を上書きし続ける。
     `clear_style_memory()` を呼べば、次の生成は環境設定の値に戻る
     （`MainWindow.open_preferences` が作成既定の変更を検知して呼ぶ）。
+
+    rect は `initial_color` の影響を受けなくなった（前掲テスト参照）ため、
+    line で検証する。
     """
     prefs = Preferences(default_stroke_width=5.0, initial_color="#123456")
     env = _make_env(prefs)
@@ -166,12 +212,12 @@ def test_style_memory_reset_lets_pref_defaults_apply_again(qapp: Any) -> None:
     document = env["document"]
     stack = env["stack"]
 
-    _drag(tm, "rect", QPointF(10, 10), QPointF(110, 90))
+    _drag(tm, "line", QPointF(10, 10), QPointF(110, 90))
     first = document.objects[0]
     stack.push(SetPropertyCommand(document, first, "stroke", "#ABCDEF", first.stroke))
 
     tm.clear_style_memory()
-    _drag(tm, "rect", QPointF(200, 200), QPointF(260, 240))
+    _drag(tm, "line", QPointF(200, 200), QPointF(260, 240))
     second = document.objects[-1]
     assert second.stroke == "#123456"
     assert second.stroke_width == 5.0
@@ -188,14 +234,19 @@ def test_connector_creation_uses_pref_routing(qapp: Any) -> None:
 
 
 def test_no_prefs_keeps_legacy_defaults(qapp: Any) -> None:
-    """`prefs=None`（回帰）: 全て従来どおりの dataclass 既定値のまま生成される。"""
+    """`prefs=None`（回帰）: 全て dataclass 既定値のまま生成される。
+
+    rect の既定は 2026-09-25 決定で stroke=None・fill=DEFAULT_SHAPE_FILL に
+    変わった（`reports/rectdefault.md`）。ここは「prefs が無ければ dataclass の
+    既定値のまま」という回帰確認が目的なので、その現行既定値を検査する。
+    """
     env = _make_env(None)
     _drag(env["tm"], "rect", QPointF(10, 10), QPointF(110, 90))
 
     rect = env["document"].objects[0]
-    assert rect.stroke == "#000000"
+    assert rect.stroke is None
     assert rect.stroke_width == 2.0
-    assert rect.fill is None
+    assert rect.fill == DEFAULT_SHAPE_FILL
 
 
 # --------------------------------------------------------------------------

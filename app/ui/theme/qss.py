@@ -48,6 +48,14 @@ QMenu::separator {{
     background: {t.border};
     margin: 4px 8px;
 }}
+/* Fusion はアイコン付き checkable な QAction にチェックマークを描かない。
+   `ColorSwatchButton` のメニュー項目は色のチップアイコンで色そのものを示す
+   ため、チェック済みのものだけアイコン周りへ枠を付けて選択状態を可視化する
+   （P2契約 D1、reports/color.md §4 で有効性を実測済み）。 */
+QMenu::icon:checked {{
+    border: 2px solid {t.accent};
+    border-radius: {t.radius_sm}px;
+}}
 
 /* ---- QToolButton（ツール/ヘッダーバー用） --------------------------- */
 QToolButton {{
@@ -200,12 +208,15 @@ QSplitter::handle {{
     background: {t.border};
 }}
 
-/* ---- PropertyPanel セクション見出し（role="section"、P2契約 §3.4/§3.5） ---- */
-QLabel[role="section"] {{
-    color: {t.fg_muted};
-    font-size: 9pt;
-    padding-top: 10px;
-    padding-bottom: 2px;
+/* ---- ColorSwatchButton のドロップダウン矢印（要望8/11/12） ----
+   `ColorSwatchButton` は常に `setMenu()` されており、Qt 既定のメニュー矢印の
+   上に自前の山形（▾）を `paintEvent` で重ねて描く（`color_swatch_button.py`）。
+   `#propertyPanelForm` 配下は下の規則が既定の矢印を消すが、環境設定ダイアログ・
+   マスク編集パネルはそのスコープ外にいるため、クラス名で全箇所を対象にする
+   （PySide6 のカスタムウィジェットも QSS の型セレクタで引ける）。 */
+ColorSwatchButton::menu-indicator {{
+    width: 0px;
+    image: none;
 }}
 
 /* ---- PropertyPanel フォームのスクロール領域（objectName="propertyPanelFormScroll"、
@@ -239,12 +250,16 @@ QLabel[role="section"] {{
    `_pin_control_height` を適用し忘れた場合の下限）のための保険。
 
    スコープ鍵は PropertyPanel 自身（#propertyPanel）ではなく、フォーム内容だけを
-   包む内側のコンテナ（#propertyPanelForm）にしている。`QColorDialog` は
-   `PropertyPanel` 自身を親にとって開かれるため、`#propertyPanel` を鍵にすると
-   子孫セレクタがダイアログ内部の OK/Cancel/「画面上の色を選択」ボタンや RGB/HSV
-   スピンにまで届いてしまい、幅108px固定でラベル文字がクリップされる（実測で
-   確認済みの回帰）。ダイアログは `#propertyPanelForm` の子孫ではないため、
-   このスコープなら実際にフォームへ配置されたコントロールだけに効く。 */
+   包む内側のコンテナ（#propertyPanelForm）にしている。かつて Qt 標準の色ダイアログが
+   `PropertyPanel` 自身を親にとって開かれ、`#propertyPanel` を鍵にすると子孫セレクタが
+   ダイアログ内部の OK/Cancel/「画面上の色を選択」ボタンや RGB/HSV スピンにまで
+   届いてしまい、幅108px固定でラベル文字がクリップされる（実測で確認済みの回帰）
+   という経緯があった。現在は独自の `SimpleColorDialog`
+   を `self.window()`（`PropertyPanel` ではなくトップレベルウィンドウ）を親にして
+   開くため（`ColorSwatchButton._open_dialog`）この問題自体は起きないが、
+   スコープをフォーム内容に限定する方針は変わらないため据え置く。ダイアログは
+   `#propertyPanelForm` の子孫ではないため、このスコープなら実際にフォームへ
+   配置されたコントロールだけに効く。 */
 #propertyPanelForm QLineEdit, #propertyPanelForm QComboBox {{
     /* border 1px×2 + padding 3px×2 = 8px。control_h - 8 が内容矩形の高さ。 */
     min-height: {t.control_h - 8}px;
@@ -255,26 +270,22 @@ QLabel[role="section"] {{
     min-height: {t.control_h - 8}px;
 }}
 #propertyPanelForm QPushButton {{
-    /* 色スウォッチ。既定の QPushButton は padding 5px 14px で他コントロールより
-       1 行分高くなるため、ここだけ padding を 3px 8px に縮める
-       （border 1px×2 + padding 3px×2 = 8px、QLineEdit と同じ内訳に揃える）。
-       border はこのセレクタで再度明示しておく（実測では上の汎用 QPushButton
-       規則からも継承され描画自体はされているが、`setStyleSheet(
-       "background-color: ...")` をウィジェット単位で当てる箇所なので、汎用規則
-       の border が将来変わってもスウォッチの見た目がここ 1 か所の変更で
-       自己完結するようにする。レビュー所見: 白/淡色スウォッチと空の入力欄
-       （どちらも背景 {t.s2}）は境界線の色が同じだと見分けづらく、hex は
-       tooltip 頼みになる — 完全解消ではないが自己完結にはしておく）。 */
+    /* 色スウォッチ（`ColorSwatchButton`）。既定の QPushButton は padding
+       5px 14px で他コントロールより1行分高くなるため、ここだけ padding を
+       3px 8px に縮める（border 1px×2 + padding 3px×2 = 8px、QLineEdit と
+       同じ内訳に揃える）。border はこのセレクタで再度明示しておく（汎用
+       QPushButton 規則の border が将来変わってもスウォッチの見た目がここ
+       1 か所の変更で自己完結するようにする）。
+       幅は固定しない: `ColorSwatchButton.sizeHint()` 自身が「値（hex/
+       null_label/「混在」）に依存しない」不変条件を満たしており
+       （`tests/test_panel_row_metrics.py::
+       test_color_swatch_width_is_independent_of_color_value`）、mask_color
+       の null_label「透明（切り取り）」のような長い文字列を 108px へ強制する
+       と文字とチェブロンが重なって読めなくなる（実測）。旧実装（`setText(hex)`
+       のみで幅固定が必要だった）からの脱却。 */
     border: 1px solid {t.border};
     padding: 3px 8px;
     min-height: {t.control_h - 8}px;
-    /* color_opt の null_label（"なし"/"透明（切り取り）"）と色ありの空文字とで
-       テキスト長が変わっても sizeHint が揺れないよう、幅も明示的に固定する
-       （QSS で width を明示すると、その種別の sizeHint はテキスト内容に関わらず
-       常にこの値になる。テキストが収まる余裕を持たせた値。実測は
-       tests/test_panel_row_metrics.py::test_color_swatch_width_is_independent_of_color_value）。 */
-    min-width: 108px;
-    max-width: 108px;
 }}
 #propertyPanelForm QPushButton::menu-indicator {{
     /* スピンの▲▼を width:0 で隠しているのと同じ方針。メニュー矢印が色面の
@@ -287,6 +298,15 @@ QLabel[role="section"] {{
        （上の QSpinBox 注記と同じ理由）。ここは保険の下限。border/padding を
        持たないため min-height をそのまま渡す。 */
     min-height: {t.control_h}px;
+}}
+
+/* ---- PropertyPanel のグループ区切り線（objectName="propertyPanelSeparator"、
+   要望6。行を置くのは D2 担当、ここはスタイルだけを用意する） ----
+   `#headerSep` と同じ流儀: ウィジェット単位の setStyleSheet だと色がテーマ
+   から切り離されて焼き込まれるため、他の部品と同様にここへ一本化する。 */
+#propertyPanelForm #propertyPanelSeparator {{
+    background: {t.border};
+    border: none;
 }}
 
 /* ---- ZoomPill（objectName="zoomPill"、P3契約 §2/§5） --------------------- */

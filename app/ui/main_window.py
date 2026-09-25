@@ -16,14 +16,12 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
-    QColor,
     QGuiApplication,
     QKeySequence,
     QShortcut,
     QUndoStack,
 )
 from PySide6.QtWidgets import (
-    QColorDialog,
     QDialog,
     QDockWidget,
     QLabel,
@@ -39,12 +37,13 @@ from app.commands.commands import SetStylesCommand
 from app.math.mathtext_render import set_math_fontset
 from app.model.document import Artboard, Document, Physical
 from app.model.objects import BaseObject
-from app.model.palettes import Palette, palette_by_id, palette_style_bundles
+from app.model.palettes import Palette, palette_style_bundles
 from app.panels.layer_panel import LayerPanel
 from app.panels.property_panel import PropertyPanel
 from app.prefs import Preferences, load_prefs, update_prefs
 from app.scene.canvas_scene import CanvasScene
 from app.scene.canvas_view import CanvasView
+from app.scene.hit import topmost_item_at
 from app.tools.tool_manager import ToolManager
 from app.ui.controllers.edit_controller import EditController
 from app.ui.controllers.export_controller import ExportController
@@ -205,11 +204,11 @@ class MainWindow(QMainWindow):
         # 紙の右下グリップドラッグ中の寸法プレビュー（項目10契約）。
         self.view.artboard_resize_preview.connect(self._on_artboard_resize_preview)
 
-        self.mask_edit_panel = MaskEditPanel()
+        self.mask_edit_panel = MaskEditPanel(prefs=self.prefs)
         self._sam3_masking = Sam3MaskController(
             self, self.scene, self.undo_stack, self.mask_edit_panel
         )
-        self.property_panel: PropertyPanel = PropertyPanel(self.scene, self._edit)
+        self.property_panel: PropertyPanel = PropertyPanel(self.scene, self._edit, prefs=self.prefs)
         self.layer_panel: LayerPanel = LayerPanel(self.scene)
 
         # 右サイドはドック1枚に一本化する（P2契約 §5）。タイトルバー無し・
@@ -296,8 +295,9 @@ class MainWindow(QMainWindow):
         self._agent_message_timer.setInterval(_AGENT_MESSAGE_MS)
         self._agent_message_timer.timeout.connect(self._clear_agent_message)
 
-        # 環境設定のパレットを QColorDialog のカスタムスウォッチへ反映（B契約 §B-2）。
-        self._apply_palette_swatches()
+        # 環境設定のパレットを両パネルの色スウォッチへ反映（要望8/11/12）。
+        self.property_panel.refresh_palette()
+        self.mask_edit_panel.refresh_palette()
 
     # ------------------------------------------------------------------
     # ProjectIOController の状態への委譲プロパティ（テスト互換: `window._project_dir`
@@ -798,18 +798,35 @@ class MainWindow(QMainWindow):
     def _topmost_object_at(self, scene_pos: QPointF) -> BaseObject | None:
         """`scene_pos` の最上位アイテムから、`obj` を持つ祖先まで遡って返す（無ければ None）。
 
-        `ToolManager._topmost_item_at` と同じ経路（`scene.items(...)` の先頭）で解決した
-        うえで、ハンドルやオーバーレイ等 `.obj` を持たない子アイテムだった場合に備えて
-        親を遡る（`ToolManager` 側は現状これを行わないため、ここでは明示的に対応する）。
+        task2（2026-09-25）: ヒット判定そのものは `app.scene.hit.topmost_item_at`
+        （`ToolManager._topmost_item_at` と共有する 1 実装）に委譲する。以前は
+        ここだけが厳密な 1 点クエリ（`scene.items(scene_pos, ...)`）のままで、
+        `ToolManager` 側は round2 finding #3 でデバイスpx矩形クエリへ移行して
+        いたため、図形の縁ぎりぎりでは左クリック（select ツール）と右クリック
+        メニューが別のオブジェクトを拾うことがあった。`context_menu_requested`
+        は `scene_pos` しか運ばないので `event` は渡さない（`topmost_item_at` は
+        その場合 `view.mapFromScene(scene_pos)` で近似する——`CanvasView.
+        contextMenuEvent` 自身も `mapToScene(event.pos())` で作った scene_pos な
+        ので、同じ丸めを往復するだけで左右のクエリが揃う）。
+        解決した item がハンドルやオーバーレイ等 `.obj` を持たない子アイテムで
+        あれば、`.obj` を持つ祖先まで遡る（`ToolManager` 側は現状これを行わない
+        ため、ここでは明示的に対応する）。
+
+        `button=None` を渡す（レビュー4巡目 finding #1。レビュー3巡目 finding #1
+        時点の `button=Qt.MouseButton.RightButton` から変更）: `_HandleItem`
+        （リサイズ/回転ハンドル）は `acceptedMouseButtons()` が既定の
+        `LeftButton` のみで、`RightButton` を渡すとハンドル自体がヒット候補から
+        除外されてしまい、`parentItem()` を辿ってオーナーへ戻る前にハンドルの
+        下に重なった**別オブジェクト**へフォールスルーしていた（回転ハンドルが
+        隣接オブジェクトに重なる配置・低ズームでリサイズハンドルの外側半分が
+        隣接オブジェクトへはみ出す配置で発生。選択中のオブジェクトではなく
+        たまたま下にあったオブジェクトに削除等のメニュー操作が効く）。
+        `button=None` は `NoButton` の装飾専用 item（`HighlightItem` 等）だけを
+        除外し、ハンドルはヒット候補に残る（`_accepts_button` 参照）ため、
+        ハンドルへの右クリックは従来どおり `parentItem()` 経由でオーナーへ
+        解決される。
         """
-        transform = self.view.transform()
-        items = self.scene.items(
-            scene_pos,
-            Qt.ItemSelectionMode.IntersectsItemShape,
-            Qt.SortOrder.DescendingOrder,
-            transform,
-        )
-        item = items[0] if items else None
+        item = topmost_item_at(self.scene, scene_pos, button=None)
         while item is not None:
             obj = getattr(item, "obj", None)
             if obj is not None:
@@ -870,15 +887,30 @@ class MainWindow(QMainWindow):
 
         右クリック位置の最上位オブジェクトが未選択なら、それだけを選択してから
         メニューを出す（標準挙動）。既に選択済み（複数選択の一部を含む）ならそのまま。
+
+        「入っている」グループ（`scene.entered_group_id()`）の別メンバーを未選択の
+        まま右クリックしたときは `select_exactly` でそのメンバーだけを選ぶ
+        （左クリックと同じ挙動、グループ内個別編集契約 §F-2）。それ以外は従来どおり
+        `clearSelection()` + `setSelected(True)`。この分岐が無いと
+        `clearSelection()` が同期発火する `_expand_group_selection` によって
+        「入っている」状態が（選択が一時的に空になったことで）自動解除され、続く
+        `setSelected(True)` は「入っていない」状態からの選択としてグループ全体へ
+        展開されてしまう——右クリックだけが左クリックと違うふるまいになり、
+        削除/複製がそのメンバー1個ではなくグループ全体に効いてしまっていた
+        （findings #7/#11）。
         """
         obj = self._topmost_object_at(scene_pos)
         if obj is not None:
             currently_selected = self.scene.selected_objects()
             if obj not in currently_selected:
-                item = self.scene.item_for(obj)
-                self.scene.clearSelection()
-                if item is not None:
-                    item.setSelected(True)
+                entered = self.scene.entered_group_id()
+                if entered is not None and obj.group_id == entered and not obj.locked:
+                    self.scene.select_exactly([obj])
+                else:
+                    item = self.scene.item_for(obj)
+                    self.scene.clearSelection()
+                    if item is not None:
+                        item.setSelected(True)
         self._build_canvas_context_menu().exec(global_pos)
 
     # ------------------------------------------------------------------
@@ -942,7 +974,8 @@ class MainWindow(QMainWindow):
         if fontset_changed:
             set_math_fontset(self.prefs.math_fontset)
             self._refresh_math_rendering()
-        self._apply_palette_swatches()
+        self.property_panel.refresh_palette()
+        self.mask_edit_panel.refresh_palette()
         self._configure_autosave_timer()
         update_prefs(**{name: getattr(self.prefs, name) for name in _PREFS_DIALOG_FIELDS})
 
@@ -970,19 +1003,6 @@ class MainWindow(QMainWindow):
         """
         for field in dataclasses.fields(Preferences):
             setattr(self.prefs, field.name, getattr(new_prefs, field.name))
-
-    def _apply_palette_swatches(self) -> None:
-        """`prefs.palette_id` のパレットを `QColorDialog` のカスタム色 0..7 に載せる。
-
-        `QColorDialog.setCustomColor` はプロセス全体の static な状態に効くため、
-        `property_panel.py`/`mask_edit_panel.py` の全ての色選択ボタンに反映される。
-        パレット未選択なら何もしない（既存のカスタム色を消さない）。
-        """
-        palette = palette_by_id(self.prefs.palette_id)
-        if palette is None:
-            return
-        for i, color in enumerate(palette.colors):
-            QColorDialog.setCustomColor(i, QColor(color))
 
     def _register_palette_styles(self, palette: Palette) -> None:
         """`palette_style_bundles` を `document.styles` にマージし、1 undo ステップで push する。

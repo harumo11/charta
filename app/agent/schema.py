@@ -303,12 +303,17 @@ TRAPS: list[str] = [
     "connector は座標を持たない。source_id / target_id + アンカーで追従する"
     "（connect_objects で作る）",
     "z 順は get_scene の配列順。z フィールドは派生キャッシュで書いてはいけない",
-    "色は厳密に '#rrggbb'（7文字）。fill と mask_color は null 可"
-    "（null の mask_color は対象外を切り抜く）",
+    "色は厳密に '#rrggbb'（7文字）。rect/ellipse/curve の fill・stroke、text の "
+    "background、image の mask_color は null 可（null の mask_color は対象外を切り抜く。"
+    "fill/stroke の null は塗り/線なし、background の null は背景なし）。"
+    "line/arrow/freehand/connector の stroke は null 不可（消すには stroke_width を 0 にする）",
     "opacity は 0.0-1.0（パーセントではない）",
     "math は matplotlib mathtext（LaTeX のサブセット）。\\usepackage 不可・日本語不可",
     "text は width / height を省略するとサーバが内容に合わせて採寸する",
-    "rect / ellipse は width > 0 かつ height > 0 でないと不可視になる（エラーにはならない）",
+    "rect / ellipse の既定は塗りあり（薄いグレー）・線なし。fill を明示的に null にし、"
+    "かつ線も無い（stroke が null または stroke_width<=0）状態にすると完全に不可視になる"
+    "（エラーにはならないが critique の invisible が検出する）。"
+    "width > 0 かつ height > 0 でないと不可視になるのも同様（エラーにはならない）",
     "locked=true は人間がロックしたもの。force=true を付けない限り書き込みは拒否される",
     "キーは型ごとに違う。例えば arrow_size は line / arrow / connector にあるが "
     "rect には無い。この型に無いキーを送ると key_not_on_type で「持っている型」が返る",

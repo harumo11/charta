@@ -30,7 +30,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from app.commands.commands import AddObjectCommand
+from app.commands.commands import AddObjectCommand, GroupCommand
 from app.export.png_exporter import artboard_pixel_size
 from app.model.document import ARTBOARD_PX_MAX, Document, mm_from_px
 from app.model.objects import ImageObject, RectObject
@@ -481,6 +481,58 @@ def test_escape_cancels_the_grip_drag_even_during_a_curve_draft(qapp: Any) -> No
     # curve 下書き自体はこの Esc では触られない（グリップが先取りするため）。
     assert stub.cancel_calls == 0
     assert stub.draft_active is True
+
+
+def test_escape_cancels_the_grip_drag_before_leaving_an_entered_group(qapp: Any) -> None:
+    """findings #1/#8: グループに「入っている」間のグリップドラッグも、Esc は
+    まずグリップだけを取り消す（グループ全体選択へ戻す Esc は 2 回目）。
+
+    `_handle_group_entry_key`（グループ内個別編集契約 §F-3）は
+    `_handle_text_edit_key`/`_handle_mask_key`/`_handle_crop_key`/
+    `_handle_node_edit_key` の 4 つの編集モードとは違い、グリップドラッグと
+    共存し得る（グリップ押下はシーンの選択に一切触れない）。旧実装ではこの
+    ハンドラがグリップの Esc キャンセルより先に置かれていたため、グループへ
+    入っている間にグリップをドラッグして Esc を押しても、グループ Esc だけが
+    消費してグリップドラッグは生き残ってしまい、直後の release で
+    `SetArtboardCommand` が確定してしまっていた（ユーザーは「キャンセルした」
+    つもりなのにモデルが変わる静かな破綻。`test_escape_cancels_the_grip_drag_
+    even_during_a_curve_draft` の curve 版と対称のグループ版）。
+    """
+    scene, stack = _make_scene()
+    a = RectObject(id=scene.document.new_id(), x=0.0, y=0.0, width=50.0, height=50.0)
+    b = RectObject(id=scene.document.new_id(), x=100.0, y=0.0, width=50.0, height=50.0)
+    stack.push(AddObjectCommand(scene.document, a))
+    stack.push(AddObjectCommand(scene.document, b))
+    group_id = scene.document.new_id()
+    stack.push(GroupCommand(scene.document, [a, b], group_id))
+    scene.select_exactly([a])
+    assert scene.entered_group_id() == group_id
+
+    view = _make_view(scene)
+    count0 = stack.count()
+    ab0 = (scene.document.artboard.width_px, scene.document.artboard.height_px)
+
+    start = _grip_corner_point(view)
+    view.mousePressEvent(_press_event(start))
+    target_local = view.mapFromScene(QPointF(1860.0, 1020.0))
+    view.mouseMoveEvent(_move_event(target_local))
+
+    view.keyPressEvent(_key_event(Qt.Key.Key_Escape))
+
+    # 1 回目の Esc はグリップドラッグだけをキャンセルする。グループの
+    # 「入っている」状態はまだ生きている。
+    assert view._grip_drag_origin_px is None
+    assert scene.entered_group_id() == group_id
+
+    view.mouseReleaseEvent(_release_event(target_local))
+
+    assert stack.count() == count0
+    assert (scene.document.artboard.width_px, scene.document.artboard.height_px) == ab0
+
+    # 2 回目の Esc でグループ全体の選択に戻る。
+    view.keyPressEvent(_key_event(Qt.Key.Key_Escape))
+    assert scene.entered_group_id() is None
+    assert {o.id for o in scene.selected_objects()} == {a.id, b.id}
 
 
 def test_grip_is_ignored_while_crop_mode_is_active(

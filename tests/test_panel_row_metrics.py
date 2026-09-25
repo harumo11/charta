@@ -35,7 +35,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QDoubleSpinBox, QFormLayout, QLabel, QWidget
 
-from app.commands.commands import AddObjectCommand
+from app.commands.commands import AddObjectCommand, GroupCommand
 from app.model.objects import new_object
 from app.model.properties import PROPERTIES
 from app.panels.property_panel import _FORM_H_SPACING, _FORM_V_SPACING, _PANEL_FIXED_WIDTH
@@ -125,8 +125,16 @@ _OBJECT_KWARGS: dict[str, dict[str, Any]] = {
     "curve": dict(x=0, y=0, width=10, height=10, points=[[0, 0], [0.5, 1], [1, 0]]),
 }
 _OBJECT_TYPES: tuple[str, ...] = tuple(_OBJECT_KWARGS)
-# 行高/中心の各テストが回すケース: 全オブジェクト種別 + artboard(未選択) + multi(複数選択)。
-_ALL_CASES: tuple[str, ...] = _OBJECT_TYPES + ("artboard", "multi")
+# 行高/中心の各テストが回すケース: 全オブジェクト種別 + artboard(未選択) +
+# multi(複数選択・rect+rect) + multi_text(複数選択・text+text、フォントコンボと
+# トグル行の混在描画) + group(グループ全体選択、X/Y平行移動フォーム)。
+# 追加理由（finding #6・契約 §D2.10）: 元の "multi" は rect+rect だけだったため、
+# multi モードの `FontFamilyCombo`（要望1）と B/I/U トグル行（要望14）の
+# 混在（mixed）描画・行高が一度も測られていなかった。同じ理由で group フォーム
+# （項目8の X/Y 平行移動、findings #1/#10 が対象にした「選択したままグループ化」
+# 経路の行）もケースが無かった。ミューテーションテストで実際に検出漏れになる
+# ことを確認済み（scratchpad の検証記録参照）。
+_ALL_CASES: tuple[str, ...] = _OBJECT_TYPES + ("artboard", "multi", "multi_text", "group")
 
 
 def _make_and_select(env: dict[str, Any], obj_type: str) -> Any:
@@ -138,7 +146,16 @@ def _make_and_select(env: dict[str, Any], obj_type: str) -> Any:
 
 
 def _prepare_case(env: dict[str, Any], case_id: str) -> Any:
-    """`case_id`（種別名 / "artboard" / "multi"）に応じてフォームを構築し panel を返す。
+    """`case_id`（種別名 / "artboard" / "multi" / "multi_text" / "group"）に応じて
+    フォームを構築し panel を返す。
+
+    - "artboard": 未選択（アートボード設定フォーム）。
+    - "multi": rect+rect の複数選択（通常の複数選択フォーム）。
+    - "multi_text": text+text の複数選択。`font_family`/`font_size`/B・I・U が
+      混在するため、`FontFamilyCombo` の混在描画（要望1）と B/I/U トグル行の
+      混在描画（要望14）を測る（finding #6）。
+    - "group": rect2個をグループ化し、片方だけ選択（自動的にグループ全体へ
+      拡張される）。X/Y 平行移動フォーム（項目8）を測る（finding #6）。
 
     **`panel.adjustSize()` は呼ばない**（レビュー所見）。実際のドックでは
     `PropertyPanel` は `themed_window` のウィンドウサイズと `QSplitter` の
@@ -165,6 +182,58 @@ def _prepare_case(env: dict[str, Any], case_id: str) -> Any:
         scene.item_for(rect_a).setSelected(True)
         scene.item_for(rect_b).setSelected(True)
         app.processEvents()
+    elif case_id == "multi_text":
+        text_a = new_object(
+            "text",
+            id=scene.document.new_id(),
+            x=0.0,
+            y=0.0,
+            width=120.0,
+            height=30.0,
+            text="A",
+            font_family="Noto Sans",
+            font_size=14.0,
+            bold=False,
+        )
+        text_b = new_object(
+            "text",
+            id=scene.document.new_id(),
+            x=0.0,
+            y=40.0,
+            width=120.0,
+            height=30.0,
+            text="B",
+            font_family="DejaVu Serif",
+            font_size=20.0,
+            bold=True,
+        )
+        _add(env, text_a)
+        _add(env, text_b)
+        scene.clearSelection()
+        scene.item_for(text_a).setSelected(True)
+        scene.item_for(text_b).setSelected(True)
+        app.processEvents()
+    elif case_id == "group":
+        rect_a = new_object(
+            "rect", id=scene.document.new_id(), x=0.0, y=0.0, width=10.0, height=10.0
+        )
+        rect_b = new_object(
+            "rect", id=scene.document.new_id(), x=20.0, y=30.0, width=10.0, height=10.0
+        )
+        _add(env, rect_a)
+        _add(env, rect_b)
+        env["stack"].push(GroupCommand(scene.document, [rect_a, rect_b], scene.document.new_id()))
+        scene.clearSelection()
+        scene.item_for(rect_a).setSelected(True)  # グループ全体へ自動拡張される
+        app.processEvents()
+        # フォールバック（何らかの理由で通常の複数選択フォームへ落ちる）を
+        # サイレントに見逃さない（finding #6 の指摘: 既存の group テストは
+        # グループ化してから選択していたため、この落とし穴自体を検出できて
+        # いなかった）。
+        assert len(scene.selected_objects()) == 2
+        assert (
+            "width" not in panel.keys_in_form()
+        ), "group ケースの前提（X/Y平行移動フォーム）が成立していない"
     else:
         _make_and_select(env, case_id)
     app.processEvents()
@@ -319,6 +388,34 @@ def test_point_row_spins_are_squeezed_at_the_current_fixed_width(env: dict[str, 
         "line フォームの最小幅がビューポート幅を超えている → 横方向にクリップされ、"
         "操作不能な行が生まれる（point 行スピンの setMinimumWidth を見直すこと）"
     )
+
+
+# --------------------------------------------------------------------------
+# フォームの最小幅がビューポート幅を超えない（全ケース、finding #6）
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case_id", _ALL_CASES)
+def test_form_min_width_fits_viewport(env: dict[str, Any], case_id: str) -> None:
+    """`test_point_row_spins_are_squeezed_at_the_current_fixed_width`（line 限定）
+    の最小幅チェックを全ケースへ広げる（finding #6・契約 §D2.10）。line だけで
+    確認していたため、multi モードの `FontFamilyCombo`（既定幅が広い）や
+    トグル行が固定幅を破ってもここでは検出できなかった。
+    """
+    panel = _prepare_case(env, case_id)
+    viewport_width = panel._form_scroll.viewport().width()
+
+    assert panel._form_widget.minimumSizeHint().width() <= viewport_width, (
+        f"{case_id}: フォームの最小幅がビューポート幅({viewport_width}px)を超えている"
+        "→ 横方向にクリップされ操作不能な行が生まれる"
+    )
+    for key in panel.keys_in_form():
+        field = panel.field_widget_for(key)
+        right_edge = field.mapTo(panel._form_scroll.viewport(), field.rect().topRight()).x()
+        assert right_edge <= viewport_width, (
+            f"{case_id}.{key}: フィールドの右端({right_edge}px)がビューポート幅"
+            f"({viewport_width}px)を超えている"
+        )
 
 
 # --------------------------------------------------------------------------

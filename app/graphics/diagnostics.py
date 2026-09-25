@@ -24,6 +24,7 @@
 | `text_overflow` | 文字が自分の箱／ラベル先の図形からあふれている |
 | `low_contrast` | 文字色と背景色のコントラストが WCAG AA を下回る |
 | `small_text` | 出力実寸で小さすぎる |
+| `invisible` | rect/ellipse/curve が塗りも線も持たず完全に不可視 |
 
 **誤警告を出さないことを、検出漏れより優先する。** エージェントは警告を信じて
 修正呼び出しを送るので、嘘の警告は嘘の修正を生む。判断に足る情報が無い場合
@@ -37,6 +38,7 @@ from typing import Any
 
 from app.graphics import boxes as bx
 from app.graphics import legibility
+from app.graphics.strokes import FILL_TYPES, is_stroked
 
 Box = tuple[float, float, float, float]
 
@@ -50,6 +52,7 @@ CHECK_NAMES: tuple[str, ...] = (
     "text_overflow",
     "low_contrast",
     "small_text",
+    "invisible",
 )
 
 #: 重なり面積がこの比（小さい方の面積に対する比）を下回るなら黙る。
@@ -77,6 +80,11 @@ _SIDE_LABELS = {"left": "左", "top": "上", "right": "右", "bottom": "下"}
 _AREALESS_TYPES = frozenset({"line", "arrow", "freehand", "connector", "curve"})
 #: 文字を持つ型。
 _TEXTUAL_TYPES = frozenset({"text", "math"})
+#: 塗り(fill)と線(stroke)を持つ型（`invisible` 判定の対象）。
+#: `app.graphics.strokes.FILL_TYPES` が唯一の真実源（2026-09-25 finding #1/#7 で一本化）。
+#: `app.tools.tool_manager`/`app.agent.diagnose` もこの同じオブジェクトを直接 import
+#: しているため、ここに旧名のエイリアスは残さない（task3, 2026-09-25: 最後の外部
+#: importer だった `tool_manager.py` が `strokes.FILL_TYPES` の直接 import へ移行した）。
 
 
 @dataclass(frozen=True)
@@ -92,10 +100,16 @@ class ObjectSnapshot:
     visible: bool
     z_index: int
     group_id: int | None = None
-    #: rect / ellipse の塗り。None は透明。
+    #: rect / ellipse / curve の塗り。None は透明。
     fill: str | None = None
+    #: rect / ellipse / curve の線色。None は線なし（`fill` と対称）。
+    stroke: str | None = None
+    #: 線幅(px)。0 以下も「線なし」を表す（`app.graphics.strokes.is_stroked` と同じ判定）。
+    stroke_width: float = 0.0
     #: text / math の文字色。
     color: str | None = None
+    #: text の背景色（`TextObject.background`）。None は背景なし。
+    background: str | None = None
     #: image がアルファチャンネルを持つか（持つなら背後を隠しきらない）。
     has_alpha: bool = False
     #: text / math の内容とサイズ。
@@ -120,7 +134,12 @@ class ObjectSnapshot:
             return self.fill is not None
         if self.type == "image":
             return not self.has_alpha
-        # text / math はほぼグリフの隙間なので、覆い隠すとはみなさない。
+        if self.type == "text":
+            # 文字そのものはグリフの隙間だらけだが、箱全体を塗る自前の背景
+            # （`background`）を持つなら、その箱は不透明とみなせる
+            # （2026-09-25 追加。`reports/text.md` §9）。
+            return self.background is not None
+        # math はほぼグリフの隙間なので、覆い隠すとはみなさない。
         return False
 
 
@@ -255,6 +274,46 @@ def check_bounds(
     return findings
 
 
+def check_invisible(snapshot: DocumentSnapshot, *, invisible: bool) -> list[dict]:
+    """rect/ellipse/curve が塗りも線も持たず完全に不可視（2026-09-25 追加）。
+
+    2026-09-25 の既定変更（rect/ellipse は既定で線なし＋薄いグレー塗り。
+    `reports/rectdefault.md`）は dataclass 側の話であって、ユーザーやエージェントが
+    `fill` を明示的に `None` にし、かつ線も無い状態にすれば、依然として完全に
+    不可視な図形は作れてしまう。当たり判定も輪郭沿いの帯だけ（§9.1 項目11）で
+    掴みにくいため、機械的に検出する。
+
+    「線が無い」の判定は `app.graphics.strokes.is_stroked` と同一
+    （`stroke` が None または `stroke_width<=0` なら線なし）。curve も対象に含める
+    （曲線の既定は変えていないが、明示的に fill=None・stroke=None にすれば
+    同じ穴になりうるため）。
+
+    **修正案（`app.agent.diagnose.suggest_fix`）は塗りではなく線を戻す**
+    （2026-09-25 訂正）。当初は `fill` を既定色に戻す案だったが、それだと
+    (a) 開曲線に塗りを与えると塊になる（契約 §1 ユーザー決定「曲線は
+    対象外」に反する）、(b) 画像の上に置いた枠（`fill=null` の意図的な用法）が
+    不透明な灰色で塗りつぶされ、下の内容を隠してしまう、という 2 つの実害が
+    あった。線を戻す修正はどちらも起こさず、かつ収束する（`is_stroked` が
+    True になり `invisible` が消える）。
+    """
+    if not invisible:
+        return []
+    findings: list[dict[str, Any]] = []
+    for obj in snapshot.objects:
+        if obj.type not in FILL_TYPES or not obj.visible:
+            continue
+        if obj.fill is not None or is_stroked(obj):
+            continue
+        findings.append(
+            _finding(
+                "invisible",
+                obj,
+                f"オブジェクト {obj.id} ({obj.type}) は塗りも線も無く、完全に不可視です",
+            )
+        )
+    return findings
+
+
 def check_overlap(snapshot: DocumentSnapshot, *, overlap: bool, occluded: bool) -> list[dict]:
     """オブジェクト同士の重なりと遮蔽。
 
@@ -362,6 +421,9 @@ def background_behind(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> tuple[
 
     z が下で最も手前にある「obj の中心を含む」オブジェクトの塗りを採る。
     **画像が背後にある場合は色を返さない**（画素を推測しないため）。
+    自前の背景（`background`）を持つ text は、箱全体を塗るので rect/ellipse の
+    塗りと同様に背景源になる（2026-09-25 追加。背景の無い text はグリフの
+    隙間だらけなので従来どおり透過し、さらに下を見る）。
     見つからなければアートボード背景。
     """
     center = bx.box_center(bx.normalized(obj.box))
@@ -378,6 +440,10 @@ def background_behind(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> tuple[
             if other.fill is None:
                 continue  # 透明な図形は背景にならない。さらに下を見る
             return (other.fill, f"object:{other.id}")
+        if other.type == "text":
+            if other.background is None:
+                continue  # 背景の無い文字は覆い隠さない。さらに下を見る
+            return (other.background, f"object:{other.id}")
     return (snapshot.artboard.background, "artboard")
 
 
@@ -486,13 +552,62 @@ def _text_overflow_findings(
     return findings
 
 
+def _effective_background(
+    snapshot: DocumentSnapshot, obj: ObjectSnapshot
+) -> tuple[str | None, str]:
+    """`obj`（text）の文字の直下に実際に見える背景色と、その出どころ。
+
+    `obj` に自前の背景（`background`）があれば、箱全体を塗るのでそれが最優先の
+    背景源になる（`background_behind` のように別オブジェクトを探しに行く必要は
+    ない）。`opacity < 1` ならその背景自体が下地（`background_behind` の色）と
+    透けて混ざる（2026-09-25 追加。`reports/text.md` §9）。
+
+    **文字インクは、この関数が返す背景色の上にさらに合成する（二重合成）
+    のが正しい**（2026-09-25 訂正。以前の実装は単一合成を正としていたが、
+    それは実際の描画と逆だった）。画面・PNG・PDF（`scene.render` /
+    `QPrinter`）はどれも `TextItem.paint` を通り、`fillRect(背景)` を描いた
+    **同じ paint 呼び出しの中で**その上に文字インクを重ねる。`QGraphicsItem`
+    の opacity は `painter.setOpacity(...)` としてプリミティブごとに適用され、
+    中間レイヤーは作られない。したがって文字インクは「一度 opacity で
+    下地と合成済みの背景」の上に、もう一度同じ opacity で合成される
+    （二重合成）。これは実測で確認済み: 白文字・不透明度 0.5・紺背景
+    `#001f3f`・白いアートボードで、画面／PNG／PDF はいずれもコントラスト比
+    1.94 相当を描画する（単一合成モデルの計算値 3.31 はどの出力にも現れない）。
+    **SVG も同じ二重合成**（`app/export/svg_exporter.py::_render_text` が
+    round-2 で修正済み。背景ありで `opacity < 1` のときは `<g>` 側の opacity
+    を 1.0 にし、背景 `<rect>` とグリフ（`<path>`/`<text>`）のそれぞれに
+    `opacity` 属性を個別に出す＝プリミティブごとの合成を再現しているため、
+    グループ opacity による単一合成にはならない）。SVG だけ `<g opacity=...>`
+    のグループ opacity で単一合成になり読みやすく見えていたのは round-1 時点
+    の話（`reports/text.md` §10）で、現在は画面・PNG・PDF・SVG のどれも同じ
+    コントラスト比 1.94 を描く。
+    """
+    own_background = obj.background
+    under, source = background_behind(snapshot, obj)
+    if own_background is None:
+        return (under, source)
+    if obj.opacity >= OPAQUE_THRESHOLD:
+        # 完全不透明。下地が不明（画像等）でも、自分の背景が完全に覆うので関係ない。
+        return (own_background, f"object:{obj.id}")
+    if under is None:
+        # 半透明で、かつ下地が不明（画像等）。画素を推測しない。
+        return (None, f"object:{obj.id}")
+    try:
+        blended = legibility.blend_over(own_background, under, obj.opacity)
+    except ValueError:
+        return (None, f"object:{obj.id}")
+    return (blended, f"object:{obj.id}")
+
+
 def _contrast_findings(snapshot: DocumentSnapshot, obj: ObjectSnapshot) -> list[dict[str, Any]]:
-    background, source = background_behind(snapshot, obj)
+    background, source = _effective_background(snapshot, obj)
     if background is None:
-        # 画像の上の文字。画素を推測しない（嘘の警告より沈黙を選ぶ）。
+        # 画像の上の文字。画素を推測しない(嘘の警告より沈黙を選ぶ)。
         return []
     assert obj.color is not None
     try:
+        # 文字インクは、この背景の上にもう一度 opacity で合成する（二重合成。
+        # 関数 docstring 参照）。
         foreground = legibility.blend_over(obj.color, background, obj.opacity)
         ratio = legibility.contrast_ratio(foreground, background)
     except ValueError:
@@ -551,6 +666,7 @@ def analyze(
         low_contrast="low_contrast" in enabled,
         small_text="small_text" in enabled,
     )
+    findings += check_invisible(snapshot, invisible="invisible" in enabled)
     if ids is not None:
         wanted = set(ids)
         findings = [f for f in findings if wanted & referenced_ids(f)]
